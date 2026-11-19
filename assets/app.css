@@ -1,0 +1,1383 @@
+/* app.css — shared design system for the whole app. Loaded by every page.
+   Plain CSS, no build step. Establishes the visual language (badges, list
+   screens, edit-in-place, forms, buttons) reused across every stage. */
+
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+  --border: #d9dee5;
+  --border-strong: #b8c0cc;
+  --text: #1c2430;
+  --text-muted: #5c6773;
+  --text-faint: #8a94a1;
+  --accent: #2f6f4f;      /* kennel green */
+  --accent-dark: #245740;
+  --accent-soft: #e5f0ea;
+  --danger: #b23b3b;
+  --danger-soft: #f6e3e3;
+  --warn: #9a6b1e;
+  --warn-soft: #f6eddc;
+  --radius: 8px;
+  --radius-sm: 5px;
+  --shadow: 0 1px 3px rgba(20, 30, 45, 0.08), 0 1px 2px rgba(20, 30, 45, 0.06);
+  --maxw: 1080px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  color: var(--text);
+  background: var(--bg);
+  line-height: 1.45;
+  font-size: 15px;
+}
+
+/* --- Top navigation ----------------------------------------------------- */
+/* min-height: the nav's space is reserved before app.js fills it (renderNav), so
+   the page under it doesn't drop when it does. Matches .nav-inner's min-height,
+   which is the same at every width. */
+#app-nav { background: var(--accent-dark); color: #fff; box-shadow: var(--shadow); min-height: 52px; }
+.nav-inner {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 16px;
+  min-height: 52px;
+  flex-wrap: wrap;
+}
+.nav-brand {
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  margin-right: 18px;
+  color: #fff;
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.nav-brand .paw { font-size: 18px; }
+.nav-edition {
+  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--accent-dark); background: #fff; padding: 2px 6px; border-radius: 999px;
+  margin-left: 2px;
+}
+.nav-brand { min-width: 0; padding: 6px 0; }
+/* "KennelOS [edition]" on top, the kennel name (kennelSetupUI.renderKennelBanner)
+   stacked under it in smaller type — never beside it, where a long name crowded
+   the phone menu button. A very long name wraps rather than overflowing. */
+.nav-brand-text { display: flex; flex-direction: column; min-width: 0; max-width: 210px; line-height: 1.2; }
+.nav-brand-name { display: flex; align-items: center; gap: 8px; }
+.nav-kennel { font-size: 12.5px; font-weight: 500; color: #d7e6de; overflow-wrap: anywhere; }
+.nav-link {
+  color: #d7e6de;
+  text-decoration: none;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-weight: 500;
+}
+.nav-link:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
+.nav-link.active { background: rgba(255, 255, 255, 0.18); color: #fff; }
+
+/* --- Active-kennel switcher (Multi-Kennel Scope Spec §8) ------------------ */
+/* The slot is always in the markup but stays EMPTY in Lite and before the first
+   own kennel exists — so the `:not(:empty)` guards mean an edition without a
+   scope lays out exactly as it did before the switcher existed. When it does
+   render, it takes the auto margin that pins the right-hand group, and "More"
+   falls in beside it. */
+.nav-scope:not(:empty) { margin-left: auto; }
+.nav-scope:not(:empty) + .nav-more { margin-left: 8px; }
+.kennel-switcher {
+  font: inherit;
+  font-size: 13px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  max-width: 190px;
+}
+/* Narrowed to one kennel reads differently from "All kennels" at a glance. */
+.kennel-switcher.scoped { background: #fff; color: var(--accent-dark); font-weight: 600; }
+.kennel-switcher option { color: var(--text); background: #fff; }
+
+/* --- "More" corner menu -------------------------------------------------- */
+.nav-more { position: relative; margin-left: auto; }
+.nav-more-btn {
+  background: none;
+  border: 0;
+  font: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+.nav-more-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 168px;
+  background: var(--accent-dark);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 6px;
+  display: none;
+  z-index: 40;
+}
+.nav-more.open .nav-more-menu { display: block; }
+.nav-more-menu .nav-link { display: block; padding: 8px 10px; }
+
+/* Wide screens: links inline, hamburger hidden. */
+.nav-links { display: flex; align-items: center; gap: 4px; flex: 1; }
+.nav-toggle {
+  display: none;
+  margin-left: auto;
+  background: none;
+  border: 0;
+  color: #fff;
+  font-size: 24px;
+  line-height: 1;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+/* Phone: collapse the links behind the hamburger. */
+@media (max-width: 860px) {
+  /* brand + hamburger share row 1; the links (flex-basis:100%) wrap to row 2. */
+  .nav-toggle { display: inline-flex; }
+  /* The brand takes the row's spare width (and can wrap its kennel line) so the
+     menu button always keeps its place on the right. */
+  .nav-brand { flex: 1 1 0; margin-right: 8px; }
+  .nav-brand-text { max-width: none; }
+  .nav-toggle:hover { background: rgba(255, 255, 255, 0.12); }
+  .nav-links {
+    display: none;
+    flex-direction: column;
+    align-items: stretch;
+    flex-basis: 100%;
+    gap: 2px;
+    padding-bottom: 8px;
+  }
+  .nav-inner.nav-open .nav-links { display: flex; }
+  .nav-links .nav-link { padding: 11px 12px; border-radius: var(--radius-sm); }
+  /* The "More" group flattens into the stack — its two links show inline, no
+     nested dropdown to fish for on a touch screen. */
+  .nav-scope:not(:empty) { margin-left: 0; width: 100%; padding: 6px 0; }
+  .nav-scope:not(:empty) + .nav-more { margin-left: 0; }
+  .kennel-switcher { max-width: 100%; width: 100%; }
+  .nav-more { position: static; margin-left: 0; width: 100%; }
+  .nav-more-btn { display: none; }
+  .nav-more-menu {
+    position: static;
+    display: block;
+    background: none;
+    border: 0;
+    box-shadow: none;
+    padding: 0;
+    min-width: 0;
+  }
+  .nav-more-menu::before {
+    content: "";
+    display: block;
+    height: 1px;
+    background: rgba(255, 255, 255, 0.14);
+    margin: 4px 0;
+  }
+}
+
+/* --- Expandable table rows ---------------------------------------------- */
+/* Key columns stay in the row; a tap opens the rest as label/value pairs
+   below (phone-first pattern). Used by the Today board and reusable elsewhere. */
+.expand-summary { cursor: pointer; }
+.expand-summary > td { vertical-align: middle; }
+.expand-chevron {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  color: var(--text-muted);
+  width: 1em;
+  text-align: center;
+}
+.expand-summary.open .expand-chevron { transform: rotate(90deg); }
+.expand-panel > td { background: var(--surface-2); padding: 0; }
+.expand-detail {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 14px;
+  padding: 12px 14px;
+}
+.expand-detail .k { color: var(--text-muted); font-size: 13px; }
+.expand-detail .v { font-size: 14px; }
+.expand-actions { grid-column: 1 / -1; margin-top: 8px; }
+
+/* --- Sample data banner -------------------------------------------------- */
+.sample-banner {
+  background: var(--warn-soft);
+  border-bottom: 1px solid #e6d5ad;
+  color: var(--warn);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* --- Page layout -------------------------------------------------------- */
+main { max-width: var(--maxw); margin: 0 auto; padding: 24px 16px 64px; }
+.page-header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+.page-header h1 { font-size: 24px; margin: 0; }
+.page-subtitle { color: var(--text-muted); margin: 4px 0 0; }
+h2 { font-size: 18px; margin: 28px 0 12px; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 20px;
+}
+.card + .card { margin-top: 16px; }
+
+/* --- Collapsible home cards (Today page) --------------------------------- */
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.card-head-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.card-toggle-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px;
+  transition: transform 0.15s ease;
+}
+.card-toggle-btn:hover { color: var(--text); }
+.card-toggle-btn[aria-expanded="false"] { transform: rotate(-90deg); }
+.card-body { margin-top: 12px; }
+.card-body[hidden] { display: none; }
+
+.grid-links { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+.tile {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 20px;
+  transition: border-color 0.12s, transform 0.12s;
+}
+.tile:hover { border-color: var(--accent); transform: translateY(-2px); }
+.tile h3 { margin: 0 0 6px; font-size: 17px; }
+.tile p { margin: 0; color: var(--text-muted); font-size: 14px; }
+.tile .tile-icon { font-size: 26px; display: block; margin-bottom: 10px; }
+
+/* --- Dashboard stat tiles (Stage 5) ------------------------------------- */
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 14px; }
+.stat {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+a.stat { transition: border-color 0.12s, transform 0.12s; }
+a.stat:hover { border-color: var(--accent); transform: translateY(-2px); }
+.stat-num { font-size: 28px; font-weight: 700; line-height: 1.1; }
+.stat-label { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
+.stat.stat-alert .stat-num { color: var(--danger); }
+.stat.stat-warn .stat-num { color: var(--warn); }
+.stat.stat-zero .stat-num { color: var(--text-faint); font-weight: 600; }
+
+/* --- Buttons ------------------------------------------------------------ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  text-decoration: none;
+  line-height: 1.2;
+  /* Never wrap a button label. In flex rows (e.g. the breeding / placement hub
+     cards' "Open pairing" / "Open litter" / "Open sale" actions) a wrappable
+     label lets the button shrink and re-flow, so its size shifts row to row;
+     nowrap keeps each action a fixed width, anchored right by the row's
+     space-between. */
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.btn:hover { background: var(--surface-2); }
+.btn-primary { background: var(--accent); border-color: var(--accent-dark); color: #fff; }
+.btn-primary:hover { background: var(--accent-dark); }
+.btn-danger { color: var(--danger); border-color: var(--danger); background: var(--surface); }
+.btn-danger:hover { background: var(--danger-soft); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+/* `.btn`'s author `display` beats the UA `[hidden]{display:none}`, so a button
+   toggled with the `hidden` property stays on screen without this — same idiom
+   as `.card-body[hidden]` / `.pill-row[hidden]` below. */
+.btn[hidden] { display: none; }
+.btn-sm { padding: 5px 10px; font-size: 13px; }
+
+/* --- Badges (status / type values) -------------------------------------- */
+.badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.badge-neutral { background: var(--surface-2); color: var(--text-muted); border-color: var(--border); }
+.badge-green   { background: var(--accent-soft); color: var(--accent-dark); border-color: #bfe0cd; }
+.badge-blue    { background: #e3edf7; color: #275580; border-color: #c3d7ea; }
+.badge-amber   { background: var(--warn-soft); color: var(--warn); border-color: #e6d5ad; }
+.badge-red     { background: var(--danger-soft); color: var(--danger); border-color: #e6c3c3; }
+.badge-purple  { background: #efe6f6; color: #6a3d90; border-color: #dbc7ea; }
+/* Waitlist program icons (assets/programIcons.js): the Programs page's picker and list. */
+.icon-choices { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.icon-choice { display: inline-flex; align-items: center; gap: 5px; font-weight: 400; cursor: pointer; }
+.icon-choice svg, .program-icon svg { vertical-align: -4px; }
+.badge-gray    { background: #e7e9ec; color: #55606c; border-color: #d3d8de; }
+
+/* --- Tables / list screens --------------------------------------------- */
+.list-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+.list-toolbar input[type="search"], .list-toolbar select {
+  font: inherit;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.list-toolbar input[type="search"] { min-width: 200px; flex: 1 1 220px; }
+.toolbar-spacer { flex: 1 1 auto; }
+
+/* --- Kennel-scope affordances (Multi-Kennel Scope Spec §7) ---------------- */
+/* The chip a scoped list/report carries in its toolbar, so a short list always
+   says why it is short — and offers the one-click way back to All kennels. */
+.scope-chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 13px; font-weight: 600;
+  color: var(--accent-dark); background: var(--accent-soft);
+  border: 1px solid #bfe0cd; border-radius: 999px; padding: 4px 6px 4px 12px;
+}
+.scope-chip-clear {
+  font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+  color: var(--accent-dark); background: #fff;
+  border: 1px solid #bfe0cd; border-radius: 999px; padding: 2px 10px;
+}
+.scope-chip-clear:hover { background: var(--accent-soft); }
+/* The banner an OUT-OF-SCOPE record shows on its own detail page. Detail pages
+   are never scope-filtered (§7) — a direct link must always resolve — so this
+   explains the mismatch and offers the switch rather than hiding the record. */
+.scope-notice {
+  background: var(--accent-soft); border: 1px solid #bfe0cd;
+  border-radius: var(--radius-sm); padding: 10px 12px; margin-top: 10px; font-size: 14px;
+}
+.check-inline { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 14px; }
+/* Keep the checkbox/radio a fixed little box — flex layouts (esp. multi-line
+   labels) otherwise stretch the native control to different sizes. */
+.check-inline input[type="checkbox"], .check-inline input[type="radio"] { flex: 0 0 auto; }
+/* A three-column grid of check-inline options (Contact "Type"). Equal-width
+   columns keep every checkbox on a shared row and column line instead of the
+   ragged staircase a flex-wrap produces; the checkbox top-aligns so a label
+   that wraps on a narrow screen still lines up with its box. */
+.check-group { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 16px; }
+.check-group .check-inline { align-items: start; }
+
+table.data { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+table.data th, table.data td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+table.data th { background: var(--surface-2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-muted); }
+table.data tbody tr:last-child td { border-bottom: none; }
+table.data tbody tr.clickable { cursor: pointer; }
+table.data tbody tr.clickable:hover { background: var(--accent-soft); }
+/* reportView `groupBy` header rows (e.g. the Shows page's per-date blocks) */
+table.data tbody tr.group-row td { background: var(--surface-2); font-weight: 600; font-size: 13px; padding: 6px 14px; }
+.row-archived { opacity: 0.55; }
+table.data tbody tr.row-review { background: var(--warn-soft); }
+table.data tbody tr.row-review td { border-bottom-color: #e6d5ad; }
+
+/* --- Sortable columns (clickable headers) -------------------------------- */
+/* The CSV import guide's column table (importHelp.js): names wrap at their
+   underscores; on a phone each column is one block, its name and need on one
+   line and what goes in it full width below, so the whole guide fits on screen. */
+table.ih-cols td.ih-name { font-size: 13px; overflow-wrap: normal; min-width: 7em; }
+table.ih-cols td.ih-need .badge { white-space: nowrap; }
+@media (max-width: 640px) {
+  table.ih-cols thead { display: none; }
+  table.ih-cols, table.ih-cols tbody { display: block; }
+  table.ih-cols tr { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  table.ih-cols tbody tr:last-child { border-bottom: none; }
+  /* table.data's phone padding would double the row's: none on these cells. */
+  table.data.ih-cols td { display: block; padding: 0; border: 0; }
+  table.ih-cols td.ih-name { font-weight: 600; min-width: 0; }
+  table.ih-cols td.ih-text { flex: 1 1 100%; font-size: 14px; line-height: 1.4; }
+}
+table.data th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+table.data th.sortable:hover { background: var(--border); color: var(--text); }
+
+/* --- Responsive column collapse (listView.js `collapse` columns) -------- */
+.col-toggle { width: 32px; text-align: center; }
+.row-toggle-btn { background: none; border: none; cursor: pointer; font-size: 14px; line-height: 1; padding: 6px; color: var(--text-muted); }
+table.data tr.row-detail[hidden] { display: none; }
+table.data tr.row-detail td { background: var(--surface-2); padding: 10px 14px; }
+table.data tr.row-detail .dl-meta { margin: 0; }
+@media (min-width: 641px) {
+  .col-toggle { display: none; }
+  table.data tr.row-detail { display: none; }
+}
+@media (max-width: 640px) {
+  table.data th.col-collapse, table.data td.col-collapse { display: none; }
+  /* Four always-visible dog-list columns (call name, sex, status, website)
+     need tighter spacing than the desktop table, and badges need to be able
+     to wrap to a second line (e.g. "External reference"), so the row never
+     forces horizontal scroll. */
+  table.data th, table.data td { padding: 8px 5px; font-size: 13px; overflow-wrap: break-word; }
+  table.data th { font-size: 10px; letter-spacing: 0.2px; hyphens: auto; }
+  table.data .badge { padding: 2px 6px; white-space: normal; }
+  .col-toggle { width: 20px; }
+}
+
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+.empty-state { text-align: center; color: var(--text-muted); padding: 40px 20px; }
+
+/* --- Forms / edit-in-place --------------------------------------------- */
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px 20px; }
+/* A `.form-grid` toggled by `hidden` (the pick dialog's deposit fields). */
+.form-grid[hidden] { display: none; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+/* Same `[hidden]` idiom as `.pill-row[hidden]` below: a `.field` toggled by its
+   `hidden` attribute (the waitlist entry's parent picks, the sale's owner field). */
+.field[hidden] { display: none; }
+.field label { font-size: 13px; font-weight: 600; color: var(--text-muted); }
+.field .req { color: var(--danger); }
+.field input:not([type="checkbox"]):not([type="radio"]), .field select, .field textarea {
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  width: 100%;
+}
+.field input:disabled, .field select:disabled, .field textarea:disabled {
+  background: var(--surface-2);
+  color: var(--text);
+  border-color: var(--border);
+  -webkit-text-fill-color: var(--text); /* keep readable on Safari */
+  opacity: 1;
+}
+.field textarea { min-height: 72px; resize: vertical; }
+.field-hint { font-size: 12px; color: var(--text-faint); }
+.field-wide { grid-column: 1 / -1; }
+/* The Dog form's Titles row (Dog Titles Field Plan §8 phase 3): one chip per title,
+   an editable abbreviation with organization and date behind "details"; logged and
+   in-the-name titles are read-only chips. */
+.title-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+.title-chips:empty { display: none; }
+#title-name-chips { display: contents; }
+.title-chip { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; max-width: 100%;
+  padding: 3px 6px; border: 1px solid var(--border-strong); border-radius: 999px; background: var(--surface-2);
+  font: inherit; font-size: 13px; color: var(--text); }
+.title-chip-readonly { border-style: dashed; background: var(--surface); }
+button.title-chip-readonly { cursor: pointer; }
+.field .title-chip input.title-abbr { width: auto; min-width: 3.5em; padding: 2px 6px; font-weight: 600; }
+.title-details { font-size: 12px; color: var(--text-muted); }
+.title-details > summary { cursor: pointer; }
+.title-details[open] { flex-basis: 100%; }
+.title-details-body { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.field .title-details-body input { width: auto; flex: 1 1 140px; min-width: 0; padding: 4px 8px; }
+.title-chip-link, .title-chip-remove { border: none; background: none; padding: 0 4px; font: inherit; font-size: 12px;
+  color: var(--text-muted); cursor: pointer; }
+.title-chip-remove { font-size: 16px; line-height: 1; }
+.title-chip-link:hover, .title-chip-remove:hover { color: var(--text); }
+.title-add { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.field .title-add input { flex: 1 1 180px; min-width: 0; max-width: 320px; }
+
+/* A fixed-2-up sub-row inside a .field-wide (kennel.js's Lifecycle-nudges
+   Male/Female promote-age pair) — flex instead of .form-grid's auto-fit
+   minmax(240px,1fr), which collapses to one column well before phone width.
+   Stays side-by-side down to the narrowest supported viewport. */
+.promote-age-row { display: flex; gap: 10px; margin-top: 4px; }
+.promote-age-row .field { flex: 1 1 0; min-width: 0; }
+
+.form-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+/* A settings Save that keeps her on the page (kennel.js flashSaved). */
+.btn.is-saved { background: var(--accent-dark); border-color: var(--accent-dark); }
+.save-flash { align-self: center; font-size: 13px; font-weight: 600; color: var(--accent); }
+.inline-warn { color: var(--warn); background: var(--warn-soft); border: 1px solid #e6d5ad; padding: 8px 12px; border-radius: var(--radius-sm); font-size: 13px; margin-top: 10px; }
+.inline-error { color: var(--danger); background: var(--danger-soft); border: 1px solid #e6c3c3; padding: 8px 12px; border-radius: var(--radius-sm); font-size: 13px; margin-top: 10px; }
+.inline-notice { color: var(--accent-dark); background: var(--accent-soft); border: 1px solid var(--border); padding: 8px 12px; border-radius: var(--radius-sm); font-size: 13px; margin-top: 10px; }
+/* The KennelPort website strip under the nav (assets/websiteBanner.js; drawn from
+   the last compare by app.js). Full width, like the sample-data strip. */
+.website-banner-strip { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0; border-radius: 0; border-width: 0 0 1px; padding: 8px 16px; }
+.website-banner-strip[hidden] { display: none; }
+
+/* Lite cap upgrade nudge (cap spec §6) — a friendly prompt, not an error. */
+.upgrade-nudge { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; background: var(--accent-soft); border: 1px solid #bfe0cd; color: var(--accent-dark); padding: 12px 14px; border-radius: var(--radius-sm); margin-top: 10px; }
+.upgrade-nudge-body { flex: 1 1 240px; }
+.upgrade-nudge-detail { font-size: 13px; margin-top: 3px; color: var(--text); }
+.upgrade-nudge .btn-primary { flex: 0 0 auto; }
+
+/* Lite's outbound edition links (editionLinks.js) — "See the full app ↗" /
+   "Upgrade to Pro →". Two renders: as items at the foot of the nav More menu,
+   and as a footer on Today. Absent in Pro/Demo (nothing rendered). */
+/* In the (dark) More menu: a divider, then the links styled as menu entries.
+   The Upgrade CTA is a <button>, so reset it to match the anchor menu items. */
+.edition-links-nav { margin-top: 6px; padding-top: 6px; border-top: 1px solid rgba(255, 255, 255, 0.14); }
+.nav-more-menu .edition-link { display: block; padding: 8px 10px; width: 100%; text-align: left; }
+.edition-link-upgrade { background: none; border: 0; font: inherit; cursor: pointer; }
+.edition-links-nav .edition-link-upgrade { color: #ffd88a; font-weight: 600; }
+.edition-links-nav .edition-links-note { margin: 4px 10px 0; font-size: 12px; color: #d7e6de; }
+
+/* Demo edition read-only banner (app.js renderDemoBanner) — a persistent strip
+   at the very top of every page so a blocked write is expected, not a surprise. */
+.demo-banner {
+  background: #3a2a12;
+  color: #ffe6b0;
+  border-bottom: 1px solid #5a441d;
+  text-align: center;
+  padding: 7px 16px;
+  font-size: 13px;
+}
+.demo-banner strong { color: #fff; }
+
+/* --- Pro license gate (assets/licenseGate.js) --------------------------- */
+/* Full-screen, non-dismissible wall shown in the Pro edition before the app
+   renders when there's no active subscription (activation wall) or it lapsed
+   past its grace window (renewal wall). Reuses the .modal card look; the overlay
+   sits above every other layer (wizard 10000, onboarding 200) since the app must
+   not be usable underneath it. */
+.license-wall-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 11000;
+  background: rgba(18, 26, 38, 0.6);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  overflow-y: auto;
+}
+.license-wall { max-width: 460px; }
+.license-title { margin: 0 0 6px; }
+.license-lead { margin: 0 0 16px; color: var(--text-muted); }
+.license-lead-note { color: var(--text); }
+.license-label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 5px; }
+.license-input {
+  width: 100%;
+  font: inherit;
+  padding: 9px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-sizing: border-box;
+}
+.license-field { margin-top: 14px; }
+.license-hint { font-weight: 400; color: var(--text-muted); }
+.license-error { color: var(--danger); font-size: 13px; min-height: 18px; margin: 8px 0 0; }
+.license-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+.license-secondary { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin-top: 16px; }
+.license-note { margin: 16px 0 0; font-size: 13px; color: var(--text-muted); }
+.license-link {
+  background: none; border: 0; padding: 0; font: inherit; font-size: 13px;
+  color: var(--accent); font-weight: 600; cursor: pointer; text-decoration: underline;
+}
+/* Grace-period strip (validated but past printed expiry, or offline within the
+   grace window): the app stays usable, this just nudges to reconnect/renew. */
+.license-grace-banner {
+  background: #3a2a12;
+  color: #ffe6b0;
+  border-bottom: 1px solid #5a441d;
+  text-align: center;
+  padding: 7px 16px;
+  font-size: 13px;
+}
+.license-grace-banner strong { color: #fff; }
+.license-grace-banner a { color: #ffd88a; font-weight: 600; }
+
+/* On Today: a centered footer strip below the last card. */
+.edition-footer:empty { display: none; }
+.edition-footer { max-width: var(--maxw); margin: 0 auto; padding: 8px 16px 48px; }
+.edition-links-footer { text-align: center; border-top: 1px solid var(--border); padding-top: 20px; }
+.edition-links-lead { margin: 0 0 12px; color: var(--text-muted); }
+.edition-links-row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+.edition-links-footer .edition-links-note { margin: 12px 0 0; font-size: 13px; color: var(--text-muted); }
+
+/* A departed (archived) dog reference that renders as plain text, not a link
+   (Lite — cap spec §7). Kept visually like body text so lineage still reads. */
+.dog-name-static { color: var(--text); }
+
+/* --- Breed test picker (assets/breedTestPicker.js) ----------------------
+   Shared by both seed-import wizards: the standalone Import Kennel Tests
+   page and the first-run kennel-setup modal. Search-as-you-type suggestions,
+   a "browse by breed group" dropdown, and a checked list of added breeds. */
+.breed-picker-toast {
+  background: var(--accent-soft);
+  color: var(--accent-dark);
+  border: 1px solid #bfe0cd;
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+.breed-picker-search-wrap { position: relative; }
+.breed-picker-suggestions {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  z-index: 20;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.breed-picker-suggestion {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  font: inherit;
+  color: var(--text);
+  cursor: pointer;
+}
+.breed-picker-suggestion:last-child { border-bottom: 0; }
+.breed-picker-suggestion:hover { background: var(--accent-soft); }
+.breed-picker-group-field { margin-top: 14px; }
+.breed-picker-selected { margin-top: 14px; }
+.breed-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+}
+.breed-picker-row:last-child { border-bottom: none; }
+.breed-picker-row input[type="checkbox"] { flex: 0 0 auto; }
+.breed-picker-modal-list { max-height: 320px; overflow-y: auto; margin: 12px 0; }
+
+/* --- Modal -------------------------------------------------------------- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(18, 26, 38, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 40px 16px;
+  overflow-y: auto;
+  z-index: 100;
+}
+/* A modal opened from the Pro license wall ("Lost a device? Free its slot"):
+   appended after the wall, so it must sit above it. */
+.license-wall-overlay ~ .modal-overlay { z-index: 11001; }
+.modal {
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 40px rgba(15, 25, 40, 0.28);
+  padding: 22px;
+  width: 100%;
+  max-width: 640px;
+}
+/* A wide modal for a page's worth of content (the picks preview). */
+.modal.modal-wide { max-width: 920px; }
+
+/* --- Timeline ----------------------------------------------------------- */
+.timeline { list-style: none; margin: 0; padding: 0; }
+.timeline-item {
+  display: grid;
+  grid-template-columns: 150px 1fr auto;
+  gap: 14px;
+  align-items: start;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.timeline-item:last-child { border-bottom: none; }
+.timeline-date { color: var(--text-muted); font-size: 14px; }
+.timeline-main { min-width: 0; }
+.timeline-main > div:first-child { margin-bottom: 2px; }
+.timeline-actions { align-self: center; }
+.event-upcoming { background: var(--warn-soft); border-radius: var(--radius-sm); padding-left: 10px; padding-right: 10px; }
+@media (max-width: 640px) {
+  .timeline-item { grid-template-columns: 1fr; }
+  .timeline-actions { justify-self: start; }
+}
+
+/* --- Calendar (pages/calendar.html) ------------------------------------- */
+.cal-toolbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }
+.cal-month-label { margin: 0; font-size: 20px; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.cal-head { font-size: 12px; font-weight: 600; color: var(--text-muted); text-align: center; padding: 2px 0; }
+.cal-cell {
+  min-height: 88px; min-width: 0; box-sizing: border-box;
+  display: flex; flex-direction: column; align-items: stretch; gap: 3px;
+  padding: 4px; text-align: left; font: inherit; color: inherit;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+button.cal-cell { cursor: pointer; }
+button.cal-cell:hover { border-color: var(--accent); }
+.cal-cell.cal-blank { background: none; border-color: transparent; }
+.cal-cell.cal-past { background: var(--bg); }
+.cal-cell.cal-today { border: 2px solid var(--accent); padding: 3px; }
+.cal-date { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.cal-today .cal-date { color: var(--accent); font-weight: 700; }
+.cal-chips { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cal-chip { display: block; font-size: 11px; line-height: 1.35; padding: 0 5px; border-radius: 4px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; box-sizing: border-box; }
+.cal-chip-reminder { display: inline-block; background: var(--warn-soft); color: var(--warn); border: 1px dashed var(--warn); }
+.cal-more { font-size: 11px; color: var(--text-muted); }
+.cal-key { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.cal-key .cal-chip { font-size: 12px; }
+.cal-day-list { list-style: none; margin: 0; padding: 0; max-height: 60vh; overflow-y: auto; }
+.cal-day-item { display: flex; flex-direction: column; gap: 3px; padding: 10px 0; border-top: 1px solid var(--border); }
+.cal-day-item .cal-chip { display: inline-block; }
+@media (max-width: 640px) {
+  .cal-grid { gap: 2px; }
+  .cal-cell { min-height: 54px; padding: 3px; }
+  .cal-cell.cal-today { padding: 2px; }
+  /* Chips collapse to colored dots; the day modal carries the words. */
+  .cal-cell .cal-chips { flex-direction: row; flex-wrap: wrap; gap: 3px; }
+  .cal-cell .cal-chip { width: 8px; height: 8px; padding: 0; font-size: 0; border: none; border-radius: 50%; background: currentColor; }
+  .cal-cell .cal-more { font-size: 10px; }
+  .cal-more-word { display: none; }
+}
+
+/* --- Pedigree import (pages/pedigree-import.html) ------------------------ */
+.ped-drop { display: flex; flex-direction: column; align-items: center; gap: 4px; text-align: center; padding: 22px 16px;
+  border: 2px dashed var(--border-strong); border-radius: var(--radius); cursor: pointer; }
+.ped-drop:hover, .ped-drop-over { border-color: var(--accent); background: var(--accent-soft); }
+.ped-file { border-top: 1px solid var(--border); padding: 12px 0; }
+.ped-file:first-child { margin-top: 12px; }
+.ped-file .badge { margin-left: 4px; }
+.ped-file-opts { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin-top: 8px; }
+.ped-file-opts .field input { min-width: 14em; }
+.ped-warn { margin: 6px 0 0; padding-left: 18px; color: var(--warn); font-size: 13px; }
+.ped-issue { color: var(--warn); font-size: 12px; margin-top: 2px; }
+.ped-needs { border-color: var(--warn) !important; background: var(--warn-soft); }
+.ped-table-wrap { overflow-x: auto; margin-top: 12px; }
+.ped-table td { vertical-align: top; padding: 8px 10px; }
+.ped-table input[type="text"] { width: 100%; min-width: 12em; }
+.ped-table select { max-width: 16em; }
+
+/* --- Pedigree ----------------------------------------------------------- */
+.ped-scroll { overflow-x: auto; overflow-y: hidden; padding: 4px; }
+.ped-canvas { position: relative; }
+.ped-lines { position: absolute; inset: 0; pointer-events: none; }
+.ped-pos { position: absolute; }
+.ped-node {
+  box-sizing: border-box;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 6px 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.ped-node .ped-main { display: flex; align-items: center; gap: 6px; }
+.ped-name { font-weight: 700; color: var(--text); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ped-name:hover { color: var(--accent); text-decoration: underline; }
+/* Departed (archived) dog in Lite: name renders but isn't a link (cap spec §7). */
+.ped-name-static, .ped-name-static:hover { color: var(--text); text-decoration: none; cursor: default; }
+.ped-open { margin-left: auto; color: var(--text-faint); text-decoration: none; font-size: 13px; }
+.ped-open:hover { color: var(--accent); }
+/* Fix a spot (assets/pedigree.js, editable): a ✎ on each ancestor, "+ Add" on an Unknown. */
+.ped-fix { flex: none; border: 0; background: none; padding: 2px 4px; min-width: 28px; min-height: 28px; cursor: pointer; color: var(--text-faint); font-size: 15px; line-height: 1; border-radius: 6px; }
+.ped-fix:hover, .ped-fix:focus-visible { color: var(--accent); background: var(--accent-soft); }
+.ped-node.ped-unknown .ped-add { margin-left: 8px; padding: 2px 8px; min-height: 28px; font-size: 13px; }
+.ped-arch { font-size: 10px; padding: 0 6px; }
+.ped-reg { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ped-dob { font-size: 12px; }
+.ped-node.ped-unknown {
+  border-style: dashed;
+  border-left-color: var(--border-strong);
+  background: var(--surface-2);
+  align-items: center;
+  box-shadow: none;
+}
+
+/* Whole-kennel family tree (assets/kennelTree.js) */
+.kt-legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; margin-bottom: 8px; }
+.kt-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.kt-family + .kt-family { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; }
+.kt-family-head { margin: 0 0 8px; font-size: 15px; }
+.kt-family-head .faint { font-weight: 400; font-size: 13px; }
+.kt-ancestor { background: var(--surface-2); }
+.kt-loners { display: flex; flex-wrap: wrap; gap: 8px; }
+.kt-loner { border: 1px solid var(--border); border-left: 4px solid var(--border-strong); border-radius: var(--radius-sm);
+  padding: 4px 10px; font-weight: 600; color: var(--text); text-decoration: none; background: var(--surface); }
+a.kt-loner:hover { color: var(--accent); }
+.kt-focus .ped-node, .kt-loner.kt-focus { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+/* --- Small utilities ---------------------------------------------------- */
+.muted { color: var(--text-muted); }
+.faint { color: var(--text-faint); }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+.row-between { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.stack-sm > * + * { margin-top: 8px; }
+.pill-row { display: flex; gap: 6px; flex-wrap: wrap; }
+/* An author `display` beats the UA `[hidden]{display:none}`, so a `.pill-row`
+   toggled via the `hidden` attribute/property (e.g. the photo-vs-PDF source
+   switch on the receipt-capture and Documents forms) needs this to actually
+   hide — same idiom as `.card-body[hidden]` / `tr.row-detail[hidden]`. */
+.pill-row[hidden] { display: none; }
+/* Trailing action button(s) in a row-between header/row: pin them to the row's
+   right edge even when the outer flex-wrap pushes them onto their own line
+   (narrow viewport) — otherwise a wrapped line's item defaults to the left.
+   A pill-row also grows to fill that line so its own internal wrapping (when
+   the button group itself is too wide) right-aligns each sub-line in turn. */
+.row-between > .pill-row { flex: 1 1 auto; justify-content: flex-end; }
+.row-between > .btn:last-child { margin-left: auto; }
+
+/* --- Hub segment tabs (Navigation Consolidation Plan v1 §6: People, Placements
+   & Contracts) — small pill row switching between the pages folded into a hub. */
+.seg-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+.seg-tab {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+  font-size: 14px;
+}
+.seg-tab:hover { background: var(--accent-soft); }
+.seg-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Secondary axis inside a card (Import/Export's backup destination): visually
+   subordinate to the primary seg-tabs above it, so the two rows never read as
+   competing choices. Same pills, one step down in weight. */
+.seg-tabs-sub { margin-bottom: 0; }
+.seg-tabs-sub .seg-tab { padding: 4px 12px; font-size: 13px; }
+.seg-tabs-sub .seg-tab.active {
+  background: var(--accent-soft);
+  color: var(--accent-dark);
+  border-color: #bfe0cd;
+  font-weight: 600;
+}
+/* A page's secondary actions behind one button ("Manage ▾"), so the page's one
+   primary action stands alone. Markup: .action-menu > button.btn[aria-expanded]
+   + .action-menu-list > a/button items (ui.js wireActionMenu). */
+.action-menu { position: relative; display: inline-block; }
+.action-menu-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 220px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 6px;
+  z-index: 40;
+}
+.action-menu-list[hidden] { display: none; }
+.action-menu-list > a, .action-menu-list > button {
+  display: block; width: 100%; text-align: left; padding: 8px 10px;
+  background: none; border: 0; border-radius: var(--radius-sm);
+  font: inherit; color: var(--text); text-decoration: none; cursor: pointer;
+  white-space: nowrap;
+}
+.action-menu-list > a:hover, .action-menu-list > button:hover { background: var(--accent-soft); }
+.action-menu-list > hr { border: 0; border-top: 1px solid var(--border); margin: 6px 4px; }
+.action-menu-list > [hidden] { display: none; }
+
+/* One-card-at-a-time pages (the Kennel page): a section dropdown above them. */
+.section-picker { max-width: 320px; margin-bottom: 14px; }
+
+.dest-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.dest-label { color: var(--text-muted); font-size: 13px; }
+
+/* Dropbox connection strip (assets/dropboxConnectUI.js) — a quiet footer row
+   for the connection a card's actions depend on, not an action in its own right. */
+.dbx-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.dbx-status { display: inline-flex; align-items: center; gap: 7px; color: var(--text-muted); font-size: 13px; }
+.dbx-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex: 0 0 auto; }
+.dbx-dot-on { background: var(--accent); }
+/* The label column is capped (fit-content) so a long label, like an application
+   question, wraps instead of taking the whole width and squeezing the values to
+   zero (they'd wrap a letter per line off the card's edge and read as blank). */
+.dl-meta { display: grid; grid-template-columns: fit-content(40%) minmax(0, 1fr); gap: 4px 16px; margin: 0; }
+.dl-meta dt { color: var(--text-muted); font-size: 13px; overflow-wrap: anywhere; }
+/* Long unbroken values (a URL, a registration string) must wrap inside the 1fr
+   column instead of running off the right edge on narrow screens. min-width:0
+   lets the grid cell shrink below its content's intrinsic width. */
+.dl-meta dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+
+/* --- Guided tour (Wizard Runtime Spec v1 §9) -----------------------------
+   Spotlight coach-marks: a transparent full-viewport click-blocker plus a
+   box-shadow "cutout" applied to the real target element itself — no mask,
+   no cutout-geometry math. The overlay sits below the target's own stacking
+   context (z-index 10001 > 10000) so the target stays clickable through it. */
+.wizard-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: transparent;
+}
+/* Intro cards and the missing-target fallback have nothing spotlit, so the dim
+   comes from the overlay itself rather than a target's box-shadow. */
+.wizard-overlay-dim { background: rgba(0, 0, 0, 0.6); }
+.wizard-spotlight-target {
+  position: relative;
+  z-index: 10001;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6), 0 0 0 3px var(--accent) inset;
+  border-radius: var(--radius-sm);
+}
+/* The card shell: a header (step count + title), a scrollable body, and the
+   action row. Kept compact and — for highlight steps — pinned to the top so it
+   never covers the feature it describes (the target is scrolled just below it). */
+.wizard-card {
+  z-index: 10002;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+}
+.wizard-card-top {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(760px, calc(100vw - 24px));
+  max-height: 60vh;
+}
+/* Flip to the bottom for targets pinned so high on the page that the top card
+   would otherwise cover them (see scrollTargetBelowCard in wizardUI.js). */
+.wizard-card-top.wizard-card-bottom {
+  top: auto;
+  bottom: 12px;
+}
+.wizard-card-centered {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(520px, calc(100vw - 24px));
+  max-height: 80vh;
+}
+/* Lite's 'pro-promo' upgrade card (assets/wizardUI.js): a centered card with an
+   accent top edge and a small "KennelOS Pro" eyebrow, so the pitch reads as
+   intentional rather than a normal tour stop. */
+.wizard-card-promo { border-color: var(--accent); border-top: 3px solid var(--accent); }
+.wizard-promo-eyebrow { color: var(--accent-dark); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
+.wizard-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.wizard-step-count { color: var(--text-muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.wizard-tooltip-title { margin: 4px 0 8px; }
+.wizard-tooltip-body { margin: 0 0 14px; color: var(--text); }
+.wizard-tooltip-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.wizard-resume-pill {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 10002;
+  padding: 10px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-dark);
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+}
+.wizard-resume-pill:hover { background: var(--accent-dark); }
+
+/* --- First-run onboarding cards (assets/onboardingUI.js) -----------------
+   A dimmed, non-dismissible overlay (no backdrop close) stacked above the modal
+   layer, reusing the modal look. Shown once on a fresh install. */
+.onboard-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(18, 26, 38, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 40px 16px;
+  overflow-y: auto;
+}
+.onboard-card {
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 40px rgba(15, 25, 40, 0.28);
+  padding: 24px;
+  width: 100%;
+  max-width: 520px;
+}
+.onboard-title { margin: 0 0 12px; }
+.onboard-kels { display: block; width: 96px; height: 96px; border-radius: 50%; object-fit: cover; margin: 0 auto 12px; }
+.onboard-subtitle { margin: 0 0 8px; }
+.onboard-body p { color: var(--text); }
+.onboard-list { margin: 12px 0; padding-left: 20px; }
+.onboard-list li { margin: 6px 0; }
+.onboard-rule { border: none; border-top: 1px solid var(--border); margin: 18px 0; }
+.onboard-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+/* Buttons in dialogs wrap their label instead of overflowing the card at phone
+   width (".btn" is nowrap everywhere else). */
+.onboard-actions .btn, .modal .form-actions .btn { white-space: normal; max-width: 100%; text-align: center; }
+
+/* --- Cloud backup service notices (assets/cloudBackupUI.js) ------------- */
+/* The in-app shutdown/notice channel (Cloud Phase 1 plan §2.1). A strip at the
+   top of every page, shown only to a device signed in to cloud backup. */
+.cloud-notice { text-align: center; padding: 7px 16px; font-size: 13px; border-bottom: 1px solid var(--border); }
+.cloud-notice-info { background: var(--accent-soft); color: var(--accent-dark); }
+.cloud-notice-warning { background: var(--warn-soft); color: var(--warn); }
+.cloud-notice-shutdown { background: var(--danger-soft); color: var(--danger); }
+
+/* --- Report charts, KPIs, totals (Reports plan, phase 1) -------------------
+   Charts are SVG from assets/chartView.js; their marks carry their own colors,
+   so only the frame, legend, axis text and tooltip are styled here. */
+.report-kpis { margin: 0 0 16px; }
+.report-kpis .stat-num { font-size: clamp(19px, 5.2vw, 28px); overflow-wrap: anywhere; }
+.stat-hint { color: var(--text-faint); font-size: 12px; margin-top: 2px; }
+.report-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr)); gap: 16px; margin: 0 0 16px; }
+.report-charts:has(> .chart-slot:only-child) { grid-template-columns: 1fr; }
+.chart-slot { min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px 8px; }
+.chart { margin: 0; position: relative; }
+.chart-title { font-weight: 600; font-size: 14px; }
+.chart-sub { color: var(--text-muted); font-size: 12.5px; margin-top: 2px; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0 2px; font-size: 12.5px; color: var(--text-muted); }
+.chart-key { display: inline-flex; align-items: center; gap: 6px; }
+.chart-swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.chart-svg { display: block; margin-top: 6px; max-width: 100%; height: auto; overflow: visible; font-family: var(--font); }
+.chart-svg .tnum, table.data td { font-variant-numeric: tabular-nums; }
+.chart-hit { fill: transparent; cursor: default; }
+.chart-hit:hover { fill: rgba(28, 36, 48, 0.04); }
+.chart-empty { color: var(--text-faint); font-size: 13px; padding: 28px 0; text-align: center; }
+.chart-tip {
+  position: absolute; z-index: 5; pointer-events: none; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--shadow);
+  padding: 6px 9px; font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.chart-tip-head { font-weight: 600; margin-bottom: 2px; }
+.range-custom { display: inline-flex; align-items: center; gap: 6px; }
+.range-custom[hidden] { display: none; }
+.range-custom input { padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); font: inherit; font-size: 14px; }
+table.data td.num { white-space: nowrap; }
+table.data th.col-center, table.data td.col-center { text-align: center; }
+table.data tfoot .total-row td { font-weight: 700; background: var(--surface-2); border-top: 2px solid var(--border-strong); border-bottom: 0; }
+.print-header { display: none; }
+
+/* --- Printing a report (Print / Save as PDF) --------------------------------
+   The browser's own dialog makes the PDF; this hides the app chrome and the
+   controls, shows the letterhead (assets/printView.js), and keeps charts and
+   table rows from splitting across pages. Opt out of printing with .no-print. */
+@media print {
+  @page { margin: 14mm 12mm; }
+  body { background: #fff; font-size: 12px; }
+  /* Set on every element, not just body: WebKit (iPhone/iPad Safari) can apply
+     its economy print colors per element, dropping light borders and fills. */
+  *, *::before, *::after { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  #app-nav, .cloud-notice, .sample-banner, .no-print { display: none !important; }
+  /* Only on a page with a letterhead (a report), where it replaces the header. */
+  main:has(.print-header) .page-header, main:has(.print-header) .list-toolbar, main:has(.print-header) .seg-tabs { display: none !important; }
+  main { max-width: none; padding: 0; }
+  main:has(.print-header) .card { border: 0; box-shadow: none; padding: 0; }
+  .print-header { display: block; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 2px solid var(--text); }
+  .print-head-row { display: flex; align-items: center; gap: 12px; }
+  .print-logo { max-height: 48px; max-width: 120px; object-fit: contain; }
+  .print-kennel { font-size: 13px; color: var(--text-muted); }
+  .print-title { font-size: 20px; font-weight: 700; }
+  .print-details { display: flex; flex-wrap: wrap; gap: 2px 16px; margin-top: 6px; font-size: 11px; color: var(--text-muted); }
+  .report-kpis { grid-template-columns: repeat(4, 1fr); }
+  .stat { box-shadow: none; padding: 8px 10px; }
+  .stat-num, main .report-kpis .stat-num { font-size: 20px; }
+  .report-charts { grid-template-columns: 1fr 1fr; }
+  .report-charts:has(> .chart-slot:only-child) { grid-template-columns: 1fr; }
+  .chart-slot, .stat, tr, .print-block { break-inside: avoid; page-break-inside: avoid; }
+  .chart-tip, .chart-hit { display: none; }
+  table.data { border-radius: 0; font-size: 11px; }
+  table.data th, table.data td { padding: 5px 8px; }
+  thead { display: table-header-group; }
+  tfoot { display: table-row-group; }
+  a { color: inherit; text-decoration: none; }
+}
+.reports-featured { margin-bottom: 18px; }
+.reports-featured .tile { border-color: var(--accent); background: var(--accent-soft); }
+/* Year in Review: two charts a row, the year's litters and titles side by side. */
+.yr-charts { grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr)); }
+.yr-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 16px; }
+.yr-lists h3 { margin: 0 0 8px; font-size: 15px; }
+@media print {
+  .yr-kpis { grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
+  .yr-charts { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+  .yr-lists { grid-template-columns: 1fr 1fr; gap: 10px; }
+  .yr-lists h3 { font-size: 13px; margin-bottom: 4px; }
+}
+
+/* --- Kels, the guided-task helper (pages/kels.*, assets/kelsChat.js) ----------
+   A chat transcript: Kels's messages on the left (after a typing indicator),
+   her replies and answer panels on the right, all in one box that scrolls to
+   the newest message. Large type and big tap targets throughout. */
+.kels-fab {
+  position: fixed; right: 18px; bottom: 18px; z-index: 90;
+  width: 72px; height: 72px; border-radius: 50%;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+  background: var(--accent); color: #fff; text-decoration: none; text-align: center;
+  box-shadow: 0 6px 20px rgba(20, 50, 35, 0.35); border: 2px solid #fff;
+  transition: transform 0.15s ease;
+}
+.kels-fab:hover, .kels-fab:focus-visible { transform: scale(1.06); background: var(--accent-dark); }
+.kels-fab-icon { font-size: 22px; line-height: 1; }
+.kels-fab-photo { width: 40px; height: 40px; border-radius: 50%; display: block; }
+.kels-fab-label { font-size: 11px; font-weight: 700; line-height: 1.1; }
+.kels-fab-dot { position: absolute; top: 4px; right: 4px; width: 14px; height: 14px; border-radius: 50%; background: #e0a526; border: 2px solid #fff; }
+@media print { .kels-fab { display: none; } }
+
+.kels-main { max-width: 760px; }
+/* Sized to the screen as it is now (dvh: the address bar showing or not), less the
+   support bar when one is on top (--assist-bar-h, set by cloudAssistUI.js), so
+   Back / Next at the foot of her panel are never below the fold. */
+.kels-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); display: flex; flex-direction: column; height: calc(100vh - 120px - var(--assist-bar-h, 0px)); height: calc(100dvh - 120px - var(--assist-bar-h, 0px)); min-height: 420px; }
+/* Header: a bigger photo and title in the same 59px, so the chat doesn't move down. */
+.kels-header { display: flex; align-items: center; gap: 10px; padding: 3px 10px; min-height: 59px; box-sizing: border-box; border-bottom: 1px solid var(--border); }
+#kels-avatar { display: flex; flex: none; }
+.kels-header-text { flex: 1; min-width: 0; }
+.kels-header h1 { font-size: clamp(18px, 6.3vw, 28px); line-height: 1.15; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kels-header p { margin: 0; font-size: 14px; }
+.kels-header .btn { flex: none; }
+.kels-avatar { flex: 0 0 auto; width: 36px; height: 36px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
+.kels-avatar-lg { width: 52px; height: 52px; font-size: 24px; }
+.kels-avatar-photo { object-fit: cover; padding: 0; background: none; }
+.kels-transcript { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; scroll-behavior: smooth; overscroll-behavior: contain; }
+.kels-row { display: flex; gap: 6px; align-items: flex-end; animation: kels-in 0.25s ease both; }
+.kels-from-kels { justify-content: flex-start; }
+.kels-from-you { justify-content: flex-end; }
+.kels-bubble { max-width: 85%; padding: 8px 12px; border-radius: 16px; font-size: 17px; line-height: 1.4; }
+.kels-from-kels .kels-bubble { background: var(--surface-2); border-bottom-left-radius: 5px; }
+.kels-from-you .kels-bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 5px; }
+.kels-bubble strong { font-weight: 700; }
+.kels-bubble .kels-lead { display: block; margin: 4px 0 0; color: var(--text-muted); font-size: 16px; }
+/* Numbered steps in her message (account health's "Help me replace it"). */
+.kels-bubble .kels-steps { margin: 8px 0 10px; padding-left: 22px; }
+.kels-bubble .kels-steps li { margin: 4px 0; }
+/* A saved login shown in her panel: label, value, small Show / Copy buttons. */
+/* A group of related settings in her panel ("Set up my waitlist"). */
+.kels-panel .ws-group { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px 10px; margin: 10px 0; }
+.kels-panel .ws-group legend { font-weight: 600; padding: 0 4px; }
+.kels-panel .ws-group .field-hint { margin: 0 0 6px; }
+.kels-panel .ws-check { display: flex; align-items: flex-start; gap: 8px; margin: 6px 0; color: var(--text); font-size: 15px; }
+.kels-panel .ws-check input { margin-top: 3px; flex: 0 0 auto; }
+.kels-panel .ws-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; margin: 4px 0; }
+.kels-panel .ws-row > span { flex: 1 1 100%; font-weight: 500; }
+.kels-login { margin-bottom: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.kels-login .gl-q { margin: 0 0 6px; }
+.kels-login-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 2px 0; }
+.kels-login-row .faint { min-width: 74px; }
+.kels-login-row code { overflow-wrap: anywhere; }
+.kels-bubble a { color: var(--accent-dark); }
+.kels-past { opacity: 0.85; }
+.kels-typing { display: inline-flex; gap: 5px; align-items: center; padding: 11px 14px; }
+.kels-typing span { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); animation: kels-dot 1.1s infinite ease-in-out; }
+.kels-typing span:nth-child(2) { animation-delay: 0.15s; }
+.kels-typing span:nth-child(3) { animation-delay: 0.3s; }
+@keyframes kels-dot { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-5px); opacity: 1; } }
+@keyframes kels-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.kels-pick { width: min(100%, 560px); display: flex; flex-direction: column; gap: 6px; }
+.kels-search { font: inherit; font-size: 16px; width: 100%; padding: 9px 12px; min-height: 44px; border: 1px solid var(--border-strong); border-radius: 22px; background: var(--surface); }
+.kels-search-empty { margin: 0; font-size: 15px; color: var(--text-muted); text-align: right; }
+/* Two across; an opened choice takes the whole row so its description has room. */
+.kels-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; width: 100%; }
+.kels-choice[hidden] { display: none; }
+.kels-choice.open { grid-column: 1 / -1; }
+.kels-choice {
+  font: inherit; font-size: 16px; font-weight: 600; line-height: 1.25; text-align: left; cursor: pointer;
+  display: flex; flex-direction: column; justify-content: center; gap: 2px; min-height: 44px;
+  padding: 8px 12px; border-radius: 14px; border: 2px solid var(--accent); background: var(--surface); color: var(--accent-dark);
+  opacity: 0; transform: translateY(6px); transition: opacity 0.3s ease, transform 0.3s ease, background 0.15s;
+}
+.kels-choice.in { opacity: 1; transform: none; }
+.kels-choice:hover { background: var(--accent-soft); }
+.kels-choice.primary { background: var(--accent); color: #fff; }
+.kels-choice.primary:hover { background: var(--accent-dark); }
+.kels-choice-sub, .kels-choice-hint { display: none; font-size: 14px; font-weight: 400; color: var(--text-muted); }
+.kels-choice.open .kels-choice-sub, .kels-choice.open .kels-choice-hint { display: block; }
+.kels-choice-hint { font-weight: 700; color: var(--accent-dark); margin-top: 2px; }
+.kels-choice.has-sub .kels-choice-label::after { content: "\00a0›"; font-weight: 400; }
+.kels-choice.open .kels-choice-label::after { content: ""; }
+.kels-choice.primary .kels-choice-sub, .kels-choice.primary .kels-choice-hint { color: #e5f0ea; }
+/* A starrable task: the button, its ☆ in the corner (its own tap target), and when
+   it's open, the "Don't move this up" button for one she uses often. */
+.kels-choice-cell { position: relative; display: grid; gap: 4px; align-content: start; }
+.kels-choice-cell[hidden] { display: none; }
+.kels-choice-cell.open { grid-column: 1 / -1; }
+.kels-choice-cell > .kels-choice { padding-right: 44px; height: 100%; }
+.kels-star {
+  position: absolute; top: 2px; right: 2px; width: 44px; height: 44px; padding: 0;
+  border: 0; background: none; cursor: pointer; font-size: 22px; line-height: 1; color: var(--accent);
+}
+.kels-choice-cell:has(.kels-choice.primary) .kels-star { color: #fff; }
+.kels-star:focus-visible { outline: 2px solid var(--accent-dark); outline-offset: -4px; border-radius: 12px; }
+.kels-choice-note { font-size: 13px; font-weight: 400; color: var(--text-muted); }
+.kels-choice.primary .kels-choice-note { color: #e5f0ea; }
+.kels-choice-aside { display: none; justify-self: end; font: inherit; font-size: 14px; background: none; border: 0; color: var(--accent-dark); text-decoration: underline; cursor: pointer; padding: 6px 4px; min-height: 36px; }
+.kels-choice-cell.open .kels-choice-aside { display: block; }
+.kels-panel { width: min(100%, 560px); background: var(--surface); border: 2px solid var(--accent-soft); border-radius: 16px; border-bottom-right-radius: 5px; padding: 10px 12px; }
+.kels-panel-foot { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+@media (prefers-reduced-motion: reduce) {
+  .kels-row, .kels-choice, .kels-typing span { animation: none; transition: none; }
+}
+@media (max-width: 520px) {
+  .kels-main { padding: 0; }
+  .kels-card { height: calc(100vh - 96px - var(--assist-bar-h, 0px)); height: calc(100dvh - 96px - var(--assist-bar-h, 0px)); border-radius: 0; border-left: none; border-right: none; }
+  .kels-transcript { padding: 8px; }
+  .kels-bubble { max-width: 92%; }
+}
+
+/* Answer-panel contents (assets/guidedLitterUI.js screens). */
+.gl-q { font-weight: 600; margin: 18px 0 8px; }
+.gl-note { font-size: 15px; margin-top: 14px; }
+.gl-body .field { margin-bottom: 10px; }
+.gl-body .field label { font-size: 16px; color: var(--text); }
+.gl-body .field-hint { font-size: 14px; }
+.gl-body .field input:not([type="checkbox"]):not([type="radio"]), .gl-body .field select { font-size: 18px; padding: 12px; min-height: 48px; }
+.gl-lead { font-size: 16px; color: var(--text-muted); margin: 0 0 14px; }
+.gl-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+.gl-tiles-small { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+.gl-tile {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left;
+  font: inherit; font-size: 17px; font-weight: 600; color: var(--text);
+  background: var(--surface); border: 2px solid var(--border-strong); border-radius: var(--radius);
+  padding: 12px 14px; min-height: 56px; cursor: pointer;
+}
+.gl-tile:hover { background: var(--surface-2); }
+.gl-tile.selected { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.gl-tile-sub { font-size: 14px; font-weight: 400; color: var(--text-muted); }
+.gl-tile .faint { font-weight: 400; font-size: 14px; }
+.gl-more { margin-top: 10px; background: none; border: none; color: var(--accent-dark); text-decoration: underline; padding: 8px 0; font-size: 16px; }
+.gl-stepper { display: grid; grid-template-columns: 1fr 48px 80px 48px; gap: 8px; align-items: center; margin-bottom: 14px; }
+.gl-stepper-label { font-weight: 600; }
+.gl-stepper input { font: inherit; font-size: 20px; text-align: center; padding: 10px 4px; min-height: 48px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); width: 100%; }
+.gl-step-btn { justify-content: center; font-size: 24px; min-height: 48px; padding: 0; }
+.gl-setall { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background: var(--surface-2); padding: 10px; border-radius: var(--radius-sm); margin-bottom: 12px; }
+.gl-setall select { font: inherit; padding: 8px; }
+.gl-plan-row { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; padding: 10px 0; border-top: 1px solid var(--border); }
+.gl-plan-row select { font: inherit; font-size: 16px; padding: 8px; min-height: 44px; grid-column: 1 / -1; }
+.gl-price-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0 18px; }
+.gl-price-grid h3 { margin: 4px 0 10px; }
+.gl-preview ul, .gl-review-section ul { margin: 6px 0 0; padding-left: 20px; }
+.gl-preview li, .gl-review-section li { margin: 4px 0; }
+.gl-extra-row { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 10px; }
+.gl-review-section { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 12px; }
+.gl-review-section h3 { margin: 0; font-size: 18px; }
+.gl-back, .gl-next, .gl-big { font-size: 17px; padding: 10px 18px; min-height: 46px; }
+.gl-inline-error { font-size: 16px; }
+.gl-progress-inline { color: var(--text-muted); font-size: 14px; margin: 0 0 4px; }
+.gl-family { margin: 0; font-size: 22px; }
+.gl-send-row { margin: 16px 0 8px; gap: 10px; }
+/* Add dogs (assets/guidedDogsUI.js): the roster, a name and boy / girl per dog. */
+.gd-row { display: grid; grid-template-columns: 1fr auto auto 44px; gap: 8px; align-items: center; padding: 8px 0; border-top: 1px solid var(--border); }
+.gd-row input { width: 100%; min-width: 0; font: inherit; font-size: 18px; color: var(--text); padding: 10px 12px; min-height: 48px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); }
+.gd-row .gl-tile { min-height: 48px; padding: 8px 12px; justify-content: center; }
+.gd-remove { min-height: 44px; justify-content: center; padding: 0; }
+@media (max-width: 520px) {
+  .gd-row { grid-template-columns: 1fr 1fr 44px; }
+  .gd-row input { grid-column: 1 / -1; }
+}
+/* Kels's litter check-in (assets/litterCheckinUI.js): a row per puppy. */
+.ck-inline { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0 12px; }
+.ck-row { display: grid; grid-template-columns: 1fr 92px 92px; gap: 8px; align-items: center; padding: 10px 0; border-top: 1px solid var(--border); }
+.ck-row-name { display: flex; flex-direction: column; gap: 2px; }
+.ck-row-name .field-hint { font-size: 14px; }
+.ck-unit { display: flex; align-items: center; gap: 4px; font-size: 15px; color: var(--text-muted); }
+/* Tidy up (assets/tidyUpUI.js): a radio choice per line, and two records side by side. */
+.gl-body .field .td-radio { display: flex; align-items: center; gap: 10px; min-height: 44px; font-size: 16px; font-weight: 400; cursor: pointer; }
+.td-radio input { width: 20px; height: 20px; flex: none; }
+.kels-bubble .kels-list { margin: 8px 0 0; padding-left: 20px; }
+.kels-bubble .kels-list li { margin: 4px 0; }
+.ck-unit input { width: 100%; min-width: 0; font: inherit; font-size: 18px; color: var(--text); text-align: center; padding: 10px 4px; min-height: 48px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); }
+.ck-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.ck-check { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 16px; cursor: pointer; }
+.ck-check input { width: 20px; height: 20px; }
+/* Pups are going home's "Which puppies are leaving?": one pup per row, its sale under its name. */
+.pp-checks { grid-template-columns: 1fr; }
+.pp-checks .pp-sub { display: block; font-size: 14px; }
+.gl-body textarea { width: 100%; font: inherit; font-size: 17px; padding: 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); }
+@media (max-width: 420px) { .ck-row { grid-template-columns: 1fr 76px 76px; } }
+.kels-main { padding-top: 8px; padding-bottom: 8px; }
+@media (max-width: 520px) { .kels-main { padding: 0; } }
+/* Room under every page's content for the floating button. */
+body:has(> .kels-fab) main { padding-bottom: 104px; }
+
+/* A folded group of settings inside one card (Kennel → Waitlist settings): a
+   bordered row with a chevron, a title and a one-line hint; open, the fields
+   sit inside it. Several groups share the card's single Save. */
+.settings-group { border: 1px solid var(--border); border-radius: var(--radius); margin: 10px 0; background: var(--surface); }
+.settings-group > summary { list-style: none; cursor: pointer; padding: 10px 12px 10px 34px; position: relative; display: flex; flex-direction: column; gap: 2px; }
+.settings-group > summary::-webkit-details-marker { display: none; }
+.settings-group > summary::before { content: '▸'; position: absolute; left: 13px; top: 10px; color: var(--text-muted); transition: transform 0.15s; }
+.settings-group[open] > summary::before { transform: rotate(90deg); }
+.settings-group > summary .field-hint { margin: 0; }
+.settings-group[open] > summary { border-bottom: 1px solid var(--border); }
+.settings-group > .form-grid { padding: 12px; }
+.settings-group > .form-pick-list { padding: 4px 12px 8px; }
+
+/* qaListEditor.js: her FAQ and her waitlist policies, rows of heading + text. */
+.qa-row { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; margin-top: 10px; background: var(--surface); }
+.qa-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.qa-num { font-weight: 700; color: var(--text-muted); min-width: 1.6em; }
+.qa-head input.qa-a { flex: 1 1 220px; min-width: 0; }
+.qa-move { display: flex; gap: 4px; margin-left: auto; }
+.qa-row textarea { min-height: 90px; }
+#wl-policies-list .qa-row textarea { min-height: 170px; }
+.qa-note { margin: 6px 0 0; font-size: 13px; color: var(--text-muted); }
+.qa-note.changed { color: var(--warn, #8a5f17); font-weight: 600; }
+.qa-count:empty { display: none; }
+.qa-count { margin: 4px 0 0; font-size: 12px; color: var(--text-muted); }
+.qa-count.changed { color: var(--warn, #8a5f17); font-weight: 600; }
+
+
+/* Do-not-sell warnings and "Add to [program]?" (waitlist family page, Approve dialog,
+   the Waitlist page's new applications). */
+.dns-alert { border-left: 4px solid var(--danger); background: var(--danger-soft); }
+.dns-alert-line { margin: 0 0 10px; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--danger-soft); color: var(--danger); font-size: 13px; }
+.program-suggest { border-left: 4px solid var(--accent); background: var(--accent-soft); }
+.program-suggest-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin: 0; font-weight: normal; }
+.program-suggest-row select { min-width: 9em; flex: 0 0 auto; }
+.row-flags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+
+/* Send for e-signature: what goes in (assets/esignUI.js) */
+.esign-details { margin: 4px 0 10px; }
+.esign-details summary { cursor: pointer; font-weight: 600; }
+.esign-detail-list { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 4px 12px; margin: 6px 0 0; max-height: 260px; overflow: auto; }
+.esign-detail-list dt { color: var(--text-muted); overflow-wrap: anywhere; }
+.esign-detail-list dd { margin: 0; overflow-wrap: anywhere; }

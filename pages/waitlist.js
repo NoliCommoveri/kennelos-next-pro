@@ -1,0 +1,348 @@
+// waitlist.js — the Waitlist page (Waitlist Spec §5.2/§6.1; End-State guide §29).
+// One kennel's list at a time (one list per kennel, Spec §0): new applications,
+// approved families whose fee is due, the ranked rolling list, and closed runs.
+// Position and passes are DERIVED here from waitlistRules — nothing is stored.
+// Also the waitlist as the main workflow (Spec §15.2): each live litter with who's
+// next and a one-tap offer. Its one primary action is "+ New application"; the rest
+// sit under Manage (the form, programs, publishing the list — waitlist-publish.html —
+// and settings). Pro-only page (proPages.js).
+import { waitlistEntryRepo } from '../data/waitlistEntryRepo.js';
+import { waitlistOfferRepo } from '../data/waitlistOfferRepo.js';
+import { waitlistProgramRepo } from '../data/waitlistProgramRepo.js';
+import { contactRepo } from '../data/contactRepo.js';
+import { litterRepo } from '../data/litterRepo.js';
+import { dogRepo } from '../data/dogRepo.js';
+import { saleRepo } from '../data/saleRepo.js';
+import * as actions from '../data/waitlistActions.js';
+import { WAITLIST_ENTRY_STATUS, WAITLIST_PRIORITY, WAITLIST_REMOVED_REASON } from '../data/vocab.js';
+import {
+  waitlistConfig, passesUsed, isMovedByBreeder, anchorDate, contactMatches, entryName,
+  canUndoRemoval, overdueFees, nextFamilyForLitter, nextTurn, nextOfferedTurn, openTurns, isTurnOverdue, isPupAvailable,
+  soonFamiliesForKennel, kennelBreeds, resolveBreed, whelpNotes, nextTurnPrepassNote, describeOfferChanges,
+  numberedList, holdsPlace, isPupReserved, waitlistLitters, isFamilyPageOnly
+} from '../data/waitlistRules.js';
+import { esc, badge, fmtDate, fmtMoney, param, todayYMD, kennelToday, cardShell, alertModal, wireActionMenu } from '../assets/ui.js';
+import { resolveWaitlistKennel, mountKennelPicker, prefsSummary, entryFlags, openSoonNotice } from '../assets/waitlistUI.js';
+import { offerEmails } from '../assets/waitlistEmailUI.js';
+import { programIconHtml } from '../assets/programIcons.js';
+import { offerSpecs, midTurn } from '../data/waitlistOutbox.js';
+import { openPicksPreview, previewParam } from '../assets/picksPreviewModal.js';
+import { formQuestions } from '../data/waitlistForm.js';
+import { programSuggestions } from '../data/programSuggest.js';
+import { doNotSellRepo } from '../data/doNotSellRepo.js';
+import { entryDoNotSellMatches } from '../data/doNotSell.js';
+import { applicationMatches } from '../data/applicationDuplicates.js';
+import { isPairDismissed } from '../assets/applicationMergeUI.js';
+
+const els = {
+  title: document.getElementById('wl-title'),
+  actions: document.getElementById('wl-actions'),
+  picker: document.getElementById('wl-kennel-picker'),
+  body: document.getElementById('wl-body'),
+  error: document.getElementById('page-error')
+};
+
+const CLOSED = ['placed', 'removed', 'withdrawn', 'declined', 'expired'];
+const none = '<span class="faint">—</span>';
+const entryHref = (e) => `waitlist-entry.html?id=${encodeURIComponent(e.id)}`;
+
+// Each table scrolls inside its card on a narrow screen (.table-scroll).
+function table(headers, rows) {
+  return `<div class="table-scroll"><table class="data"><thead><tr>${headers.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
+}
+const row = (e, cells) => `<tr class="clickable" data-href="${esc(entryHref(e))}">${cells.map((c) => `<td>${c}</td>`).join('')}</tr>`;
+
+// The picks preview reopens once per page load (?preview=<litter id>).
+let previewReopened = false;
+
+async function main() {
+  const { kennel, own } = await resolveWaitlistKennel(param('kennel'));
+  if (!kennel) {
+    els.body.innerHTML = '<div class="empty-state">Set up your kennel first — each of your kennels keeps its own waitlist.</div>';
+    return;
+  }
+  mountKennelPicker(els.picker, { kennel, own });
+  const kq = `kennel=${encodeURIComponent(kennel.id)}`;
+  els.title.textContent = own.length > 1 ? `Waitlist — ${kennel.kennel_name}` : 'Waitlist';
+  // One primary action; everything else lives under Manage. (CSV import is on the
+  // Import/Export page.)
+  els.actions.innerHTML = `
+    <a class="btn" href="kels.html?task=waitlist-setup&${kq}">✨ Set up your waitlist with Kels</a>
+    <a class="btn btn-primary" href="waitlist-entry.html?new=1&${kq}">+ New application</a>
+    <div class="action-menu" id="wl-manage">
+      <button class="btn" type="button" aria-haspopup="menu" aria-expanded="false">Manage ▾</button>
+      <div class="action-menu-list" role="menu" hidden>
+        <button type="button" role="menuitem" id="wl-soon" title="Tell the families whose turn is coming up for the pups available now">Almost your turn…</button>
+        <hr>
+        <a role="menuitem" href="waitlist-form.html?${kq}">Application form</a>
+        <a role="menuitem" href="waitlist-programs.html?${kq}">Programs</a>
+        <a role="menuitem" href="waitlist-publish.html?${kq}">Publish list</a>
+        <a role="menuitem" href="kennel.html?id=${encodeURIComponent(kennel.id)}#waitlist-settings">Settings</a>
+      </div>
+    </div>`;
+  wireActionMenu(document.getElementById('wl-manage'));
+
+  const [entries, offers, programs, contacts, litters, dogs, sales, doNotSell] = await Promise.all([
+    waitlistEntryRepo.getByKennel(kennel.id),
+    waitlistOfferRepo.getByKennel(kennel.id),
+    waitlistProgramRepo.getMapForKennel(kennel.id),
+    contactRepo.getAll({ includeArchived: true }),
+    litterRepo.getAll(),
+    dogRepo.getAll({ includeArchived: true }),
+    saleRepo.getAll({ includeArchived: true }),
+    doNotSellRepo.getAll()
+  ]);
+  const config = waitlistConfig(kennel);
+  // Before she opens an application: whether it's on her do-not-sell list, and the
+  // programs its answers suggest ("Add to …?" waits on the family's page).
+  const form = formQuestions(config);
+  // …and whether it may be the same family as another application on this list
+  // (applicationDuplicates.js; merged from the family's page after she confirms).
+  const contactMap = new Map(contacts.map((c) => [c.id, c]));
+  const reviewFlags = (e) => {
+    const dns = entryDoNotSellMatches(e, doNotSell);
+    const dup = applicationMatches(e, entries, { contactsById: contactMap, dismissed: isPairDismissed })[0];
+    const flags = [
+      ...(dns.length ? [`<span class="badge badge-red" title="Open the application to see who it matches">${dns[0].strength === 'certain' ? 'Do not sell' : 'Maybe do not sell'}</span>`] : []),
+      ...(dup ? [`<span class="badge badge-amber" title="Open the application to compare it with the other one">${dup.strength === 'certain' ? 'Likely a duplicate' : 'Maybe a duplicate'}</span>`] : []),
+      ...programSuggestions(e, form, programs).map((s) => `<span class="badge badge-green" title="Their answers suggest this program: open the application to add them">Add to ${esc(s.program.name)}?</span>`)
+    ];
+    return flags.length ? `<div class="row-flags">${flags.join('')}</div>` : '';
+  };
+  // A breed preference that isn't one of this kennel's breeds matches no pup: flag it.
+  const breeds = kennelBreeds(kennel, dogs);
+  const breedFlag = (e) => (e.pref_breed && resolveBreed(e.pref_breed, breeds) === null
+    ? ' <span class="badge badge-red" title="No pup will match this breed. Open the family to pick one of your breeds.">Unknown breed</span>' : '');
+  // The waitlist's deadlines are on the kennel's own date (D11).
+  const today = kennelToday(kennel);
+  const contactsById = new Map(contacts.map((c) => [c.id, c]));
+  const nameOf = (e) => esc(entryName(e, contactsById.get(e.contact_id)));
+  const programBadge = (e) => {
+    const p = programs.get(e.waitlist_program_id);
+    if (!p) return '';
+    const cls = p.priority === 'ahead' ? 'badge-purple' : 'badge-neutral';
+    const icon = programIconHtml(p);
+    return ` <span class="badge ${cls}" title="${esc(p.priority === 'ahead' ? WAITLIST_PRIORITY[1].label : '')}">${icon ? `${icon} ` : ''}${esc(p.name)}</span>`;
+  };
+
+  // --- New applications (Spec §5.2) ---
+  const applied = entries.filter((e) => e.status === 'applied')
+    .sort((a, b) => (a.applied_date || '').localeCompare(b.applied_date || '') || (a.created_at || '').localeCompare(b.created_at || ''));
+  const appliedHtml = applied.length
+    ? table(['Applicant', 'Applied', 'Wants', 'Possible match'], applied.map((e) => {
+        const matches = e.contact_id ? [] : contactMatches(e.application || {}, contacts);
+        const match = e.contact_id
+          ? '<span class="badge badge-neutral">Existing contact</span>'
+          : matches.length ? `<span class="badge badge-amber">${esc(matches[0].contact.name)}${matches.length > 1 ? ` +${matches.length - 1}` : ''}</span>` : none;
+        return row(e, [`<strong>${nameOf(e)}</strong>${programBadge(e)}${reviewFlags(e)}`, e.applied_date ? esc(fmtDate(e.applied_date)) : none, prefsSummary(e), match]);
+      }))
+    : '<div class="empty-state">No new applications.</div>';
+
+  // --- Fee due (approved, not yet on the list) ---
+  const approved = entries.filter((e) => e.status === 'approved')
+    .sort((a, b) => (a.approved_date || '').localeCompare(b.approved_date || ''));
+  const overdue = new Set(overdueFees(approved, today).map((e) => e.id));
+  const approvedHtml = approved.length
+    ? table(['Family', 'Approved', 'Fee', 'Pay by'], approved.map((e) => row(e, [
+        `<strong>${nameOf(e)}</strong>${programBadge(e)}${reviewFlags(e)}`,
+        e.approved_date ? esc(fmtDate(e.approved_date)) : none,
+        e.fee_amount != null ? esc(fmtMoney(e.fee_amount)) : none,
+        e.fee_due_date ? `${esc(fmtDate(e.fee_due_date))}${overdue.has(e.id) ? ' <span class="badge badge-red">Past due</span>' : ''}` : none
+      ])))
+    : '<div class="empty-state">Nobody is waiting on a fee.</div>';
+
+  // --- The rolling list (Spec §6.1) ---
+  // Numbered with the families who have a pup selected (Waitlist Fixes Plan §3.1):
+  // they keep their place and number until the pup goes home.
+  const salesById = new Map(sales.map((x) => [x.id, x]));
+  const numbered = numberedList(entries, kennel.id, programs, { sales, dogs });
+  const selectedPup = (e) => dogs.find((d) => d.id === salesById.get(e.placed_sale_id)?.dog_id)?.call_name || '';
+  const listHtml = numbered.length
+    ? table(['#', 'Family', 'Wants', 'Passes', 'In line since'], numbered.map((e, i) => (e.status === 'active' ? row(e, [
+        `<strong>${i + 1}</strong>`,
+        `<strong>${nameOf(e)}</strong>${programBadge(e)} ${entryFlags(e, today, config)}${breedFlag(e)}`,
+        prefsSummary(e),
+        `${passesUsed(e, offers)} of ${esc(config.max_passes)}`,
+        `${esc(fmtDate(anchorDate(e)))}${isMovedByBreeder(e) ? ' <span class="badge badge-purple" title="You set this place by hand">Moved by you</span>' : ''}`
+      ]) : row(e, [
+        `<strong>${i + 1}</strong> <span title="Pup selected">✓</span>`,
+        `<strong>${nameOf(e)}</strong>${programBadge(e)} <span class="badge badge-green" title="They keep this number until the pup goes home">Pup selected${selectedPup(e) ? `: ${esc(selectedPup(e))}` : ''}</span>`,
+        '<span class="faint">Pup selected</span>',
+        none,
+        esc(fmtDate(anchorDate(e)))
+      ]))))
+    : '<div class="empty-state">Nobody is on the list yet. Families join once you approve them and mark their fee received.</div>';
+
+  // --- Litters: who's next (Spec §15.2) ---
+  const dogsById = new Map(dogs.map((d) => [d.id, d]));
+  const dogName = (id) => dogsById.get(id)?.call_name || '—';
+  const litterLabel = (l) => l.nickname || `${dogName(l.dam_id)} × ${dogName(l.sire_id)}`;
+  const entriesById = new Map(entries.map((e) => [e.id, e]));
+  const familyLink = (e) => `<a href="${esc(entryHref(e))}">${nameOf(e)}</a>`;
+  const opts = { today, config, programsById: programs };
+  // "Not this litter" on the next family's turn (Spec §16.2), said before she taps.
+  const prepassNoteHtml = (n) => {
+    const note = nextTurnPrepassNote(n.entry, n.litters, { offers, config, program: programs.get(n.entry.waitlist_program_id) || null, litterOf: litterLabel });
+    return note ? `<p class="field-hint" style="margin:-4px 0 8px;"><span class="badge badge-amber">Not this litter</span> ${esc(note)}</p>` : '';
+  };
+  // A litter stays on the card while it has a pup available or reserved (E2).
+  const litterRows = waitlistLitters(kennel, litters)
+    .map((l) => {
+      const pups = dogs.filter((d) => d.litter_id === l.id);
+      const available = pups.filter((d) => isPupAvailable(d, sales));
+      const reserved = pups.filter(isPupReserved);
+      const lOffers = offers.filter((o) => o.litter_id === l.id);
+      const open = lOffers.find((o) => o.outcome === 'open' && !o.is_archived) || null;
+      // First in line for this litter alone (Spec §6.1): only to say someone is.
+      const next = open ? null : nextFamilyForLitter(entries, lOffers, l, pups, sales, opts);
+      return { l, available, reserved, open, next };
+    })
+    .filter((r) => r.available.length || r.reserved.length || r.open);
+  // One family holds a turn at a time across the open litters (Spec §16.1): the
+  // card leads with it, or with who's next.
+  const kennelTurns = openTurns(offers, kennel.id);
+  const kennelLitters = litters.filter((l) => l.kennel_id === kennel.id);
+  // Who opening picks on a litter really offers the turn to: the kennel-wide rule,
+  // never the litter's own queue (K6-6).
+  const opensTo = (l) => (kennelTurns.length ? null
+    : nextOfferedTurn(entries, offers, kennelLitters, dogs, sales, { ...opts, kennelId: kennel.id, opening: l }));
+  const upNext = kennelTurns.length ? null : nextTurn(entries, offers, kennelLitters, dogs, sales, { ...opts, kennelId: kennel.id });
+  const turnLine = kennelTurns.length
+    ? kennelTurns.map((t) => {
+      const e = entriesById.get(t.entry_id);
+      const overdue = isTurnOverdue(t, today);
+      return `<p style="margin:0 0 8px;"><strong>${e ? familyLink(e) : 'A family'}'s turn</strong>: ${esc(t.offers.map((o) => litterLabel(litters.find((x) => x.id === o.litter_id) || {})).join(', '))} · pick and pay by ${esc(fmtDate(t.respond_by_date))}${overdue ? ' <span class="badge badge-red">Deadline passed</span>' : ''}</p>`;
+    }).join('')
+    : upNext
+      ? `<p style="margin:0 0 8px;">Next turn: <strong>${familyLink(upNext.entry)}</strong> (${esc(upNext.litters.map((x) => litterLabel(x.litter)).join(', '))}) <button class="btn btn-sm btn-primary" data-offer-litter="${esc(upNext.litters[0].litter.id)}">Offer to them</button></p>${prepassNoteHtml(upNext)}`
+      : '';
+  const littersHtml = litterRows.length
+    ? turnLine + table(['Litter', 'Pups available', 'Reserved', 'Picks', 'Turn'], litterRows.map(({ l, available, reserved, open, next }) => {
+        let turn;
+        if (open) {
+          const e = entriesById.get(open.entry_id);
+          const picked = open.chosen_dog_id ? ` · <span class="badge badge-purple">Picked ${esc(dogName(open.chosen_dog_id))}</span> deposit pending` : '';
+          turn = `In ${e ? familyLink(e) : 'a family'}'s turn${picked}`;
+        } else if (l.picks_opened_date) {
+          turn = kennelTurns.length ? '<span class="faint">Waits for the next turn</span>'
+            : upNext && upNext.litters.some((x) => x.litter.id === l.id) ? '<span class="faint">In the next turn</span>'
+              : '<span class="faint">Nobody on the list is eligible</span>';
+        } else if (next) {
+          const to = opensTo(l);
+          turn = `${to ? `Opening picks offers the turn to ${familyLink(to.entry)}` : `First in line for this litter: ${familyLink(next.entry)}`} <button class="btn btn-sm" data-offer-litter="${esc(l.id)}" title="Open picks on this litter">Open picks</button>`;
+        } else turn = '<span class="faint">Nobody on the list is eligible</span>';
+        return `<tr><td><a href="litter.html?id=${encodeURIComponent(l.id)}">${esc(litterLabel(l))}</a></td>
+          <td>${available.length}</td>
+          <td>${reserved.length}</td>
+          <td>${l.picks_opened_date ? `Open since ${esc(fmtDate(l.picks_opened_date))}` : '<span class="faint">Not open</span>'}</td>
+          <td>${turn}</td></tr>`;
+      }))
+    : '<div class="empty-state">No litters with pups to offer right now.</div>';
+
+  // --- Family pages only (E3, D6): families with a status page and no place ---
+  const pageOnly = entries.filter(isFamilyPageOnly)
+    .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+  const pageOnlyHtml = pageOnly.length
+    ? table(['Family', 'Pup', 'Gone home?'], pageOnly.map((e) => {
+        const sale = salesById.get(e.placed_sale_id);
+        const pup = sale ? dogsById.get(sale.dog_id) : null;
+        const home = e.status !== 'placed' ? '<span class="badge badge-neutral">Backed out</span>'
+          : sale?.status === 'delivered' ? '<span class="badge badge-green">Home</span>'
+            : ['returned', 'cancelled', 'voided'].includes(sale?.status) ? `<span class="badge badge-neutral">Sale ${esc(sale.status)}</span>`
+              : '<span class="faint">Not yet</span>';
+        return row(e, [`<strong>${nameOf(e)}</strong>`, pup ? esc(pup.call_name || '—') : none, home]);
+      }))
+    : '<div class="empty-state">No family pages. A litter sold outside the waitlist can give its families a status page from its Litter page (Non-Waitlist Sales…).</div>';
+
+  // --- Closed runs ---
+  // A family with a pup selected is still on the list, not closed; a family page only
+  // has its own section.
+  const closed = entries.filter((e) => CLOSED.includes(e.status) && !holdsPlace(e, { sales, dogs }) && !isFamilyPageOnly(e))
+    .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+  const closedHtml = closed.length
+    ? table(['Family', 'Status', 'Why'], closed.map((e) => row(e, [
+        `<strong>${nameOf(e)}</strong>`,
+        badge(WAITLIST_ENTRY_STATUS, e.status) + (canUndoRemoval(e, today) ? ' <span class="badge badge-amber">Undo available</span>' : ''),
+        e.status === 'removed' && e.removed_reason ? badge(WAITLIST_REMOVED_REASON, e.removed_reason) : none
+      ])))
+    : '<div class="empty-state">No closed entries.</div>';
+
+  const count = (n) => ` <span class="faint">(${n})</span>`;
+  els.body.innerHTML =
+    cardShell('New applications' + count(applied.length), appliedHtml, { key: 'applied', isEmpty: !applied.length }) +
+    cardShell('Fee due' + count(approved.length), approvedHtml, { key: 'approved', isEmpty: !approved.length, marginTop: true }) +
+    cardShell('On the list' + count(numbered.length), listHtml, { key: 'list', marginTop: true }) +
+    cardShell('Litters' + count(litterRows.length), littersHtml, { key: 'litters', isEmpty: !litterRows.length, marginTop: true }) +
+    cardShell('Family pages only' + count(pageOnly.length), pageOnlyHtml, { key: 'pageonly', isEmpty: !pageOnly.length, marginTop: true }) +
+    cardShell('Closed' + count(closed.length), closedHtml, { key: 'closed', isEmpty: true, marginTop: true });
+
+  els.body.querySelectorAll('tr[data-href]').forEach((tr) => {
+    tr.addEventListener('click', () => { location.href = tr.dataset.href; });
+  });
+
+  // Offer the next family their turn — opening picks first if they aren't open.
+  els.body.querySelectorAll('[data-offer-litter]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        const l = litters.find((x) => x.id === btn.dataset.offerLitter);
+        // Opening picks goes through the picks preview first (Picks Preview Spec §3).
+        let turn;
+        if (l.picks_opened_date) turn = await actions.offerNext(l.id);
+        else {
+          const res = await openPicksPreview({ litterId: l.id });
+          if (!res) { btn.disabled = false; await main(); return; }
+          turn = res.turn;
+        }
+        // Families passed on the way ("Not this litter" to their whole turn, §16.2).
+        const passedLines = describeOfferChanges({ auto_passed: turn?.auto_passed || [] }, {
+          nameOf: (id) => { const e = entriesById.get(id); return e ? entryName(e, contactsById.get(e.contact_id)) : 'A family'; },
+          litterOf: (id) => litterLabel(litters.find((x) => x.id === id) || {})
+        });
+        if (turn && !turn.none) {
+          const e = entriesById.get(turn.entry_id);
+          const covers = (turn.litter_ids || []).map((id) => litterLabel(litters.find((x) => x.id === id) || {})).join(', ');
+          await alertModal({ title: turn.joined ? 'Added to their turn' : 'Turn offered', message: [...passedLines, `It's ${e ? entryName(e, contactsById.get(e.contact_id)) : 'the next family'}'s turn (${covers}). They have until ${fmtDate(turn.respond_by_date)} to pick a pup from any of these and send the deposit, or pass. Let them know.`].join('\n\n') });
+          await offerEmails(offerSpecs({ next: turn }));
+        } else if (turn?.none) {
+          await alertModal({ title: 'No turn offered', message: [...passedLines, 'Nobody else on the list is eligible for the pups available right now.'].join('\n\n') });
+        } else {
+          await alertModal({ title: 'No turn offered', message: kennelTurns.length
+            ? 'A family holds the turn now and isn\'t first in line for this litter, so it waits for the next turn.'
+            : 'Nobody on the list is eligible for the pups available right now.' });
+        }
+        await main();
+      } catch (err) {
+        els.error.innerHTML = `<div class="inline-error">${esc(err.message || String(err))}</div>`;
+        btn.disabled = false;
+      }
+    });
+  });
+
+  // Back from fixing a family or a pup the picks preview linked to: reopen it.
+  const again = previewParam();
+  if (again && !previewReopened) {
+    previewReopened = true;
+    const l = litters.find((x) => x.id === again && x.kennel_id === kennel.id);
+    const rowBtn = l && !l.picks_opened_date ? els.body.querySelector(`[data-offer-litter="${CSS.escape(l.id)}"][title="Open picks on this litter"]`) : null;
+    if (rowBtn) setTimeout(() => rowBtn.click(), 0);
+    else if (l) setTimeout(async () => { await openPicksPreview({ litterId: l.id }); await main(); }, 0);
+  }
+
+  // "It's almost your turn" (Spec §15.5): every live litter of this kennel at once.
+  // Families with an open offer anywhere are left out but still count toward the
+  // pups, so a second litter never re-notifies a family mid-decision.
+  document.getElementById('wl-soon').onclick = () => {
+    const live = waitlistLitters(kennel, litters);
+    const rows = soonFamiliesForKennel(entries, offers, live, dogs, sales, opts);
+    openSoonNotice({
+      kennel, config, rows, contactsById,
+      litterLabelOf: (r) => r.litters.map((x) => `${litterLabel(x.litter)}: #${x.soonPosition} in line`).join(' · '),
+      litterIdsOf: (r) => r.litters.map((x) => x.litter.id),
+      // Litters born before picks open (Spec §16.6): one row per family per litter.
+      whelp: live.flatMap((l) => whelpNotes(entries, l, dogs, sales, opts).filter((w) => w.kind === 'review' || !midTurn(offers, w.entry.id)).map((w) => ({ ...w, litterIds: [l.id] })))
+    });
+  };
+}
+
+main().catch((e) => { els.error.innerHTML = `<div class="inline-error">${esc(e.message || String(e))}</div>`; });

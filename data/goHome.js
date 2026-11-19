@@ -1,0 +1,261 @@
+// goHome.js — a sold puppy's way home, pure (decided 2026-10-15). People record
+// pickups and boarding but rarely come back to mark a sale Delivered, so this
+// works out, for one puppy with a sale in progress, what's missing:
+//   - 'boarding': the sale carries a deferred-pickup boarding charge, but no
+//     boarding is logged for the puppy around its ready date;
+//   - 'schedule': from a week before the litter's ready date, no pickup is on the
+//     calendar and no boarding covers today or later;
+//   - 'overdue': the pickup date has passed (nothing scheduled after it, no
+//     boarding covering today) and the sale still isn't Delivered.
+// Today's nudges and Kels's litter check-in both read it; the fixes are ordinary
+// events (a `placement` pickup, a `boarding` span) and, for 'overdue', the Sale
+// page's own Delivered save (sale.html?id=…&deliver=1), so delivery's prompts run.
+import { addDaysToYMD, addMonthsToYMD } from './dateUtils.js';
+import { saleExtraCharges } from './extraCharges.js';
+
+export const READY_AFTER_DAYS = 56;
+// Kels and Today start asking about the pickup this many days before the ready date.
+export const SCHEDULE_LEAD_DAYS = 7;
+// A sale far enough along to plan the pickup.
+export const GO_HOME_SALE_STATUSES = ['deposit_paid', 'paid_in_full'];
+export const BOARDING_TITLE = 'Deferred pickup boarding';
+export const PICKUP_TITLE = 'Puppy pickup';
+// A go-home where the puppy is taken to the family (a flight nanny, ground
+// transport…): the same `placement` event, its `dropoff_method` set.
+export const DROPOFF_TITLE = 'Puppy drop-off';
+
+const ymd = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || '');
+
+// The litter's estimated ready date, else 8 weeks after the whelp date.
+export const readyDateOf = (litter) => (ymd(litter?.estimated_ready_date) ? litter.estimated_ready_date
+  : ymd(litter?.whelp_date) ? addDaysToYMD(litter.whelp_date, READY_AFTER_DAYS) : null);
+
+// The sale whose pickup we're planning: the newest one in progress.
+export function goHomeSale(sales) {
+  return sales.filter((s) => !s.is_archived && GO_HOME_SALE_STATUSES.includes(s.status))
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))[0] || null;
+}
+
+// The sale has a deferred-pickup boarding charge.
+export const hasDeferredBoarding = (sale) => Number(sale?.deferred_boarding_amount) > 0;
+
+// How long the charged boarding runs: `deferred_boarding_duration_days` is a
+// COUNT of the frequency's units ("2" × Week = two weeks; guide §4, Sale).
+// → the end date for a start date, or '' when the count isn't a number.
+export function boardingEnd(sale, start) {
+  const n = Math.round(Number(String(sale?.deferred_boarding_duration_days ?? '').trim()));
+  if (!ymd(start) || !Number.isFinite(n) || n <= 0) return '';
+  const unit = String(sale.deferred_boarding_frequency || 'Day').toLowerCase();
+  if (unit === 'month') return addDaysToYMD(addMonthsToYMD(start, n), -1);
+  return addDaysToYMD(start, n * (unit === 'week' ? 7 : 1) - 1);
+}
+
+// "$15 per Day × 14"-style summary of the charge, for Kels and Today.
+export function boardingChargeText(sale, fmtMoney = (v) => `$${v}`) {
+  if (!hasDeferredBoarding(sale)) return '';
+  const f = sale.deferred_boarding_frequency ? ` per ${String(sale.deferred_boarding_frequency).toLowerCase()}` : '';
+  const n = String(sale.deferred_boarding_duration_days ?? '').trim();
+  return `${fmtMoney(sale.deferred_boarding_amount)}${f}${n ? ` × ${n}` : ''}`;
+}
+
+// A pickup event for this sale's family: a placement event with that buyer, or
+// with no contact on it (older pickups were logged without one).
+export const pickupFor = (sale) => (e) => !e.is_archived && e.event_type === 'placement' && ymd(e.event_date)
+  && (!e.related_contact_id || !sale.buyer_contact_id || e.related_contact_id === sale.buyer_contact_id);
+
+// When the pup is expected to go home to this sale's family, for a contract's
+// pickupDate: its next pickup on the calendar (today or later), else its latest
+// one, else the litter's ready date. `events`: the pup's events. → YYYY-MM-DD | ''
+export function expectedPickupDate({ sale, events, litter, today }) {
+  const dates = sale ? (events || []).filter(pickupFor(sale)).map((e) => e.event_date).sort() : [];
+  return dates.find((d) => d >= today) || dates[dates.length - 1] || readyDateOf(litter) || '';
+}
+
+// What's missing on this puppy's way home, or null. `pup`: the dog; `litter`:
+// its litter; `sales`: its sales; `events`: its events (any types).
+// → null | { kind: 'boarding' | 'schedule' | 'overdue', sale, readyDate, pickupDate? }
+export function goHomeIssue({ pup, litter, sales, events, today }) {
+  if (!pup || pup.is_archived || pup.status !== 'puppy') return null;
+  const sale = goHomeSale(sales);
+  const readyDate = readyDateOf(litter);
+  if (!sale || !readyDate) return null;
+  const since = addDaysToYMD(readyDate, -SCHEDULE_LEAD_DAYS);
+  if (today < since) return null;
+
+  const live = events.filter((e) => !e.is_archived);
+  // Boarding around the go-home: starts from a week before the ready date on.
+  const boarding = live.filter((e) => e.event_type === 'boarding' && ymd(e.event_date) && (e.event_end_date || e.event_date) >= since);
+  if (hasDeferredBoarding(sale) && !boarding.length) return { kind: 'boarding', sale, readyDate };
+  // Staying on: a boarding that runs today or later (one with no end, from its start on).
+  const staying = boarding.some((e) => (e.event_end_date ? e.event_end_date >= today : true));
+  const pickups = live.filter(pickupFor(sale));
+  if (pickups.some((e) => e.event_date >= today) || staying) return null;
+  const past = pickups.map((e) => e.event_date).sort();
+  if (past.length) return { kind: 'overdue', sale, readyDate, pickupDate: past[past.length - 1] };
+  return { kind: 'schedule', sale, readyDate };
+}
+
+// Where a new pickup or boarding starts by default: the ready date, or today
+// once that has passed.
+export const defaultStart = (readyDate, today) => (readyDate && readyDate > today ? readyDate : today);
+
+// The events Kels writes. A pickup: the family as its related contact; with a
+// `method` (vocab PLACEMENT_METHODS) other than Local pickup it's a drop-off. A
+// boarding: the charge's span from `start`. `location`: where (a family's own place, or
+// one of her pickup places), optional.
+export const pickupEvent = (pup, sale, date, time = '', method = '', location = '') => ({
+  subject_type: 'dog', subject_id: pup.id, event_type: 'placement', event_date: date,
+  title: method && method !== 'Local pickup' ? DROPOFF_TITLE : PICKUP_TITLE,
+  ...(sale.buyer_contact_id ? { related_contact_id: sale.buyer_contact_id } : {}),
+  details: { ...(time ? { placement_time: time } : {}), ...(method ? { dropoff_method: method } : {}), ...(location ? { location } : {}) }
+});
+export const boardingEvent = (pup, start, end = '') => ({
+  subject_type: 'dog', subject_id: pup.id, event_type: 'boarding', event_date: start,
+  ...(end ? { event_end_date: end } : {}), title: BOARDING_TITLE, details: { boarding_reason: 'Deferred pickup' }
+});
+
+// The pickup message (Payment Schedule plan §7): what Kels's Pups are going home
+// offers to send a family once their pup's pickup or drop-off is on the calendar.
+// She sends it herself (the message composer). Everything comes in formatted:
+//   who          the buyer's first name
+//   pupName      the pup
+//   date, time   the pickup day ("December 4, 2026") and time ("2:00 PM"), time optional
+//   location     where, optional
+//   dropoff      true: it's a drop-off (taken to the family), not a pickup
+//   owed         what's owed by that day ("$2,150.00", from paymentSchedule.owedBy), or ''
+//   paidUp       nothing is owed on the sale at all
+//   finalMethods her final-payment methods ("Cash or Zelle only"), only when what's
+//                owed includes the final payment (D9), else ''
+//   kennelName   signs it
+// → { subject, body }
+export function pickupMessage(p = {}) {
+  const t = (v) => String(v ?? '').trim();
+  const pup = t(p.pupName) || 'your puppy';
+  const Pup = pup.charAt(0).toUpperCase() + pup.slice(1);
+  const at = `${t(p.date)}${t(p.time) ? ` at ${t(p.time)}` : ''}`;
+  const where = t(p.location) ? `${p.dropoff ? ', to' : ', at'} ${t(p.location)}` : '';
+  const lines = [t(p.who) ? `Hi ${t(p.who)},` : 'Hi,', ''];
+  lines.push(p.dropoff ? `We're all set to bring ${pup} to you on ${at}${where}.` : `${Pup}'s pickup is all set for ${at}${where}.`);
+  if (t(p.owed)) {
+    lines.push('', `${t(p.owed)} is due ${p.dropoff ? 'at drop-off' : 'at pickup'}.`);
+    if (t(p.finalMethods)) lines.push(`For the final payment: ${t(p.finalMethods)}`);
+  } else if (p.paidUp) {
+    lines.push('', `${Pup} is paid in full. Thank you!`);
+  }
+  lines.push('', 'Let us know if anything changes, or if you have any questions.', '', 'See you soon!');
+  if (t(p.kennelName)) lines.push(t(p.kennelName));
+  return { subject: `${Pup}'s ${p.dropoff ? 'drop-off' : 'pickup'} day`, body: lines.join('\n') };
+}
+
+// --- Training stays (Family Requests plan §6) ----------------------------------------
+// An extra that needs the pup to stay (a training package: `boarding_days` on the
+// sale's charge) is a boarding event on the pup, reason Training, linked by
+// `details.sale_id` and `details.extra_charge_id` (the link is stored on the event
+// only; the sale finds its stays by query).
+export const TRAINING_REASON = 'Training';
+
+// The pup's stays linked to this charge (not archived).
+export const trainingStaysFor = (sale, charge, events) => events.filter((e) => !e.is_archived && e.event_type === 'boarding'
+  && e.details?.sale_id === sale.id && e.details?.extra_charge_id === charge.id);
+
+// The stay to log: from `start`, the charge's days long.
+export function trainingStayEvent(pup, sale, charge, start) {
+  const days = Math.max(1, Math.round(Number(charge.boarding_days) || 1));
+  return {
+    subject_type: 'dog', subject_id: pup.id, event_type: 'boarding', event_date: start,
+    event_end_date: addDaysToYMD(start, days - 1), title: charge.label,
+    details: { boarding_reason: TRAINING_REASON, sale_id: sale.id, extra_charge_id: charge.id }
+  };
+}
+
+// The day after the pup's last boarding (any reason) still to end on or after `from`'s
+// day before: where a pickup can go once its stays are over. `events`: the pup's.
+// → YYYY-MM-DD (the later of `from` and the day after the last stay).
+export function afterStays(events, from) {
+  let at = from;
+  for (const e of events || []) {
+    if (e.is_archived || e.event_type !== 'boarding' || !ymd(e.event_date)) continue;
+    const next = addDaysToYMD(e.event_end_date || e.event_date, 1);
+    if (next > at) at = next;
+  }
+  return at;
+}
+
+// What a save put on a sale that needs the pup to stay: the stay extras it added (by
+// id) and whether it added boarding. `before`: the sale as it was (null: new).
+// → { chargeIds: [id], boarding: bool } | null (nothing new to stay for)
+export function addedStays(before, after) {
+  if (!after) return null;
+  const had = new Set(saleExtraCharges(before).map((c) => c.id));
+  const chargeIds = saleExtraCharges(after).filter((c) => c.boarding_days && !had.has(c.id)).map((c) => c.id);
+  const boarding = hasDeferredBoarding(after) && !hasDeferredBoarding(before);
+  return chargeIds.length || boarding ? { chargeIds, boarding } : null;
+}
+
+// A stay extra or boarding just put on a sale (owner, 2026-11-15): what goes on the
+// pup's calendar. Each stay extra (boarding_days) with no linked stay: a stay from the
+// ready date (today once that's passed), after the stays already logged for the sale,
+// one after another. Boarding just added, none logged: from the day after the last
+// stay, its length long. Then the pickup the day after it all ends: a new one, or the
+// next one on the calendar moved there when it falls before. `chargeIds`: the extras
+// just added (null: every stay extra); `boarding`: the boarding was just added.
+// `events`: the pup's. → null (nothing to put on the calendar) | { stays: [event],
+// boarding: event | null, pickup: { date, event: the pickup to move | null } | null }
+export function stayPickupPlan({ sale, pup, litter = null, events = [], today, chargeIds = null, boarding = false }) {
+  if (!sale || !pup) return null;
+  const live = (events || []).filter((e) => !e.is_archived);
+  let from = defaultStart(readyDateOf(litter), today);
+  for (const e of live) {
+    if (e.event_type !== 'boarding' || e.details?.sale_id !== sale.id || !e.details?.extra_charge_id) continue;
+    const next = addDaysToYMD(e.event_end_date || e.event_date, 1);
+    if (next > from) from = next;
+  }
+  const stays = [];
+  for (const c of saleExtraCharges(sale).filter((x) => x.boarding_days && (!chargeIds || chargeIds.includes(x.id)))) {
+    if (trainingStaysFor(sale, c, live).length) continue;
+    const stay = trainingStayEvent(pup, sale, c, from);
+    stays.push(stay);
+    from = addDaysToYMD(stay.event_end_date, 1);
+  }
+  let board = null;
+  if (boarding && hasDeferredBoarding(sale)) {
+    const since = addDaysToYMD(readyDateOf(litter) || today, -SCHEDULE_LEAD_DAYS);
+    const logged = live.some((e) => e.event_type === 'boarding' && e.details?.boarding_reason === 'Deferred pickup' && (e.event_end_date || e.event_date) >= since);
+    if (!logged) {
+      board = boardingEvent(pup, from, boardingEnd(sale, from));
+      from = board.event_end_date ? addDaysToYMD(board.event_end_date, 1) : '';
+    }
+  }
+  if (!stays.length && !board) return null;
+  const next = live.filter(pickupFor(sale)).filter((e) => e.event_date >= today).sort((a, b) => a.event_date.localeCompare(b.event_date))[0] || null;
+  const pickup = next && from && next.event_date >= from ? null : { date: from, event: next };
+  return { stays, boarding: board, pickup };
+}
+
+// Linked stays whose charge is gone from its sale (or the sale is): still on the
+// calendar, to remove or keep. `salesById`: every sale. → [{ event, sale }]
+export function orphanTrainingStays(events, salesById, today) {
+  return events.filter((e) => !e.is_archived && e.event_type === 'boarding' && e.details?.extra_charge_id
+    && (e.event_end_date || e.event_date) >= today).map((event) => {
+    const sale = salesById.get(event.details.sale_id) || null;
+    const live = sale && !sale.is_archived && (sale.extra_charges || []).some((c) => c.id === event.details.extra_charge_id);
+    return live ? null : { event, sale };
+  }).filter(Boolean);
+}
+
+// The sold dog's changes when its sale is Delivered and she says how it leaves her
+// roster (Pro, `externalOwnership`): 'external' (the family owns it now: External,
+// status external_reference, owner = `ownerId` when given) or 'co_owned' (she keeps
+// a share: Co-owned, the buyer added as a co-owner). → the changes, or null.
+// The Sale page's delivery prompt and Kels's check-in both write these.
+export function deliveredOwnershipChanges(dog, choice, { ownerId = null, buyerId = null, today } = {}) {
+  if (!dog) return null;
+  if (choice === 'external') {
+    return { ownership_type: 'external', status: 'external_reference', status_date: today, ...(ownerId ? { owner_contact_id: ownerId } : {}) };
+  }
+  if (choice === 'co_owned') {
+    const coOwners = dog.co_owner_contact_ids || [];
+    return { ownership_type: 'co_owned', ...(buyerId && !coOwners.includes(buyerId) ? { co_owner_contact_ids: [...coOwners, buyerId] } : {}) };
+  }
+  return null;
+}

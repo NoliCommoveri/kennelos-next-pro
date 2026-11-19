@@ -1,0 +1,453 @@
+// import-export.js — wires the Import/Export page to the backup engine: Backup &
+// restore, Duplicates (assets/duplicateScanUI.js), CSV import, and the Danger zone. Account, kennel setup, the guided tour
+// and this device's license are on the Settings page (pages/settings.js).
+import { downloadBackup, readBackupFile, inspectBackup, restoreBackup, planFileMerge, countRecords } from '../data/importExport.js';
+import { getLastBackupDate } from '../data/settings.js';
+import { getResetCounts, resetApp } from '../data/appReset.js';
+import { esc, confirmModal, selectModal } from '../assets/ui.js';
+import { editionFlags, edition } from '../data/editionConfig.js';
+import { isProOnlyPage } from '../data/proPages.js';
+import { isDropboxConnected } from '../data/dropbox.js';
+import { mountDropboxConnect } from '../assets/dropboxConnectUI.js';
+import { pushToDropbox, fetchDropboxBackup } from '../data/assistantSync.js';
+import { isCloudAvailable } from '../data/cloud/cloudConfig.js';
+import { downloadImportTemplate } from '../assets/importHelp.js';
+import { askSame, askClashes } from '../assets/mergeQuestions.js';
+import { mountDuplicateScan } from '../assets/duplicateScanUI.js';
+
+// Cloud backup UI, loaded only when this edition has a server (`cloudUrl` set),
+// so an edition without one never even loads the cloud modules (plan §7).
+const cloudUI = isCloudAvailable() ? await import('../assets/cloudBackupUI.js') : null;
+
+const msg = document.getElementById('page-msg');
+function flash(text, kind = 'ok') {
+  msg.innerHTML = `<div class="${kind === 'ok' ? 'inline-warn' : 'inline-error'}" style="${kind === 'ok' ? 'color:var(--accent-dark);background:var(--accent-soft);border-color:#bfe0cd;' : ''}">${esc(text)}</div>`;
+  msg.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function renderLastBackup() {
+  const iso = getLastBackupDate();
+  const el = document.getElementById('last-backup');
+  el.textContent = iso ? new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'Never';
+}
+
+// --- Backup & restore -------------------------------------------------------
+// Two INDEPENDENT axes: what you're doing (back up / restore — the seg-tabs) and
+// where it goes (cloud / this device / Dropbox — chosen per run). They compose freely,
+// which is the whole point: a Dropbox push IS a backup (same exportAll(), same
+// lastBackupDate stamp) and a Dropbox pull IS a restore (same restoreBackup()
+// engine), so they belong on the same control rather than in a parallel card.
+//
+// The payoff is the restore path: BOTH sources land in showRestorePreview(), so
+// a Dropbox pull now gets the same dry-run table and the same Merge/Replace
+// choice a file gets — previously it went straight to a bare confirm and could
+// only merge.
+//
+// Cloud is the first destination when this edition has a cloud server. Its pane
+// (#br-cloud) is filled by cloudBackupUI.mountCloudPane in the same shape as the
+// other two: a blurb, "Last backup", Back up now on one side and the backups to
+// roll back to (a dropdown, right on the page) on the other, and a strip at the
+// foot saying whether cloud backup is on, where Dropbox's says whether it's
+// connected.
+
+const dropboxEnabled = editionFlags.assistant;
+const fileInput = document.getElementById('restore-file');
+const fetchBtn = document.getElementById('btn-dbx-fetch');
+const backupBtn = document.getElementById('btn-backup');
+const preview = document.getElementById('restore-preview');
+let pendingBackup = null;
+const cloudPane = document.getElementById('br-cloud');
+const dropboxConnect = document.getElementById('dropbox-connect');
+let mode = 'backup';                  // 'backup' | 'restore'
+let dest = cloudUI ? 'cloud' : 'local'; // 'cloud' | 'local' | 'dropbox'
+let renderCloudPane = () => {};
+
+const BLURBS = {
+  'backup:local': 'Downloads every record as one JSON file — also the migration path if the app ever moves to a new web address (your data doesn’t follow automatically).',
+  'backup:dropbox': 'Uploads a full backup to your own Dropbox, and refreshes what KennelAssistant sees. Pull it on your other phone to catch up.',
+  'restore:local': 'Load records from a backup file. Merge adds what’s new and asks before undoing any newer edits here; Replace wipes current records first.',
+  'restore:dropbox': 'Load the backup last pushed to Dropbox — from this phone or another one. Merge adds what’s new and asks before undoing any newer edits here; Replace wipes current records first.'
+};
+
+// Drop a preview without touching the file input — the change handler runs this
+// before reading `files[0]`, so clearing the input here would wipe the very
+// selection it is about to read.
+function clearPending() {
+  pendingBackup = null;
+  preview.innerHTML = '';
+}
+
+// Switching either axis invalidates a preview built from the other source, and
+// also forgets the chosen file so the input doesn't show a stale name.
+function resetRestoreInput() {
+  clearPending();
+  fileInput.value = '';
+}
+
+function renderBackupRestore() {
+  const needsConnect = dest === 'dropbox' && !isDropboxConnected();
+  const isCloud = dest === 'cloud';
+
+  const destLabel = document.getElementById('dest-label');
+  if (destLabel) destLabel.textContent = mode === 'backup' ? 'To:' : 'From:';
+  cloudPane.hidden = !isCloud;
+  document.getElementById('br-backup').hidden = isCloud || mode !== 'backup';
+  document.getElementById('br-restore').hidden = isCloud || mode !== 'restore';
+  // Each destination's connection strip shows only with that destination.
+  if (dropboxConnect) dropboxConnect.hidden = dest !== 'dropbox';
+  if (isCloud) {
+    renderCloudPane();
+    return;
+  }
+  document.getElementById('backup-blurb').textContent = BLURBS[`backup:${dest}`];
+  document.getElementById('restore-blurb').textContent = BLURBS[`restore:${dest}`];
+
+  backupBtn.textContent = dest === 'local' ? '⬇ Download backup' : '⬆ Push to Dropbox';
+  backupBtn.disabled = needsConnect;
+  fileInput.hidden = dest !== 'local';
+
+  // Everything below is the Dropbox axis, which Lite deletes outright (see the
+  // edition branch at the foot of this file) — so it exists only when enabled.
+  if (!dropboxEnabled) return;
+  fetchBtn.hidden = dest !== 'dropbox';
+  fetchBtn.disabled = needsConnect;
+  // No separate "connect first" notice: the strip at the foot of the card says
+  // Dropbox isn't connected, right under the disabled button.
+}
+
+// The single dry-run preview, whatever the backup came from. Nothing is written
+// until Merge or Replace.
+function showRestorePreview(obj) {
+  const info = inspectBackup(obj);
+  pendingBackup = obj;
+  const rows = Object.entries(info.counts)
+    .map(([name, n]) => `<tr><td>${esc(name)}</td><td>${n}</td></tr>`).join('');
+  // A newer KennelOS may add tables; they're skipped here, never mistaken for hers.
+  const warnUnknown = info.unknownTables.length
+    ? `<div class="inline-warn">Skipping ${info.unknownTables.length === 1 ? 'a table' : 'tables'} this version of KennelOS doesn't have: ${esc(info.unknownTables.join(', '))}. If you didn't make this backup with KennelOS, don't restore it.</div>`
+    : '';
+  preview.innerHTML = `
+    <p class="muted">Exported ${info.exported_at ? esc(new Date(info.exported_at).toLocaleString()) : 'unknown date'} (schema v${esc(info.schema_version ?? '?')}).</p>
+    <table class="data" style="max-width:320px;"><thead><tr><th>Table</th><th>Rows</th></tr></thead><tbody>${rows}</tbody></table>
+    ${warnUnknown}
+    <div class="form-actions">
+      <button class="btn" id="btn-merge">Merge into current data</button>
+      <button class="btn btn-danger" id="btn-replace">Replace all data</button>
+    </div>`;
+  document.getElementById('btn-merge').onclick = () => doRestore('merge');
+  document.getElementById('btn-replace').onclick = () => doRestore('replace');
+}
+
+backupBtn.addEventListener('click', () => {
+  if (dest === 'dropbox') return runNetworkAction(backupBtn, doDropboxPush);
+  return doLocalBackup();
+});
+
+fetchBtn.addEventListener('click', () => runNetworkAction(fetchBtn, doDropboxFetch));
+
+async function doLocalBackup() {
+  try {
+    const data = await downloadBackup();
+    const total = Object.values(data.collections).reduce((n, rows) => n + rows.length, 0);
+    renderLastBackup();
+    flash(`Backup downloaded — ${total} record(s) across ${Object.keys(data.collections).length} tables.`);
+  } catch (e) {
+    flash(e.message || String(e), 'err');
+  }
+}
+
+async function doDropboxPush() {
+  const result = await pushToDropbox();
+  renderLastBackup(); // a push counts as a backup
+  flash(`Pushed to Dropbox — full backup (${result.records} record(s)) and assistant feed (${result.dogs} dog(s), ${result.events} event(s)).`);
+}
+
+async function doDropboxFetch() {
+  const fetched = await fetchDropboxBackup();
+  if (!fetched) {
+    flash('No backup in Dropbox yet — push from your other phone first.', 'err');
+    return;
+  }
+  showRestorePreview(fetched.backup);
+}
+
+fileInput.addEventListener('change', async () => {
+  clearPending();
+  const file = fileInput.files?.[0];
+  if (!file) return;
+  try {
+    showRestorePreview(await readBackupFile(file));
+  } catch (e) {
+    flash(e.message || String(e), 'err');
+  }
+});
+
+// Disable a button while its network action runs, then restore it. `busy` also
+// freezes the seg-tabs for the duration: switching axis mid-flight would re-label
+// the buttons, and this handler would then restore the label it captured for the
+// OLD destination on top of it.
+let busy = false;
+async function runNetworkAction(btn, action) {
+  const label = btn.textContent;
+  busy = true;
+  btn.disabled = true;
+  btn.textContent = 'Working…';
+  try {
+    await action();
+  } catch (e) {
+    flash(e.message || String(e), 'err');
+  } finally {
+    busy = false;
+    // The button may have been re-rendered away (e.g. after a disconnect).
+    if (btn.isConnected) { btn.disabled = false; btn.textContent = label; }
+  }
+}
+
+// Merge's questions, before anything is written (planFileMerge plans; the restore
+// does exactly that plan):
+//   1. Records each device entered on its own that the rules aren't sure are the
+//      same ("Are these the same?"). Each answer can pair more (a litter once its
+//      dam is), so the plan is made again until nothing is left to ask.
+//   2. A paired dog whose name, sex or parents differ: which to keep.
+//   3. What the merge does, and, when this device changed records after the
+//      backup was made, keep those edits or take the backup's copy.
+// → { keepNewer, answers, clashChoices } | null (cancelled).
+async function askMerge() {
+  let answers = {};
+  let plan = await planFileMerge(pendingBackup, { answers });
+  while (plan.asks.length) {
+    const got = await askSame(plan.asks);
+    if (!got) return null;
+    answers = { ...answers, ...got };
+    plan = await planFileMerge(pendingBackup, { answers });
+  }
+  const clashChoices = plan.clashes.length ? await askClashes(plan.clashes) : {};
+  if (!clashChoices) return null;
+
+  const n = (k, one, many) => `${plan[k]} ${plan[k] === 1 ? one : many}`;
+  const what = `This adds ${n('added', 'record', 'records')} and updates ${n('updated', 'record', 'records')} with the file’s newer copy.`
+    + (plan.matched ? ` ${n('matched', 'record was', 'records were')} entered on both devices, so each pair becomes one record.` : '')
+    + ' Nothing is deleted.';
+  if (!plan.newerHere) {
+    const ok = await confirmModal({ title: 'Merge data?', message: what, confirmLabel: 'Merge' });
+    return ok ? { keepNewer: true, answers, clashChoices } : null;
+  }
+  const choice = await selectModal({
+    title: 'Merge data?',
+    message: `${what} ${n('newerHere', 'record was', 'records were')} changed on this device after this backup was made.`,
+    label: 'For those',
+    options: [
+      { value: 'mine', label: 'Keep my newer edits' },
+      { value: 'file', label: 'Take the backup’s copy' }
+    ],
+    defaultValue: 'mine',
+    confirmLabel: 'Merge'
+  });
+  return choice ? { keepNewer: choice === 'mine', answers, clashChoices } : null;
+}
+
+async function doRestore(mode) {
+  if (!pendingBackup) return;
+  let opts = {};
+  if (mode === 'merge') {
+    opts = await askMerge();
+    if (!opts) return;
+  } else {
+    // The numbers, so a wrong or tiny file is plain before she taps (K2-1).
+    const [mine, theirs] = [await countRecords(), inspectBackup(pendingBackup).records];
+    if (!(await confirmModal({
+      title: 'Replace all data?',
+      message: `Replace the ${mine} record${mine === 1 ? '' : 's'} on this device with the file's ${theirs}? Everything here now is deleted first. This cannot be undone.`,
+      confirmLabel: 'Replace',
+      danger: true
+    }))) return;
+  }
+  try {
+    const result = await restoreBackup(pendingBackup, mode, opts);
+    const total = result.reduce((n, r) => n + r.count, 0);
+    flash(`Restore complete (${mode}) — ${total} record(s) loaded. Reloading…`);
+    setTimeout(() => location.reload(), 1200);
+  } catch (e) {
+    // The Lite import cap (cap spec §9) throws a CapExceededError before writing
+    // anything, so spell out what happened and what to do rather than showing the
+    // terse repo message — nothing was changed, so the user can act and retry.
+    if (e && e.name === 'CapExceededError') {
+      const what = e.kind === 'litters' ? 'litters' : 'active dogs';
+      flash(`This backup would leave ${e.current} ${what} — KennelOS Lite keeps up to ${e.limit}. `
+        + `Nothing was changed. Trim the file to ${e.limit} or fewer ${what}, or upgrade to Pro, then import again.`, 'err');
+    } else {
+      flash(e.message || String(e), 'err');
+    }
+  }
+}
+
+renderLastBackup();
+mountDuplicateScan(document.getElementById('duplicates-card'), { flash });
+
+function wireSegTabs(containerId, onPick) {
+  const tabs = document.getElementById(containerId);
+  if (!tabs) return; // the destination row is absent in Lite
+  tabs.addEventListener('click', (e) => {
+    const tab = e.target.closest('.seg-tab');
+    if (!tab || busy) return; // a network action owns the card right now
+    tabs.querySelectorAll('.seg-tab').forEach((t) => t.classList.toggle('active', t === tab));
+    onPick(tab);
+  });
+}
+
+wireSegTabs('br-tabs', (tab) => {
+  mode = tab.dataset.mode;
+  resetRestoreInput();
+  renderBackupRestore();
+});
+
+wireSegTabs('dest-tabs', (tab) => {
+  dest = tab.dataset.dest;
+  resetRestoreInput();
+  renderBackupRestore();
+});
+
+// CSV import is a single dropdown — pick a data type and go straight to its
+// dedicated import page (each has its own dry-run preview).
+const csvSelect = document.getElementById('csv-import-select');
+// Lite is the only build that excludes Pro-only pages, so only there do we drop
+// CSV-import options whose target page (Contacts, Stud services, Kennel tests)
+// would be absent. Pro/Demo ship every page, so they keep every option.
+if (edition === 'lite') {
+  for (const opt of [...csvSelect.options]) {
+    if (opt.value && isProOnlyPage(opt.value)) opt.remove();
+  }
+}
+csvSelect.addEventListener('change', () => {
+  if (csvSelect.value) location.href = csvSelect.value;
+});
+
+// A template for each import the select above still offers (so Lite lists only
+// its own). Kennel tests import a breed/test seed file, so theirs is the bundled sample.
+const TEMPLATE_ENTITY = {
+  'kennel-import.html': 'kennel', 'dog-import.html': 'dog', 'contact-import.html': 'contact', 'pairing-import.html': 'pairing',
+  'litter-import.html': 'litter', 'sale-import.html': 'sale', 'event-import.html': 'event',
+  'stud-service-import.html': 'stud_service', 'expense-import.html': 'expense', 'waitlist-import.html': 'waitlist'
+};
+const KENNEL_TESTS_SAMPLE = '../resources/common_tests_by_breed_seed.csv';
+const templateSelect = document.getElementById('csv-template-select');
+for (const o of [...csvSelect.options].filter((x) => x.value)) {
+  const value = o.value === 'kennel-tests-import.html' ? 'sample' : TEMPLATE_ENTITY[o.value];
+  if (!value) continue;
+  templateSelect.add(new Option(value === 'sample' ? `${o.textContent} (sample file)` : o.textContent, value));
+}
+templateSelect.addEventListener('change', () => {
+  const v = templateSelect.value;
+  if (v === 'sample') {
+    const a = document.createElement('a');
+    a.href = KENNEL_TESTS_SAMPLE;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } else if (v) {
+    downloadImportTemplate(v);
+  }
+  templateSelect.value = '';
+});
+
+async function renderResetAppStatus() {
+  const status = document.getElementById('reset-app-status');
+  const counts = await getResetCounts();
+  const parts = Object.entries(counts).map(([name, n]) => `${n} ${name}`);
+  status.textContent = `Currently stored: ${parts.join(', ')}.`;
+}
+
+const RESET_PHRASE = 'RESET';
+
+function showResetAppModal() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true" style="max-width:440px;">
+      <h2 style="margin-top:0;">⚠️ Reset app to start</h2>
+      <p class="muted">This permanently deletes <strong>all</strong> dogs, contacts, kennels, and events, and clears
+        all app settings. You'll land back on the first-run setup screen. This cannot be undone.</p>
+      <div class="field field-wide">
+        <label>Type <strong>${RESET_PHRASE}</strong> to confirm</label>
+        <input id="reset-confirm-input" type="text" autocomplete="off" placeholder="${RESET_PHRASE}">
+      </div>
+      ${cloudUI ? cloudUI.resetSignOutFieldHtml() : ''}
+      <div id="reset-error"></div>
+      <div class="form-actions">
+        <button class="btn btn-danger" id="reset-confirm-btn" disabled>Delete everything</button>
+        <button class="btn" data-act="cancel">Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const input = overlay.querySelector('#reset-confirm-input');
+  const confirmBtn = overlay.querySelector('#reset-confirm-btn');
+  const errorBox = overlay.querySelector('#reset-error');
+
+  input.addEventListener('input', () => {
+    confirmBtn.disabled = input.value !== RESET_PHRASE;
+  });
+
+  overlay.querySelector('[data-act="cancel"]').addEventListener('click', () => overlay.remove());
+  // Backdrop tap (and Escape, via ui.js) = Cancel.
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.querySelector('[data-act="cancel"]')?.click(); });
+
+  confirmBtn.addEventListener('click', async () => {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Deleting…';
+    try {
+      await resetApp();
+      // Plan §3.3: resetApp() always turns cloud backup off; signing out too is
+      // the user's choice (ticked by default).
+      if (cloudUI) await cloudUI.signOutAfterResetIfChecked(overlay);
+      overlay.querySelector('.modal').innerHTML = `<h2 style="margin-top:0;">Reset complete</h2>
+        <p class="muted">Reloading…</p>`;
+      setTimeout(() => location.reload(), 800);
+    } catch (e) {
+      errorBox.innerHTML = `<div class="inline-error">${esc(e.message || String(e))}</div>`;
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Delete everything';
+    }
+  });
+
+  input.focus();
+}
+
+document.getElementById('btn-reset-app').addEventListener('click', showResetAppModal);
+
+renderResetAppStatus();
+
+// The destinations this edition has. Cloud needs a cloud server (`cloudUrl`);
+// Dropbox sync + KennelAssistant is Pro (§26). With neither (Lite with no server)
+// there is no second destination at all, so the whole row disappears and the
+// card renders as the plain local backup/restore it has always been.
+if (cloudUI) renderCloudPane = cloudUI.mountCloudPane(cloudPane, () => mode);
+else {
+  document.querySelector('#dest-tabs [data-dest="cloud"]')?.remove();
+  document.querySelector('#dest-tabs [data-dest="local"]')?.classList.add('active');
+  cloudPane.remove();
+}
+if (!dropboxEnabled) {
+  document.querySelector('#dest-tabs [data-dest="dropbox"]')?.remove();
+  if (!cloudUI) document.getElementById('dest-row')?.remove();
+  document.getElementById('btn-dbx-fetch')?.remove();
+  dropboxConnect?.remove();
+  renderBackupRestore();
+} else {
+  renderBackupRestore();
+  // Mounts the connect control AND finishes an in-flight OAuth redirect, so
+  // everything gated on the connection re-renders once it lands.
+  mountDropboxConnect(dropboxConnect, {
+    onChange: (connected) => {
+      if (connected) {
+        // Back from dropbox.com: land on the destination she was connecting.
+        dest = 'dropbox';
+        document.querySelectorAll('#dest-tabs .seg-tab').forEach((t) => t.classList.toggle('active', t.dataset.dest === 'dropbox'));
+        flash('Dropbox connected.');
+      }
+      renderBackupRestore();
+    },
+    onError: (m) => flash(m, 'err')
+  });
+}

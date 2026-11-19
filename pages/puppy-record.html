@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Puppy Record — KennelOS</title>
+  <link rel="stylesheet" href="../assets/app.css">
+  <link rel="manifest" href="../manifest.json">
+  <link rel="icon" href="../assets/icons/favicon-32.png" sizes="32x32">
+  <link rel="apple-touch-icon" href="../assets/icons/apple-touch-icon.png">
+  <meta name="theme-color" content="#122138">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="KennelOS">
+  <style>
+    /* puppy-record.js's own layout — a printable record, not a data-entry
+       screen, so it doesn't reuse the app's dl-meta/form-grid patterns.
+       Deliberately tight: this is meant to read as a dense one-page handout,
+       not a spaced-out app screen. */
+    .pr-wrap { max-width: 820px; margin: 0 auto; }
+    .pr-header { text-align: center; margin-bottom: 10px; }
+    .pr-header h1 { margin: 0; font-size: 24px; }
+    .pr-header .pr-kennel { color: var(--text-muted); font-size: 16px; font-weight: 700; }
+    .pr-header .pr-generated { color: var(--text-faint); font-size: 11px; margin-top: 2px; }
+
+    /* Shared "pulled out of the box" section title — centered, plain, the
+       same size everywhere (Puppy Information / Parents / Health History /
+       Buyer) so the page reads as a sequence of labeled blocks. */
+    .pr-section-label { text-align: center; font-size: 15px; font-weight: 700; margin: 14px 0 6px; }
+    .pr-section-label:first-of-type { margin-top: 8px; }
+
+    .pr-parents { display: flex; gap: 12px; margin-bottom: 8px; }
+    .pr-parent {
+      flex: 1 1 0; min-width: 0; background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 8px 12px;
+    }
+    .pr-parent-role {
+      text-transform: uppercase; letter-spacing: 0.05em; font-size: 11px;
+      color: var(--text-muted); font-weight: 600; margin-bottom: 2px;
+    }
+    .pr-tests { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); font-size: 12px; color: var(--text-muted); }
+
+    .pr-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 8px 12px; margin-bottom: 8px;
+    }
+
+    /* Puppy Information's rows split into columns of up to 5 present rows
+       each, so a puppy with a lot of recorded fields flows sideways instead
+       of stretching the card tall. */
+    .pr-info-columns { display: flex; gap: 0 20px; flex-wrap: wrap; }
+    .pr-info-col { flex: 1 1 220px; min-width: 220px; }
+
+    .pr-row { display: flex; gap: 6px; padding: 1px 0; font-size: 14px; }
+    .pr-row .pr-k { flex: 0 0 auto; white-space: nowrap; color: var(--text-muted); }
+    .pr-row .pr-v { flex: 1; min-width: 0; overflow-wrap: break-word; }
+
+    /* Health History: three columns (owner call, 2026-10-09), on paper too.
+       puppy-record.js deals the cards into three independent stacks (each into
+       the shortest so far), so a card is only as tall as its own entries and a
+       short card stacks under another rather than stretching to match a long
+       one beside it, as a grid row would. */
+    .pr-health-grid { display: flex; gap: 8px; align-items: flex-start; }
+    .pr-health-col { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+    .pr-health-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 6px 12px; break-inside: avoid;
+    }
+    .pr-health-card h3 { margin: 0 0 2px; font-size: 13px; }
+    .pr-health-list { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+    .pr-health-list li { padding: 3px 0; border-top: 1px solid var(--border); }
+    .pr-health-list li:first-child { border-top: 0; }
+    .pr-hdate { color: var(--text-muted); margin-right: 6px; }
+    .pr-hnotes { color: var(--text-muted); margin-top: 1px; }
+    .pr-hvet { color: var(--text-muted); }
+
+    .pr-empty { color: var(--text-faint); font-style: italic; font-size: 13px; }
+
+    .pr-actions { display: flex; justify-content: center; gap: 10px; margin-bottom: 14px; }
+
+    /* Several pups in one file (?dogs=): each record starts a new page, and so
+       does the first one after the breeder's cover page. On screen, a rule. */
+    .pr-cover + .pr-pup, .pr-pup + .pr-pup { break-before: page; page-break-before: always; }
+    @media screen {
+      .pr-cover + .pr-pup, .pr-pup + .pr-pup { margin-top: 24px; padding-top: 18px; border-top: 2px dashed var(--border); }
+    }
+
+    /* The breeder's cover page (&cover=1): where each pup stands. */
+    .pr-cover-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .pr-cover-table th, .pr-cover-table td { text-align: left; vertical-align: top; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    .pr-cover-table th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); }
+    .pr-cover-sub { color: var(--text-muted); font-size: 12px; }
+    .pr-cover-missing { font-weight: 600; }
+    @media screen and (max-width: 640px) {
+      .pr-cover-table { display: block; overflow-x: auto; }
+    }
+
+    @media print {
+      #app-nav, .no-print { display: none !important; }
+      body { background: #fff; }
+      .pr-card, .pr-parent, .pr-health-card { break-inside: avoid; page-break-inside: avoid; }
+      /* iPhone/iPad (WebKit) prints in "economy" color mode unless each element
+         opts out, which can wash the light card borders out entirely — and iOS
+         also shrinks the page to fit the paper, thinning a 1px line further. So
+         on paper: opt every element out, and draw the boxes in a darker gray. */
+      .pr-wrap, .pr-wrap * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      .pr-card, .pr-parent, .pr-health-card { border: 1px solid #9aa3ae; }
+      .pr-tests, .pr-health-list li { border-top-color: #c3cad3; }
+      .pr-cover-table th, .pr-cover-table td { border-bottom-color: #c3cad3; }
+      /* A short section's heading stays on the same page as its card. */
+      .pr-keep { break-inside: avoid; }
+    }
+
+    /* On a narrow phone SCREEN, two side-by-side parent cards squeeze each
+       .pr-row's nowrap label (e.g. "Registered name") past its shrink
+       limit, pushing the pair wider than the viewport. Stack them there —
+       same content, one column, no horizontal overflow. Printing keeps Sire
+       and Dam on one line (owner call, 2026-10-09): iOS prints at the phone's
+       width, so this must be screen-only, like the Health History rule below. */
+    @media screen and (max-width: 640px) {
+      .pr-parents { flex-direction: column; }
+    }
+    /* Three across is too tight to read on a phone SCREEN; stack them there.
+       Printing (even from a phone) lays out at paper width and keeps three. */
+    @media screen and (max-width: 640px) {
+      .pr-health-grid { flex-direction: column; }
+      .pr-health-col { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app-nav" class="no-print"></div>
+  <main class="pr-wrap">
+    <div class="pr-actions no-print">
+      <a class="btn btn-sm" id="pr-back" href="sales.html">← Back to sale</a>
+      <button class="btn btn-primary btn-sm" id="pr-print">Print / Save as PDF</button>
+      <a class="btn btn-sm" id="pr-fields" href="kennels.html" hidden>Choose fields</a>
+    </div>
+    <div id="pr-root"><p class="pr-empty">Loading…</p></div>
+  </main>
+  <script type="module" src="../app.js"></script>
+  <script type="module" src="puppy-record.js"></script>
+</body>
+</html>

@@ -1,0 +1,1251 @@
+// settings.js — tiny localStorage-backed settings store. This is the small,
+// synchronous "UI prefs / last backup date" use case that localStorage is
+// genuinely right for (Build Brief A3) — records live in IndexedDB, not here.
+
+const KEYS = {
+  lastBackupDate: 'kennelOS.lastBackupDate',
+  persistRequested: 'kennelOS.persistRequested',
+  sampleDataManifest: 'kennelOS.sampleDataManifest',
+  sampleDataCleared: 'kennelOS.sampleDataCleared',
+  myKennelId: 'kennelOS.myKennelId',
+  myContactId: 'kennelOS.myContactId',
+  activeKennelId: 'kennelOS.activeKennelId',
+  companion: 'kennelOS.companion',
+  invoiceDefaults: 'kennelOS.invoiceDefaults',
+  mileageDefaults: 'kennelOS.mileageDefaults',
+  expensesMigrated: 'kennelOS.expensesMigrated',
+  websiteDraftOnly: 'kennelOS.websiteDraftOnly',
+  websiteLaterFor: 'kennelOS.websiteLaterFor',
+  wizardStatus: 'kennelOS.wizardStatus',
+  wizardStepIndex: 'kennelOS.wizardStepIndex',
+  wizardStepId: 'kennelOS.wizardStepId',
+  dropbox: 'kennelOS.dropbox',
+  assistantLastSync: 'kennelOS.assistantLastSync',
+  assistantFeedPushedAt: 'kennelOS.assistantFeedPushedAt',
+  furever: 'kennelOS.furever',
+  cloudDirtyAt: 'kennelOS.cloudDirtyAt',
+  cloudDirtySince: 'kennelOS.cloudDirtySince',
+  cloudOfferPending: 'kennelOS.cloudOfferPending',
+  cloudRestoredAt: 'kennelOS.cloudRestoredAt',
+  assistReady: 'kennelOS.assistReady',
+  assistantImported: 'kennelOS.assistantImported',
+  kelsSetupDone: 'kennelOS.kelsSetupDone',
+  kelsDraftNotice: 'kennelOS.kelsDraftNotice',
+  guidedLitterDraft: 'kennelOS.guidedLitterDraft',
+  guidedDogsDraft: 'kennelOS.guidedDogsDraft',
+  guidedPeopleDraft: 'kennelOS.guidedPeopleDraft',
+  guidedFormDraft: 'kennelOS.guidedFormDraft',
+  prepChecks: 'kennelOS.prepChecks',
+  kelsFavorites: 'kennelOS.kelsFavorites',
+  kelsTaskUse: 'kennelOS.kelsTaskUse',
+  kelsNoPromote: 'kennelOS.kelsNoPromote',
+  meetKelsPending: 'kennelOS.meetKelsPending',
+  studTripsMigrated: 'kennelOS.studTripsMigrated',
+  dataChangedAt: 'kennelOS.dataChangedAt',
+  navKennels: 'kennelOS.navKennels',
+  websiteStrip: 'kennelOS.websiteStrip',
+  cloudCodeUnsaved: 'kennelOS.cloudCodeUnsaved',
+  tourCleanupNotice: 'kennelOS.tourCleanupNotice'
+};
+
+// A restore gave records new ids (importExport.restoreFileMerge): every value this
+// app keeps in localStorage that names one (My kennel, the active kennel, Today
+// dismissals, Kels's drafts and favorites…) is passed through `rekey`, a value →
+// value function that returns the same value when nothing in it changed.
+export function remapStoredIds(rekey) {
+  const keys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith('kennelOS.')) keys.push(k);
+  }
+  for (const k of keys) {
+    const raw = localStorage.getItem(k);
+    if (raw == null) continue;
+    let next;
+    try {
+      const parsed = JSON.parse(raw);
+      const moved = rekey(parsed);
+      next = moved === parsed ? raw : JSON.stringify(moved);
+    } catch {
+      next = rekey(raw);
+    }
+    if (next !== raw) localStorage.setItem(k, next);
+  }
+}
+
+export function getLastBackupDate() {
+  return localStorage.getItem(KEYS.lastBackupDate); // ISO string or null
+}
+
+export function setLastBackupDate(iso = new Date().toISOString()) {
+  localStorage.setItem(KEYS.lastBackupDate, iso);
+  return iso;
+}
+
+export function wasPersistRequested() {
+  return localStorage.getItem(KEYS.persistRequested) === '1';
+}
+
+export function markPersistRequested() {
+  localStorage.setItem(KEYS.persistRequested, '1');
+}
+
+// Sample-data manifest — the record of which IDs were created by the demo
+// seed, so they can be found again for a clean bulk delete (see sampleData.js).
+export function getSampleDataManifest() {
+  const raw = localStorage.getItem(KEYS.sampleDataManifest);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function setSampleDataManifest(manifest) {
+  localStorage.setItem(KEYS.sampleDataManifest, JSON.stringify(manifest));
+}
+
+// Is the tour's sample data loaded? One localStorage read, so the shell and the
+// write guard (demoMode.assertWritable) can ask without loading sampleData.js.
+export function hasSampleData() {
+  try { return getSampleDataManifest() != null; } catch { return false; } // no storage (tests): none
+}
+
+export function removeSampleDataManifest() {
+  localStorage.removeItem(KEYS.sampleDataManifest);
+}
+
+// The tour's seed lives only in the browsing session that seeded it (Load
+// Performance plan D2): the seed's `seededAt` is marked in sessionStorage, and a
+// page load in any other session clears the seed (assets/sampleDataUI.js).
+const TOUR_SESSION_KEY = 'kennelOS.tourSeededAt';
+const TOUR_CLEAR_KEY = 'kennelOS.tourClearTried';
+
+export function markTourSeededThisSession(seededAt) {
+  try { globalThis.sessionStorage?.setItem(TOUR_SESSION_KEY, String(seededAt || '')); } catch { /* storage unavailable */ }
+}
+
+export function wasTourSeededThisSession() {
+  const seededAt = getSampleDataManifest()?.seededAt;
+  try { return Boolean(seededAt) && globalThis.sessionStorage?.getItem(TOUR_SESSION_KEY) === String(seededAt); } catch { return false; }
+}
+
+// Should a page load clear the tour's seed (D2)? Yes unless the tour is active
+// and this browsing session seeded it. False when there's no seed.
+export function tourSeedExpired() {
+  if (!hasSampleData()) return false;
+  return !(getWizardStatusRaw() === 'active' && wasTourSeededThisSession());
+}
+
+// The one reload after an automatic clear, so a clear that didn't stick can't
+// reload forever (sampleDataUI.autoClearTourSeed).
+export function tookTourClearReload() {
+  try { return globalThis.sessionStorage?.getItem(TOUR_CLEAR_KEY) === '1'; } catch { return false; }
+}
+
+export function setTourClearReload(on) {
+  try {
+    if (on) globalThis.sessionStorage?.setItem(TOUR_CLEAR_KEY, '1');
+    else globalThis.sessionStorage?.removeItem(TOUR_CLEAR_KEY);
+  } catch { /* storage unavailable */ }
+}
+
+// What clearing an old seed changed in her own records (sampleData.clearSampleData
+// `detached`), shown once on the next page and then dropped.
+export function setTourCleanupNotice(lines) {
+  try {
+    if (lines?.length) localStorage.setItem(KEYS.tourCleanupNotice, JSON.stringify(lines));
+    else localStorage.removeItem(KEYS.tourCleanupNotice);
+  } catch { /* storage unavailable: no notice */ }
+}
+
+export function takeTourCleanupNotice() {
+  const lines = readJson(KEYS.tourCleanupNotice, null, (v) => Array.isArray(v));
+  try { localStorage.removeItem(KEYS.tourCleanupNotice); } catch { /* fine */ }
+  return lines || [];
+}
+
+export function wasSampleDataCleared() {
+  return localStorage.getItem(KEYS.sampleDataCleared) === '1';
+}
+
+export function markSampleDataCleared() {
+  localStorage.setItem(KEYS.sampleDataCleared, '1');
+}
+
+// "My kennel" identity — the real Kennel/Contact created by the kennel-setup
+// wizard (see kennelSetup.js). Stored as ids, not copied strings, so renaming
+// either record later (e.g. from the Kennels page) stays the single source of
+// truth; settings just remembers which records they are.
+export function getMyKennelId() {
+  return localStorage.getItem(KEYS.myKennelId);
+}
+
+export function setMyKennelId(id) {
+  localStorage.setItem(KEYS.myKennelId, id);
+}
+
+export function getMyContactId() {
+  return localStorage.getItem(KEYS.myContactId);
+}
+
+export function setMyContactId(id) {
+  localStorage.setItem(KEYS.myContactId, id);
+}
+
+// --- Active kennel scope (data/kennelScope.js) ------------------------------
+// Which of the user's own kennels the app is currently narrowed to, or absent for
+// "All kennels". Read/written only through kennelScope.js, never by a page.
+// Rides clearAllSettings() like every other key.
+//
+// (There is deliberately no "kennel setup skipped" key any more: first-run kennel
+// setup is a hard gate — Multi-Kennel Scope Spec §3.2 — because from that spec on,
+// every owned dog needs a kennel to point at. The gate re-fires until satisfied.)
+export function getActiveKennelId() {
+  return localStorage.getItem(KEYS.activeKennelId);
+}
+
+export function setActiveKennelId(id) {
+  if (id == null) localStorage.removeItem(KEYS.activeKennelId);
+  else localStorage.setItem(KEYS.activeKennelId, id);
+}
+
+// --- Companion messaging (per recipient type) ------------------------------
+// The Companion feature's Layer-1 config: kennel identity + intro/announcement
+// copy, one set per bundle type, edited in the Companion Messaging console and
+// copied into every built bundle so header/landing text updates without touching
+// the shell. App-level UI config, so it lives here (localStorage), never in
+// IndexedDB — consistent with "nothing app-level goes in IndexedDB." The Layer-2
+// per-recipient personal message is Contact.companion_note (a real record field),
+// shown ALONGSIDE the broadcast announcement (not an override).
+//
+// Deliberately ONE shared set across all of a user's own kennels, even in Pro's
+// multi-kennel mode (Multi-Kennel Scope Spec §10) — weighed against per-kennel
+// keying and kept global by owner decision: simpler, and a multi-kennel breeder
+// can swap the kennel name/tagline by hand before sending if they want
+// per-kennel branding. Not a gap to "finish" — revisit only if this becomes a
+// real pain point in practice.
+export const COMPANION_TYPES = ['prospective', 'family', 'partner'];
+
+const COMPANION_TYPE_LABELS = {
+  prospective: 'Prospective families',
+  family: 'Current families',
+  partner: 'Partners'
+};
+
+// `include` is the Layer-1 component allow-list per bundle type: a flat map of
+// boolean flags, ALL default true (current behaviour = everything shown). Each
+// flag lets the owner drop a component from the recipient's page; the builder
+// only ever SUBTRACTS from what it emits, so this can never widen the bundle.
+// Master flags gate a group; a child flag is only honoured when its master is
+// on (the builder ANDs them). New flags added here default true, so an upgrade
+// never silently hides a component from an existing saved config.
+const COMPANION_INCLUDE_DEFAULTS = {
+  prospective: {
+    parents: true, parentRegisteredName: true, parentCallName: true, parentPhotos: true, parentTests: true,
+    pricing: true, pricingPrice: true, pricingDeposit: true,
+    litterDates: true, markings: true,
+    // Reveal the owner/breeder kennel on FOSTER-IN litters only (the field is
+    // emitted empty for a non-foster or foster-out litter regardless of this flag —
+    // on foster-out we are the breeder). Defaults on, per the "all include flags
+    // default true" invariant; turn it off to keep a foster dam's owner kennel
+    // private on a prospective share.
+    fosterOwnerKennel: true
+  },
+  family: {
+    age: true, parentage: true, photos: true, readyPlacement: true, financials: true,
+    histVaccination: true, histPreventative: true, histWeight: true, histMilestone: true, histNote: true,
+    histBoarding: true, contract: true,
+    // Same as prospective: only populated for a puppy from a foster litter.
+    fosterOwnerKennel: true,
+    // Her referral links marked "Share with families" (Accounts; Integrations plan §3).
+    recommended: true
+  },
+  partner: {
+    studServices: true, studRegisteredName: true, studCallName: true, studPhotos: true, studTests: true,
+    studAgreement: true, studContract: true,
+    contracts: true
+  }
+};
+
+const COMPANION_DEFAULTS = {
+  prospective: {
+    kennelName: '', tagline: '', announcement: '', closer: '',
+    introText: 'A peek at the puppies we have available right now. This is a snapshot as of the last link I sent — I’ll send a fresh link when things change. There’s no live sync.',
+    include: COMPANION_INCLUDE_DEFAULTS.prospective
+  },
+  family: {
+    kennelName: '', tagline: '', announcement: '', closer: '',
+    introText: 'This shows your puppy’s info as of the last link I sent. I’ll send a new link whenever anything changes — there’s no live sync.',
+    include: COMPANION_INCLUDE_DEFAULTS.family
+  },
+  partner: {
+    kennelName: '', tagline: '', announcement: '', closer: '',
+    introText: 'A summary of our arrangement as of the last link I sent. I’ll send a new link when anything changes — there’s no live sync.',
+    include: COMPANION_INCLUDE_DEFAULTS.partner
+  }
+};
+
+// The full ordered list of include flags per type (masters + children), used by
+// the console to render checkboxes and by callers that need every key.
+export function companionIncludeKeys(type) {
+  return Object.keys(COMPANION_INCLUDE_DEFAULTS[type] || {});
+}
+
+export function companionTypeLabel(type) {
+  return COMPANION_TYPE_LABELS[type] || type;
+}
+
+function readCompanionStore() {
+  const raw = localStorage.getItem(KEYS.companion);
+  if (!raw) return {};
+  try { return JSON.parse(raw) || {}; } catch { return {}; }
+}
+
+// Merged with defaults so a caller always gets every field, even before the
+// owner has saved anything.
+export function getCompanionSettings(type) {
+  const defaults = COMPANION_DEFAULTS[type] || {};
+  const stored = readCompanionStore()[type] || {};
+  // `include` is deep-merged over defaults so a flag the owner never set (or one
+  // added in a later version) falls back to its default (on) instead of undefined.
+  return {
+    ...defaults,
+    ...stored,
+    include: { ...(defaults.include || {}), ...(stored.include || {}) }
+  };
+}
+
+export function setCompanionSettings(type, values) {
+  const store = readCompanionStore();
+  const prev = store[type] || {};
+  const merged = { ...prev, ...values };
+  // Deep-merge `include` so a partial write updates only the named flags and
+  // never drops the rest (the console writes the full map, but this keeps any
+  // caller honest).
+  if (values.include) merged.include = { ...(prev.include || {}), ...values.include };
+  store[type] = merged;
+  localStorage.setItem(KEYS.companion, JSON.stringify(store));
+  return getCompanionSettings(type);
+}
+
+// --- Furever seed-link identity ---------------------------------------------
+// The Furever seed-link generator's kennel-wide identity block: the fields the
+// brief calls "inherently yours, never generic" — kennel name/tagline, the
+// breeder's own contact, and their vet's contact. Filled in once (Furever
+// console, "Kennel identity" card) and copied into every seed packet sent from
+// then on. `breederKey` is a stable id generated on first read so every pup from
+// this kennel dedupes into ONE `breeders` row in Furever — deliberately NOT tied
+// to "My Kennel" (settings' myKennelId): Furever should work even if Kennel Setup
+// was skipped.
+//
+// This localStorage block is the device's CACHE. The program's copy rides on her
+// own kennel's record (`furever_identity`, data/fureverIdentity.js, K14-5), so
+// backups, cloud backup and live sync carry it and every device sends the same
+// key; the Furever console and the seed packet load through that module.
+//
+// Deliberately ONE shared block across all of a user's own kennels, even in
+// Pro's multi-kennel mode (Multi-Kennel Scope Spec §10) — same owner decision
+// as Companion above, kept global rather than keyed per kennel. Per-kennel
+// keying would also have meant per-kennel Drive content-pack pointers and
+// breederKey values, risking already-sent packets' dedup; staying global sidesteps
+// that entirely. Not a gap to "finish."
+//
+// Also holds the KENNEL-WIDE content-pack pointer (Content Package Fetch
+// Mechanism §3.4): `packKey`/`folderId`/`manifestFileId`/`manifestResourceKey`/
+// `version` are the Drive-side pointers a "Publish" run persists so a republish
+// reuses the same folder/file instead of creating new ones; `selection` is the
+// cached bulk-add-picker state (`{ documentIds, uploads }`) so the picker reopens
+// pre-checked. The per-litter equivalent lives on the litter record itself
+// (`litterRepo`'s `furever_pack` field), not here. `driveConnected` is UI-only
+// state — whether Connect has ever succeeded — never the access token itself
+// (googleDrive.js holds that in memory only, per its own §4.1 discipline).
+const FUREVER_DEFAULTS = {
+  breederKey: '',
+  kennelName: '', tagline: '',
+  breederContact: { name: '', phone: '', email: '' },
+  breederVet: { name: '', phone: '', address: '' },
+  driveConnected: false,
+  contentPack: {
+    packKey: null, folderId: null, manifestFileId: null, manifestResourceKey: null,
+    version: 0, selection: { documentIds: [], uploads: [] }
+  }
+};
+
+function readFureverStore() {
+  const raw = localStorage.getItem(KEYS.furever);
+  if (!raw) return {};
+  try { return JSON.parse(raw) || {}; } catch { return {}; }
+}
+
+export function getFureverSettings() {
+  const stored = readFureverStore();
+  if (!stored.breederKey) {
+    stored.breederKey = crypto.randomUUID();
+    localStorage.setItem(KEYS.furever, JSON.stringify(stored));
+  }
+  return {
+    ...FUREVER_DEFAULTS,
+    ...stored,
+    breederContact: { ...FUREVER_DEFAULTS.breederContact, ...(stored.breederContact || {}) },
+    breederVet: { ...FUREVER_DEFAULTS.breederVet, ...(stored.breederVet || {}) },
+    contentPack: {
+      ...FUREVER_DEFAULTS.contentPack,
+      ...(stored.contentPack || {}),
+      selection: {
+        ...FUREVER_DEFAULTS.contentPack.selection,
+        ...((stored.contentPack && stored.contentPack.selection) || {})
+      }
+    }
+  };
+}
+
+export function setFureverSettings(values) {
+  const stored = readFureverStore();
+  const merged = { ...stored, ...values };
+  if (values.breederContact) merged.breederContact = { ...(stored.breederContact || {}), ...values.breederContact };
+  if (values.breederVet) merged.breederVet = { ...(stored.breederVet || {}), ...values.breederVet };
+  if (values.contentPack) {
+    merged.contentPack = { ...(stored.contentPack || {}), ...values.contentPack };
+    if (values.contentPack.selection) {
+      merged.contentPack.selection = { ...((stored.contentPack || {}).selection || {}), ...values.contentPack.selection };
+    }
+  }
+  if (!merged.breederKey) merged.breederKey = crypto.randomUUID();
+  localStorage.setItem(KEYS.furever, JSON.stringify(merged));
+  return getFureverSettings();
+}
+
+// --- Invoice / receipt defaults (§24) --------------------------------------
+// Global config for the invoice generator: the default set of accepted payment
+// methods offered on an invoice ("Payment may be made using one of the
+// following methods:"). The generator modal prefills from this and can override
+// per document, or save the current selection back here as the new default.
+const INVOICE_DEFAULTS = {
+  acceptedMethods: ['Cash', 'Check', 'Bank transfer', 'Venmo', 'Zelle']
+};
+
+export function getInvoiceDefaults() {
+  const raw = localStorage.getItem(KEYS.invoiceDefaults);
+  if (!raw) return { ...INVOICE_DEFAULTS };
+  try { return { ...INVOICE_DEFAULTS, ...(JSON.parse(raw) || {}) }; } catch { return { ...INVOICE_DEFAULTS }; }
+}
+
+export function setInvoiceDefaults(values) {
+  const merged = { ...getInvoiceDefaults(), ...values };
+  localStorage.setItem(KEYS.invoiceDefaults, JSON.stringify(merged));
+  return merged;
+}
+
+// --- Mileage defaults (§21) ------------------------------------------------
+// The default reimbursement/deduction rate per mile the add-expense form's
+// mileage mode prefills. Editable per entry, or saved back here as the new
+// default. 0.70 is a sensible starting value (the 2025 US IRS standard mileage
+// rate) — change it to whatever rate your jurisdiction/records use. Units are
+// the app's native decimal dollars per mile.
+const MILEAGE_DEFAULTS = {
+  rate: 0.70
+};
+
+export function getMileageDefaults() {
+  const raw = localStorage.getItem(KEYS.mileageDefaults);
+  if (!raw) return { ...MILEAGE_DEFAULTS };
+  try { return { ...MILEAGE_DEFAULTS, ...(JSON.parse(raw) || {}) }; } catch { return { ...MILEAGE_DEFAULTS }; }
+}
+
+export function setMileageDefaults(values) {
+  const merged = { ...getMileageDefaults(), ...values };
+  localStorage.setItem(KEYS.mileageDefaults, JSON.stringify(merged));
+  return merged;
+}
+
+// Her website (KennelPort): what she sends from KennelOS is published at once
+// unless she turned that off on this device (Settings' Your website card), so it
+// lands only in the draft for Site Manager's Publish.
+export function getWebsitePublishOnSend() {
+  return localStorage.getItem(KEYS.websiteDraftOnly) !== '1';
+}
+
+export function setWebsitePublishOnSend(on) {
+  if (on) localStorage.removeItem(KEYS.websiteDraftOnly);
+  else localStorage.setItem(KEYS.websiteDraftOnly, '1');
+}
+
+// "Later" on the website banner: the unsent changes she put off, as a short
+// signature, so the banner comes back only when something else changes.
+export function getWebsiteLaterFor() {
+  return localStorage.getItem(KEYS.websiteLaterFor) || null;
+}
+
+export function setWebsiteLaterFor(signature) {
+  if (signature) localStorage.setItem(KEYS.websiteLaterFor, String(signature).slice(0, 200));
+  else localStorage.removeItem(KEYS.websiteLaterFor);
+}
+
+// Financials migration flag — set once the one-time Event.cost → Expense fold
+// has run (expenseRepo.migrateEventCosts). Cleared by Reset App along with every
+// other key, after which the migration re-runs harmlessly (no event has a cost).
+export function getExpensesMigrated() {
+  return localStorage.getItem(KEYS.expensesMigrated) === '1';
+}
+
+export function markExpensesMigrated() {
+  localStorage.setItem(KEYS.expensesMigrated, '1');
+}
+
+// Stud-trip migration flag — set once every in-person stud service's trip has a
+// boarding event (studServiceRepo.migrateStudTrips). Cleared by Reset App.
+export function getStudTripsMigrated() {
+  return localStorage.getItem(KEYS.studTripsMigrated) === '1';
+}
+
+export function markStudTripsMigrated() {
+  localStorage.setItem(KEYS.studTripsMigrated, '1');
+}
+
+// --- Guided tour (first-run wizard) -----------------------------------------
+// Wizard Runtime Spec v1 §2.1. `wizardStatus` is absent → treated as 'unseen';
+// `wizardStepIndex` is written on every advance/retreat regardless of status, so
+// pausing mid-tour never loses the spot.
+export function getWizardStatusRaw() {
+  return localStorage.getItem(KEYS.wizardStatus); // null | 'unseen' | 'active' | 'dismissed' | 'completed'
+}
+
+export function setWizardStatusRaw(status) {
+  localStorage.setItem(KEYS.wizardStatus, status);
+}
+
+export function getWizardStepIndexRaw() {
+  const raw = localStorage.getItem(KEYS.wizardStepIndex);
+  const n = raw == null ? 0 : parseInt(raw, 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// The step's id beside its index (K11-18): a release that adds or removes a stop
+// moves the indexes, not the ids. wizardState reads the id first.
+export function getWizardStepIdRaw() {
+  return localStorage.getItem(KEYS.wizardStepId) || null;
+}
+
+export function setWizardStepIdRaw(id) {
+  if (id) localStorage.setItem(KEYS.wizardStepId, id);
+  else localStorage.removeItem(KEYS.wizardStepId);
+}
+
+export function setWizardStepIndexRaw(index) {
+  localStorage.setItem(KEYS.wizardStepIndex, String(index));
+}
+
+// --- Dropbox sync (data/dropbox.js) -----------------------------------------
+// One JSON blob holding the OAuth tokens the PKCE flow produces (refresh
+// token, cached short-lived access token, and the in-flight PKCE verifier
+// during a redirect) — the app key itself is hardcoded in data/dropbox.js,
+// not stored here. App-level config, so it lives here like every other
+// setting — never in IndexedDB, and it rides Reset App's clearAllSettings
+// like everything else. The SAME connection is shared by the Import/Export
+// page and the KennelAssistant page (same origin, same folder).
+export function getDropboxSettings() {
+  const raw = localStorage.getItem(KEYS.dropbox);
+  if (!raw) return {};
+  try { return JSON.parse(raw) || {}; } catch { return {}; }
+}
+
+export function setDropboxSettings(values) {
+  const merged = { ...getDropboxSettings(), ...values };
+  // A key explicitly set to null is a delete, so tokens can be dropped cleanly.
+  for (const k of Object.keys(merged)) if (merged[k] == null) delete merged[k];
+  localStorage.setItem(KEYS.dropbox, JSON.stringify(merged));
+  return merged;
+}
+
+export function clearDropboxSettings() {
+  localStorage.removeItem(KEYS.dropbox);
+}
+
+// KennelAssistant: when the dog feed was last pulled from Dropbox (ISO string).
+export function getAssistantLastSync() {
+  return localStorage.getItem(KEYS.assistantLastSync);
+}
+
+export function setAssistantLastSync(iso = new Date().toISOString()) {
+  localStorage.setItem(KEYS.assistantLastSync, iso);
+  return iso;
+}
+
+// Owner side of the same story: when THIS device last uploaded the assistant
+// feed. The helper only ever sees what was pushed, so the console needs this to
+// answer "does my helper know about the puppies I added this morning?" — which
+// `assistantLastSync` (a per-device read stamp, written on the helper's phone)
+// cannot answer here.
+export function getAssistantFeedPushedAt() {
+  return localStorage.getItem(KEYS.assistantFeedPushedAt);
+}
+
+export function setAssistantFeedPushedAt(iso = new Date().toISOString()) {
+  localStorage.setItem(KEYS.assistantFeedPushedAt, iso);
+  return iso;
+}
+
+// --- Kels's Getting Started: the parts she has answered, per kennel (K11-12) ---
+// { [kennelId]: { parts: [...], complete } } on this device, so a run left partway
+// can pick up where she stopped. In KEYS, so Reset App clears it.
+function readSetupDone() {
+  try { return JSON.parse(localStorage.getItem(KEYS.kelsSetupDone) || '{}') || {}; } catch { return {}; }
+}
+export function getKelsSetupDone(kennelId) {
+  const entry = readSetupDone()[kennelId] || {};
+  return { parts: Array.isArray(entry.parts) ? entry.parts : [], complete: entry.complete === true };
+}
+export function markKelsSetupPart(kennelId, part, { complete = false } = {}) {
+  const all = readSetupDone();
+  const entry = all[kennelId] || { parts: [] };
+  const parts = [...new Set([...(entry.parts || []), ...(part ? [part] : [])])];
+  all[kennelId] = { parts: complete ? [] : parts, complete: complete || entry.complete === true };
+  localStorage.setItem(KEYS.kelsSetupDone, JSON.stringify(all));
+}
+// Any kennel set up all the way through (the menu's priority).
+export function anyKelsSetupComplete() {
+  return Object.values(readSetupDone()).some((e) => e && e.complete === true);
+}
+
+// --- KennelAssistant: the helper's entries imported on this device (K11-4) ----
+// Ids only, newest last, at most ASSISTANT_IMPORTED_MAX. An entry she deleted
+// after importing is then known as one she removed, not offered as New again.
+// Device-only; in KEYS, so Reset App clears it.
+const ASSISTANT_IMPORTED_MAX = 5000;
+export function getAssistantImportedIds() {
+  try {
+    const list = JSON.parse(localStorage.getItem(KEYS.assistantImported) || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+export function addAssistantImportedIds(ids) {
+  const list = getAssistantImportedIds().filter((id) => !ids.includes(id));
+  const next = [...list, ...ids].slice(-ASSISTANT_IMPORTED_MAX);
+  localStorage.setItem(KEYS.assistantImported, JSON.stringify(next));
+}
+
+// --- Guided "Record a new litter" draft (assets/guidedLitterUI.js) ----------
+// The answers given so far, saved after every step so closing the window loses
+// nothing and Today can offer "Finish recording …". One draft at a time; null
+// when none. In KEYS, so Reset App clears it. Device-only: it is not program
+// data until she approves the review and it's saved through the repos.
+export function getGuidedLitterDraft() {
+  const raw = localStorage.getItem(KEYS.guidedLitterDraft);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function setGuidedLitterDraft(draft) {
+  localStorage.setItem(KEYS.guidedLitterDraft, JSON.stringify(draft));
+  return draft;
+}
+
+export function clearGuidedLitterDraft() {
+  localStorage.removeItem(KEYS.guidedLitterDraft);
+}
+
+// --- Kels's "Add dogs" draft (assets/guidedDogsUI.js) ------------------------
+// As the litter draft above: her answers so far, one draft at a time, null when
+// none. In KEYS, so Reset App clears it. Device-only until the save.
+export function getGuidedDogsDraft() {
+  try {
+    return JSON.parse(localStorage.getItem(KEYS.guidedDogsDraft) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+export function setGuidedDogsDraft(draft) {
+  localStorage.setItem(KEYS.guidedDogsDraft, JSON.stringify(draft));
+  return draft;
+}
+
+export function clearGuidedDogsDraft() {
+  localStorage.removeItem(KEYS.guidedDogsDraft);
+}
+
+// --- Kels's "Add people" draft (assets/guidedPeopleUI.js) --------------------
+// As the dogs draft above: one at a time, null when none, cleared by Reset App.
+export function getGuidedPeopleDraft() {
+  try {
+    return JSON.parse(localStorage.getItem(KEYS.guidedPeopleDraft) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+export function setGuidedPeopleDraft(draft) {
+  localStorage.setItem(KEYS.guidedPeopleDraft, JSON.stringify(draft));
+  return draft;
+}
+
+export function clearGuidedPeopleDraft() {
+  localStorage.removeItem(KEYS.guidedPeopleDraft);
+}
+
+// --- Kels's "Set up my application form" draft (assets/guidedFormUI.js) -----
+// As the others: one at a time, null when none, cleared by Reset App. Her form
+// stays here until she approves it, so a half-made one never goes online.
+export function getGuidedFormDraft() {
+  try {
+    return JSON.parse(localStorage.getItem(KEYS.guidedFormDraft) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+export function setGuidedFormDraft(draft) {
+  localStorage.setItem(KEYS.guidedFormDraft, JSON.stringify(draft));
+  return draft;
+}
+
+export function clearGuidedFormDraft() {
+  localStorage.removeItem(KEYS.guidedFormDraft);
+}
+
+// A draft an update can't carry on (its DRAFT_VERSION changed) is let go with a
+// word, never silently (K11-16): `retireDraft` clears it and leaves a notice Kels
+// says once on her next visit (takeKelsDraftNotice), naming what it was and, when
+// its save had already made some records, that those are kept. → null.
+export function retireDraft(key, draft, what) {
+  const name = (draft && draft.label) || what;
+  const s = (draft && draft.saved) || {};
+  const made = Object.values(s).some((v) => v && (typeof v === 'string' || (typeof v === 'object' && Object.values(v).some(Boolean))))
+    || [...(draft?.pups || []), ...(draft?.dogs || []), ...(draft?.people || [])].some((x) => x && x.saved && x.id);
+  const text = `After the last update I couldn't keep the draft you hadn't finished (${name}), so I've let it go.${made ? ' Some of it was already saved before it stopped, and those records are still in your program: have a look there before starting it again.' : ''}`;
+  const list = takeKelsDraftNotice({ keep: true });
+  localStorage.setItem(KEYS.kelsDraftNotice, JSON.stringify([...list, text]));
+  localStorage.removeItem(KEYS[key]);
+  return null;
+}
+export function takeKelsDraftNotice({ keep = false } = {}) {
+  let list = [];
+  try { list = JSON.parse(localStorage.getItem(KEYS.kelsDraftNotice) || '[]') || []; } catch { list = []; }
+  if (!keep) localStorage.removeItem(KEYS.kelsDraftNotice);
+  return Array.isArray(list) ? list : [];
+}
+
+// Every Kels draft at once: where the records they name go away wholesale (Clear
+// sample data, the tour's end, a Replace restore), so none resumes over records
+// that are gone (K11-2).
+export function clearGuidedDrafts() {
+  for (const k of ['guidedLitterDraft', 'guidedDogsDraft', 'guidedPeopleDraft', 'guidedFormDraft']) localStorage.removeItem(KEYS[k]);
+}
+
+// --- Kels's "Pups are going home": the optional checks she ticked last time ----
+// (assets/prepPupsUI.js), ticked again next time. Device-only UI state; null until
+// she's answered once. In KEYS, so Reset App clears it.
+export function getPrepChecks() {
+  try {
+    const v = JSON.parse(localStorage.getItem(KEYS.prepChecks) || 'null');
+    return Array.isArray(v) ? v.filter((k) => typeof k === 'string') : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setPrepChecks(keys) {
+  localStorage.setItem(KEYS.prepChecks, JSON.stringify(keys || []));
+  return keys;
+}
+
+// --- Kels's menu: her starred tasks, when she started each, and the ones she --
+// said not to move up (data/kelsFavorites.js says what they mean). Device-only:
+// her habits on this device, never in a backup or synced. In KEYS, so Reset App
+// clears them.
+function readJson(key, fallback, ok) {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) || 'null');
+    return ok(v) ? v : fallback;
+  } catch {
+    return fallback;
+  }
+}
+const isIdList = (v) => Array.isArray(v) && v.every((x) => typeof x === 'string');
+
+export const getKelsFavorites = () => readJson(KEYS.kelsFavorites, [], isIdList);
+export function setKelsFavorites(ids) { localStorage.setItem(KEYS.kelsFavorites, JSON.stringify(ids || [])); }
+export const getKelsNoPromote = () => readJson(KEYS.kelsNoPromote, [], isIdList);
+export function setKelsNoPromote(ids) { localStorage.setItem(KEYS.kelsNoPromote, JSON.stringify(ids || [])); }
+export const getKelsTaskUse = () => readJson(KEYS.kelsTaskUse, {}, (v) => v && typeof v === 'object' && !Array.isArray(v));
+export function setKelsTaskUse(uses) { localStorage.setItem(KEYS.kelsTaskUse, JSON.stringify(uses || {})); }
+// The "Meet Kels" card is waiting for the next page load: set when the first-run
+// kennel setup saves (after the tour, or Start my kennel), cleared once shown.
+export const isMeetKelsPending = () => localStorage.getItem(KEYS.meetKelsPending) === '1';
+export function setMeetKelsPending(on) {
+  if (on) localStorage.setItem(KEYS.meetKelsPending, '1');
+  else localStorage.removeItem(KEYS.meetKelsPending);
+}
+
+// --- Cloud backup dirty signal (Cloud Phase 1 plan §3.2) ---------------------
+// `cloudDirtyAt` is the ISO time of the latest local data change. Set by ONE
+// helper, markDataChanged(), which every data write calls: repoBase's
+// create/update/hardDelete and the direct writers (fileRepo, expenseRepo,
+// assistantSync, importExport.restoreBackup). tests/cloudDirty.test.js fails if
+// a new direct db writer appears without it. The backup scheduler pushes only
+// while this is set, and clears it with clearCloudDirty(the value it pushed),
+// so a change that lands mid-push keeps the flag for the next one. In KEYS, so
+// Reset App clears it (an empty program has nothing to push).
+//
+// `cloudDirtySince` is the FIRST unpushed change: the scheduler's 5-minute timer
+// runs from it (plan §2.2), so later changes ride the same push. A change
+// event is also dispatched on the window (CLOUD_DATA_CHANGED_EVENT) so a running
+// scheduler can start its timer without polling.
+export const CLOUD_DATA_CHANGED_EVENT = 'kennelos:datachanged';
+// Live sync's: every sync run ends with it (data/cloud/cloudSync.js), so an open
+// status line can redraw itself.
+export const SYNC_STATUS_EVENT = 'kennelos:syncstatus';
+// Cloud backup's: every push attempt past the quick skips ends with it
+// (data/cloud/cloudBackup.js), so an open status line or Today's card can redraw.
+export const CLOUD_BACKUP_EVENT = 'kennelos:cloudbackup';
+
+export function markDataChanged(iso = new Date().toISOString()) {
+  noteDataChanged(iso);
+  try {
+    localStorage.setItem(KEYS.cloudDirtyAt, iso);
+    if (!localStorage.getItem(KEYS.cloudDirtySince)) localStorage.setItem(KEYS.cloudDirtySince, iso);
+  } catch {
+    /* storage unavailable: the next start-up push still sees the change */
+  }
+  try {
+    globalThis.dispatchEvent?.(new Event(CLOUD_DATA_CHANGED_EVENT));
+  } catch {
+    /* no window (tests) */
+  }
+  return iso;
+}
+
+// When this device's records last changed, by a local edit (markDataChanged) or a
+// live-sync apply (syncApply.js, which must not mark the backup dirty). Unlike
+// cloudDirtyAt it is never cleared by a push, so a reader that saved a result
+// (the website strip, Load Performance plan D7) can tell whether anything moved
+// since. In KEYS: Reset App drops it along with the results it guards.
+export function noteDataChanged(iso = new Date().toISOString()) {
+  try { localStorage.setItem(KEYS.dataChangedAt, iso); } catch { /* storage unavailable */ }
+  return iso;
+}
+
+export function getDataChangedAt() {
+  try { return localStorage.getItem(KEYS.dataChangedAt); } catch { return null; }
+}
+
+export function getCloudDirtyAt() {
+  return localStorage.getItem(KEYS.cloudDirtyAt); // ISO string or null
+}
+
+export function getCloudDirtySince() {
+  return localStorage.getItem(KEYS.cloudDirtySince) || localStorage.getItem(KEYS.cloudDirtyAt);
+}
+
+// Clears the flag only if it still holds `ifAt` (omit to clear unconditionally).
+// When a newer change landed meanwhile, the flag stays and `since` moves up to
+// that change, so its push is timed from when it happened.
+export function clearCloudDirty(ifAt) {
+  const current = localStorage.getItem(KEYS.cloudDirtyAt);
+  if (ifAt === undefined || current === ifAt) {
+    localStorage.removeItem(KEYS.cloudDirtyAt);
+    localStorage.removeItem(KEYS.cloudDirtySince);
+  } else if (current) {
+    localStorage.setItem(KEYS.cloudDirtySince, current);
+  }
+}
+
+// The one-time "Protect your records: turn on free cloud backup" offer (Cloud
+// Phase 1 plan §2.1), armed when the first kennel is saved and shown on the next
+// load (the save reloads the page). And when this device was last restored from
+// the cloud, for the "private details aren't in cloud backup" hint (§2.3).
+export function isCloudOfferPending() {
+  return localStorage.getItem(KEYS.cloudOfferPending) === '1';
+}
+
+export function setCloudOfferPending(on) {
+  if (on) localStorage.setItem(KEYS.cloudOfferPending, '1');
+  else localStorage.removeItem(KEYS.cloudOfferPending);
+}
+
+// Support's helper device has set itself up for this program (cloudAssistUI.js
+// bootstrapHelper): its vault key and the join. Keyed by program id.
+export function getAssistReady() {
+  return localStorage.getItem(KEYS.assistReady);
+}
+
+export function setAssistReady(programId) {
+  if (programId) localStorage.setItem(KEYS.assistReady, programId);
+  else localStorage.removeItem(KEYS.assistReady);
+}
+
+export function getCloudRestoredAt() {
+  return localStorage.getItem(KEYS.cloudRestoredAt);
+}
+
+export function setCloudRestoredAt(iso) {
+  if (iso) localStorage.setItem(KEYS.cloudRestoredAt, iso);
+  else localStorage.removeItem(KEYS.cloudRestoredAt);
+}
+
+// --- What the shell draws before its first database read --------------------
+// (Load Performance plan Phase 1.) Each is a copy of something the database
+// holds, kept so the page's first paint already has it; the page corrects the
+// copy after it reads the real thing, so a stale one costs a redraw, never a
+// wrong record. All in KEYS, so Reset App drops them.
+
+// The nav's kennel name (under "KennelOS") and the kennel switcher's own kennels:
+// { name: string|null, own: [{ id, kennel_name }] }.
+export function getNavKennels() {
+  const v = readJson(KEYS.navKennels, null, (x) => x && typeof x === 'object' && Array.isArray(x.own));
+  return v ? { name: typeof v.name === 'string' ? v.name : null, own: v.own.filter((k) => k && typeof k.id === 'string') } : null;
+}
+
+export function setNavKennels(value) {
+  try {
+    if (!value) localStorage.removeItem(KEYS.navKennels);
+    else localStorage.setItem(KEYS.navKennels, JSON.stringify({ name: value.name || null, own: (value.own || []).map((k) => ({ id: k.id, kennel_name: k.kennel_name || '' })) }));
+  } catch { /* storage unavailable: the nav fills in after its read */ }
+}
+
+// The KennelPort website strip's last compare (assets/websiteBanner.js, D7):
+// { checkedAt, signature, html, waiting: [{ kennel: { id, kennel_name }, lines, never, portal }] }.
+// `html` is the strip's closed state, drawn as-is in the first paint.
+export function getWebsiteStripCache() {
+  return readJson(KEYS.websiteStrip, null, (x) => x && typeof x === 'object' && Array.isArray(x.waiting));
+}
+
+export function setWebsiteStripCache(value) {
+  try {
+    if (!value) localStorage.removeItem(KEYS.websiteStrip);
+    else localStorage.setItem(KEYS.websiteStrip, JSON.stringify(value));
+  } catch { /* storage unavailable: the strip compares on every page instead */ }
+}
+
+// Whether this device's private-vault recovery code was still unsaved when last
+// looked up (Today's cloud card shows "Save your recovery code" from it).
+export function getCloudCodeUnsavedCache() {
+  try { return localStorage.getItem(KEYS.cloudCodeUnsaved) === '1'; } catch { return false; }
+}
+
+export function setCloudCodeUnsavedCache(on) {
+  try {
+    if (on) localStorage.setItem(KEYS.cloudCodeUnsaved, '1');
+    else localStorage.removeItem(KEYS.cloudCodeUnsaved);
+  } catch { /* storage unavailable */ }
+}
+
+// Full app reset (Reset App to Start): drop every key this app owns in
+// localStorage, so the next load has no memory of sample data, kennel setup,
+// or backup history — same blank slate as a browser that's never visited.
+export function clearAllSettings() {
+  for (const key of Object.values(KEYS)) localStorage.removeItem(key);
+}
+
+// --- Pro license (Pro edition license gate — data/license.js) ----------------
+// The cached Lemon Squeezy activation record (key, instance id, status, expiry,
+// billing interval, last-validated timestamp) that lets Pro run offline within a
+// grace window without re-hitting the network every launch.
+//
+// Deliberately NOT in KEYS above, so clearAllSettings() (Reset App to Start) does
+// NOT drop it: a data reset wipes the kennel program, but paid entitlement isn't
+// program data — de-activating Pro on a reset would be a hostile surprise, and the
+// key would just re-validate anyway. It's cleared explicitly only when the owner
+// chooses "use a different key" (clearProLicense), never by Reset App.
+const PRO_LICENSE_KEY = 'kennelOS.proLicense';
+
+export function getProLicense() {
+  const raw = localStorage.getItem(PRO_LICENSE_KEY);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+export function setProLicense(record) {
+  localStorage.setItem(PRO_LICENSE_KEY, JSON.stringify(record));
+  return record;
+}
+
+export function clearProLicense() {
+  localStorage.removeItem(PRO_LICENSE_KEY);
+}
+
+// When this device last asked the store about its license, and whether it has in
+// this browsing session (data/license.js licenseCheckDue: once a session and
+// again after 6 hours, decision D6 of the Load Performance plan). Outside KEYS
+// like the record itself. The session mark is in sessionStorage, so a new tab or
+// a relaunched app asks again.
+const LICENSE_CHECKED_KEY = 'kennelOS.licenseCheckedAt';
+const LICENSE_SESSION_KEY = 'kennelOS.licenseAsked';
+
+export function getLicenseCheckedAt() {
+  try { return localStorage.getItem(LICENSE_CHECKED_KEY); } catch { return null; }
+}
+
+export function wasLicenseAskedThisSession() {
+  try { return globalThis.sessionStorage?.getItem(LICENSE_SESSION_KEY) === '1'; } catch { return false; }
+}
+
+export function markLicenseAsked(iso = new Date().toISOString()) {
+  try { localStorage.setItem(LICENSE_CHECKED_KEY, iso); } catch { /* storage unavailable */ }
+  try { globalThis.sessionStorage?.setItem(LICENSE_SESSION_KEY, '1'); } catch { /* storage unavailable */ }
+}
+
+// --- Cloud backup session, state and device id (Cloud Phase 1 plan §3.3) -----
+// Outside KEYS, so Reset App's clearAllSettings() doesn't drop them: appReset.js
+// handles them explicitly instead. A reset always turns backup OFF and forgets
+// which snapshot this device was in step with (so turning it back on goes
+// through the restore-or-replace choice, plan §3.4), but it keeps the sign-in
+// unless the user also chooses to sign out.
+//   cloudSession     { token, email, programId, deviceId } — email stays on this
+//                    device only; the server keeps a keyed hash (plan §2.1)
+//   cloudBackupState { enabled, lastPushedAt, lastAttemptAt, lastSnapshotId,
+//                      lastCounts, lastContentHash, lastError, movedToEdition }
+//                    (movedToEdition: 'pro' once a Lite device stopped backing
+//                    up because the program moved to Pro)
+//                    (lastCheckInAt: the last device check-in, plan §2.5)
+//                    (emailChange: a pending change of the account's email,
+//                    { requestedAt, effectiveAt, deviceLabel } or null, plan §2.6)
+//                    (vault: 'on' | 'locked' | 'off' | null, and vaultPushedAt:
+//                    the private vault as this device last saw it, Private
+//                    Vault Plan §2.2; the key itself is in device_secrets)
+//   cloudDeviceId    this browser's id on the cloud account, minted here and sent
+//                    on every sign-in so signing in again doesn't make the
+//                    backing device a stranger. Separate from the license's
+//                    deviceId below, which has one documented purpose.
+const CLOUD_SESSION_KEY = 'kennelOS.cloudSession';
+const CLOUD_BACKUP_STATE_KEY = 'kennelOS.cloudBackupState';
+const CLOUD_DEVICE_ID_KEY = 'kennelOS.cloudDeviceId';
+
+const CLOUD_BACKUP_STATE_DEFAULTS = {
+  enabled: false, lastPushedAt: null, lastAttemptAt: null, lastSnapshotId: null,
+  lastCounts: null, lastContentHash: null, lastError: null, movedToEdition: null,
+  lastCheckInAt: null, vault: null, vaultPushedAt: null, emailChange: null
+};
+
+function readJsonKey(key) {
+  const raw = localStorage.getItem(key);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+export function getCloudSession() {
+  return readJsonKey(CLOUD_SESSION_KEY);
+}
+
+// The cloud service notices this browsing session already fetched (cloudDevices.js
+// cacheNotices writes them to sessionStorage under this key), so the shell can
+// draw them at boot instead of after the cloud UI loads. Null when none fetched yet.
+export function getCachedCloudNotices() {
+  try {
+    const v = JSON.parse(globalThis.sessionStorage?.getItem('kennelOS.cloudNotices') || 'null');
+    return Array.isArray(v) ? v : null;
+  } catch { return null; }
+}
+
+export function setCloudSession(session) {
+  localStorage.setItem(CLOUD_SESSION_KEY, JSON.stringify(session));
+  return session;
+}
+
+export function clearCloudSession() {
+  localStorage.removeItem(CLOUD_SESSION_KEY);
+}
+
+export function getCloudBackupState() {
+  return { ...CLOUD_BACKUP_STATE_DEFAULTS, ...(readJsonKey(CLOUD_BACKUP_STATE_KEY) || {}) };
+}
+
+// Merges `patch` into the stored state and returns the result.
+export function updateCloudBackupState(patch) {
+  const next = { ...getCloudBackupState(), ...patch };
+  localStorage.setItem(CLOUD_BACKUP_STATE_KEY, JSON.stringify(next));
+  return next;
+}
+
+export function clearCloudBackupState() {
+  localStorage.removeItem(CLOUD_BACKUP_STATE_KEY);
+}
+
+// Live sync on this device (Cloud Phase 2 plan §3.4; data/cloud/cloudSync.js):
+//   enabled     this device keeps in step
+//   joining     a join is under way (cloudSync.joinSync): until it finishes,
+//               any sync run resumes the join instead of a plain pull
+//   cursor      the highest server seq this device has applied
+//   lastPushAt / lastPullAt / lastCursorSentAt   ISO times
+//   lastError   { code, at, detail } | null: what paused it (vault_locked,
+//               pro_required, sync_off, vault_key_stale, resync_required,
+//               shrink, error { message }, offline …)
+//   rejected    { '<table>:<id>': hash } — records the server dropped; skipped
+//               until they change again, or until the Worker's field list does
+//               (plan §11)
+//   fieldsVersion  the Worker's cloud field fingerprint at the last head check
+//   waiting     { '<table>': seq } — tables this build lacks, from the first seq
+//               seen; pulled again once an update has the table
+//   activity    [{ at, kind, tbl, id, by, op?, reason?, where? }] — kinds in
+//               data/cloud/syncActivity.js; the last 30 days, newest first, at most 100
+// Outside KEYS like the backup state. Reset App clears it (appReset.js).
+const CLOUD_SYNC_STATE_KEY = 'kennelOS.cloudSyncState';
+const CLOUD_SYNC_STATE_DEFAULTS = {
+  enabled: false, cursor: 0, lastPushAt: null, lastPullAt: null, lastCursorSentAt: null,
+  lastError: null, rejected: {}, activity: []
+};
+
+export function getCloudSyncState() {
+  return { ...CLOUD_SYNC_STATE_DEFAULTS, ...(readJsonKey(CLOUD_SYNC_STATE_KEY) || {}) };
+}
+
+export function updateCloudSyncState(patch) {
+  const next = { ...getCloudSyncState(), ...patch };
+  localStorage.setItem(CLOUD_SYNC_STATE_KEY, JSON.stringify(next));
+  return next;
+}
+
+export function clearCloudSyncState() {
+  localStorage.removeItem(CLOUD_SYNC_STATE_KEY);
+}
+
+// The waitlist online on this device (data/cloud/cloudWaitlist.js, W2 Plan §5):
+// per kennel id, what was last published { publicId, hash, version, publishedAt },
+// plus the last error. Outside KEYS like the rest of the cloud state, so Reset
+// App doesn't drop it (a reset turns cloud backup off, and publishing with it).
+const WAITLIST_ONLINE_STATE_KEY = 'kennelOS.waitlistOnline';
+
+export function getWaitlistOnlineState() {
+  return { kennels: {}, lastError: null, lastAttemptAt: null, ...(readJsonKey(WAITLIST_ONLINE_STATE_KEY) || {}) };
+}
+
+export function updateWaitlistOnlineState(patch) {
+  const next = { ...getWaitlistOnlineState(), ...patch };
+  localStorage.setItem(WAITLIST_ONLINE_STATE_KEY, JSON.stringify(next));
+  return next;
+}
+
+export function clearWaitlistOnlineState() {
+  localStorage.removeItem(WAITLIST_ONLINE_STATE_KEY);
+}
+
+// Vendor integrations on this device (data/cloud/cloudIntegrations.js, Integrations
+// plan §0): how many connections the account has (0 = never ask for events), the
+// events cursor, and the last error. Outside KEYS like the rest of the cloud state.
+const INTEGRATIONS_STATE_KEY = 'kennelOS.integrations';
+
+export function getIntegrationsState() {
+  return { connections: 0, eventsCursor: 0, lastError: null, lastAttemptAt: null, ...(readJsonKey(INTEGRATIONS_STATE_KEY) || {}) };
+}
+
+export function updateIntegrationsState(patch) {
+  const next = { ...getIntegrationsState(), ...patch };
+  localStorage.setItem(INTEGRATIONS_STATE_KEY, JSON.stringify(next));
+  return next;
+}
+
+export function getCloudDeviceId() {
+  let id = localStorage.getItem(CLOUD_DEVICE_ID_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(CLOUD_DEVICE_ID_KEY, id);
+  }
+  return id;
+}
+
+export function setCloudDeviceId(id) {
+  localStorage.setItem(CLOUD_DEVICE_ID_KEY, id);
+}
+
+// --- Erased by its owner (Cloud Phase 1 plan §2.5) --------------------------
+// After a remote erase wipes this device, the one thing written back is the
+// dead token, kept only until the server has heard "erased" (it may have gone
+// offline mid-erase). It opens nothing: the server answers it on the ack route
+// alone. Then clearAllAppStorage() is what "every key this app owns" means
+// for the erase: KEYS, and everything deliberately outside them (the license,
+// the cloud session and ids, the test switch), in both storages.
+const ERASE_ACK_KEY = 'kennelOS.eraseAck';
+const APP_PREFIX = 'kennelOS.';
+
+export function getPendingEraseAck() {
+  return localStorage.getItem(ERASE_ACK_KEY);
+}
+
+export function setPendingEraseAck(token) {
+  localStorage.setItem(ERASE_ACK_KEY, token);
+}
+
+export function clearPendingEraseAck() {
+  localStorage.removeItem(ERASE_ACK_KEY);
+}
+
+// Support's helper device handed back while it couldn't reach the server: its copy is
+// wiped at once, and this one token (it opens nothing else: help is ending) is kept
+// until the server has heard End help (cloudDevices.finishAssistEnd, review K05-8).
+const ASSIST_END_KEY = 'kennelOS.assistEnd';
+
+export function getPendingAssistEnd() {
+  return localStorage.getItem(ASSIST_END_KEY);
+}
+
+export function setPendingAssistEnd(token) {
+  localStorage.setItem(ASSIST_END_KEY, token);
+}
+
+export function clearPendingAssistEnd() {
+  localStorage.removeItem(ASSIST_END_KEY);
+}
+
+export function clearAllAppStorage() {
+  for (const store of [globalThis.localStorage, globalThis.sessionStorage]) {
+    if (!store) continue;
+    try {
+      const keys = [];
+      for (let i = 0; i < store.length; i++) {
+        const k = store.key(i);
+        if (k && k.startsWith(APP_PREFIX)) keys.push(k);
+      }
+      for (const k of keys) store.removeItem(k);
+    } catch { /* storage unavailable: nothing to clear */ }
+  }
+}
+
+// --- Cloud test-server switch (data/cloud/cloudConfig.js) --------------------
+// '1' while this browser is pointed at the edition's staging server
+// (devCloudUrl) on a deployed origin, turned on by visiting any page with
+// ?cloud=staging and off with ?cloud=off. Outside KEYS so Reset App keeps it:
+// it says which server this browser talks to, not anything about the program.
+const CLOUD_TEST_SERVER_KEY = 'kennelOS.cloudTestServer';
+
+export function isCloudTestServerOn() {
+  return localStorage.getItem(CLOUD_TEST_SERVER_KEY) === '1';
+}
+
+export function setCloudTestServer(on) {
+  if (on) localStorage.setItem(CLOUD_TEST_SERVER_KEY, '1');
+  else localStorage.removeItem(CLOUD_TEST_SERVER_KEY);
+}
+
+// --- Device id (Pro license gate — data/license.js) --------------------------
+// A random id this browser mints for itself, used for exactly one thing: making
+// the name of this browser's activation ("instance") in the Lemon Squeezy
+// dashboard unique, so an owner who has used several of their allowed
+// activations can tell them apart and release the right one.
+//
+// This is NOT device detection and reads nothing whatsoever about the machine —
+// no hardware, no fingerprint, no user agent. It is a UUID with no meaning
+// outside this browser's own storage, and it never leaves the app except as the
+// last 8 characters of a label the owner sees in their own store account.
+//
+// Outside KEYS above for the same reason the license record is: it is
+// entitlement bookkeeping, not program data, so Reset App to Start must leave it
+// alone. If a reset re-minted it, this browser's already-held activation would
+// silently change name and stop being identifiable.
+const DEVICE_ID_KEY = 'kennelOS.deviceId';
+
+export function getDeviceId() {
+  let id = localStorage.getItem(DEVICE_ID_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(DEVICE_ID_KEY, id);
+  }
+  return id;
+}

@@ -1,0 +1,291 @@
+// referenceRegistry.js — the single declared list of every foreign key that
+// points at each entity, plus the generic guard that drives hard-delete blocking
+// (Data Model v3 §10, Stage4 Revision v2 §4).
+//
+// Stage 4 note: every relationship now has ONE canonical stored side; the
+// reverse is always a derived query, never a second stored pointer (Data Model
+// v3 §1, sixth design principle). That means every entry below points at a field
+// that is actually written somewhere — there is no `Sale.contract_id`,
+// `StudService.contract_id`, or `Pairing.stud_service_id` to guard, because
+// those fields don't exist.
+//
+// Why a registry instead of ad-hoc checks in each repo:
+//  - It stays HONEST per stage. `findBlockingReferences` skips any entry whose
+//    table doesn't exist in the current schema version — a harmless no-op now
+//    that all ten tables exist from version(1), but kept so a future unshipped
+//    table can't silently break the guard.
+//  - It can't silently rot: adding a referencing table later means appending one
+//    line here, not remembering to update a scattered check.
+//
+// Entry shape:
+//   { table, field, label,
+//     multiEntry?:   true if `field` is a Dexie multi-entry (*) index,
+//     compoundIndex? + discriminatorValue?:  for the polymorphic Event, match
+//       only rows of the right subject_type via the [subject_type+subject_id]
+//       compound index,
+//     scan?: true when `field` is an unindexed dotted path (every row is read);
+//       `list[].key` matches any item of the list `list` whose `key` is the id }
+import { db, existingTableNames } from './db.js';
+
+// --- Dog: what can point at a Dog (Data Model v3 §10) -----------------------
+export const DOG_REFERENCES = [
+  { table: 'dogs',          field: 'sire_id',        label: 'sire of another dog' },
+  { table: 'dogs',          field: 'dam_id',         label: 'dam of another dog' },
+  {
+    table: 'events', field: 'subject_id', label: 'subject of an event',
+    compoundIndex: '[subject_type+subject_id]', discriminatorValue: 'dog'
+  },
+  { table: 'events',        field: 'related_dog_id', label: 'partner on an event' },
+  { table: 'pairings',      field: 'sire_id',        label: 'sire in a pairing' },
+  { table: 'pairings',      field: 'dam_id',         label: 'dam in a pairing' },
+  { table: 'litters',       field: 'sire_id',        label: 'sire of a litter' },
+  { table: 'litters',       field: 'dam_id',         label: 'dam of a litter' },
+  { table: 'waitlist_entries', field: 'listen_sire_ids', label: 'sire in a waitlist family\'s listen-only choice', multiEntry: true },
+  { table: 'waitlist_entries', field: 'listen_dam_ids',  label: 'dam in a waitlist family\'s listen-only choice', multiEntry: true },
+  { table: 'sales',         field: 'dog_id',         label: 'placed via a sale' },
+  { table: 'stud_services', field: 'our_dog_id',     label: 'our dog in a stud service' },
+  { table: 'stud_services', field: 'partner_dog_id', label: 'partner dog in a stud service' },
+  { table: 'contracts',     field: 'related_dog_id', label: 'subject of a contract' },
+  {
+    table: 'expenses', field: 'subject_id', label: 'subject of an expense',
+    compoundIndex: '[subject_type+subject_id]', discriminatorValue: 'dog'
+  },
+  { table: 'documents', field: 'dog_id', label: 'has a filed document' },
+  { table: 'waitlist_offers', field: 'chosen_dog_id', label: 'pup chosen on a waitlist offer' },
+  // Not indexed (only a delete asks), so it's a scan: an indexed probe would throw.
+  { table: 'waitlist_offers', field: 'lost_dog_id', label: 'pup a family lost, on a waitlist offer\'s history', scan: true }
+];
+
+// --- Litter: what can point at a Litter (Data Model v3 §10) -----------------
+// A litter can't be hard-deleted while any Dog still has litter_id pointing at it
+// (its puppy roster). Archive instead.
+export const LITTER_REFERENCES = [
+  { table: 'dogs', field: 'litter_id', label: 'puppy roster member' },
+  {
+    table: 'expenses', field: 'subject_id', label: 'subject of an expense',
+    compoundIndex: '[subject_type+subject_id]', discriminatorValue: 'litter'
+  },
+  { table: 'waitlist_offers',  field: 'litter_id',        label: 'litter on a waitlist offer' },
+  // Not indexed (only a delete asks), so it's a scan.
+  { table: 'contracts', field: 'reservation_litter_id', label: 'litter on a reservation agreement', scan: true }
+];
+
+// --- Pairing: what can point at a Pairing -----------------------------------
+// A linked litter (Litter.pairing_id), a linked stud service (StudService.pairing_id
+// — canonical, mirrors Litter.pairing_id), or any Event logged against the pairing
+// blocks hard delete.
+export const PAIRING_REFERENCES = [
+  { table: 'litters',       field: 'pairing_id', label: 'linked litter' },
+  {
+    table: 'events', field: 'subject_id', label: 'subject of an event',
+    compoundIndex: '[subject_type+subject_id]', discriminatorValue: 'pairing'
+  },
+  { table: 'stud_services', field: 'pairing_id', label: 'linked stud service' },
+  {
+    table: 'expenses', field: 'subject_id', label: 'subject of an expense',
+    compoundIndex: '[subject_type+subject_id]', discriminatorValue: 'pairing'
+  }
+];
+
+// --- Contact: what can point at a Contact -----------------------------------
+// Now includes the merged-in buyer role via sales.buyer_contact_id (Stage 4 —
+// there is no separate Buyer entity; a buyer is a Contact, Data Model v3 §5.5).
+export const CONTACT_REFERENCES = [
+  { table: 'dogs',          field: 'owner_contact_id',     label: 'owner of a dog' },
+  { table: 'dogs',          field: 'co_owner_contact_ids', label: 'co-owner of a dog', multiEntry: true },
+  { table: 'dogs',          field: 'lives_with_contact_id', label: 'co-owner a co-owned dog lives with', scan: true },
+  { table: 'sales',         field: 'buyer_contact_id',        label: 'buyer on a sale' },
+  { table: 'sales',         field: 'referred_by_contact_id',  label: 'referrer on a sale' },
+  { table: 'stud_services', field: 'partner_contact_id',      label: 'partner contact in a stud service' },
+  { table: 'stud_services', field: 'referred_by_contact_id',  label: 'referrer on a stud service' },
+  { table: 'events',        field: 'related_contact_id',      label: 'contact on a boarding, placement, show, vet visit, or surgery event' },
+  { table: 'contracts',     field: 'related_contact_id',      label: 'counterparty on a contract' },
+  { table: 'litters',       field: 'foster_partner_contact_id', label: 'foster partner on a litter' },
+  { table: 'waitlist_entries', field: 'contact_id',             label: 'family on a waitlist' },
+  { table: 'do_not_sell', field: 'contact_id', label: 'person on your do-not-sell list' }
+];
+
+// --- Kennel: what can point at a Kennel -------------------------------------
+// The six kennel_id entries below are the KENNEL SCOPE (Multi-Kennel Scope Spec
+// §4.2). Consequence worth knowing: a kennel in real use becomes effectively
+// undeletable, because its litters/sales/contracts all block hard delete — archive
+// is the intended exit, and the Kennels page's Delete button is disabled with the
+// blocker list naming exactly which records are holding it.
+export const KENNEL_REFERENCES = [
+  { table: 'contacts', field: 'kennel_id',          label: 'kennel of a contact' },
+  { table: 'dogs',     field: 'kennel_id',          label: 'kennel of a dog' },
+  { table: 'dogs',     field: 'breeder_kennel_id',  label: 'breeder kennel of a dog' },
+  {
+    table: 'expenses', field: 'subject_id', label: 'subject of an expense',
+    compoundIndex: '[subject_type+subject_id]', discriminatorValue: 'kennel'
+  },
+  { table: 'pairings',      field: 'kennel_id', label: 'kennel of a pairing' },
+  { table: 'litters',       field: 'kennel_id', label: 'kennel of a litter' },
+  { table: 'sales',         field: 'kennel_id', label: 'kennel of a sale' },
+  { table: 'stud_services', field: 'kennel_id', label: 'kennel of a stud service' },
+  { table: 'contracts',     field: 'kennel_id', label: 'kennel of a contract' },
+  { table: 'documents',     field: 'kennel_id', label: 'kennel of a document' },
+  { table: 'waitlist_entries',  field: 'kennel_id', label: 'kennel of a waitlist entry' },
+  { table: 'waitlist_offers',   field: 'kennel_id', label: 'kennel of a waitlist offer' },
+  { table: 'waitlist_programs', field: 'kennel_id', label: 'kennel of a waitlist program' }
+];
+
+// --- Sale: what can point at a Sale (Stage 4) -------------------------------
+export const SALE_REFERENCES = [
+  { table: 'contracts', field: 'related_sale_id', label: 'documented by a contract' },
+  { table: 'waitlist_entries', field: 'placed_sale_id', label: 'placement of a waitlist family' },
+  { table: 'waitlist_offers', field: 'sale_id', label: 'a waitlist family\'s pick' },
+  // A training stay booked with its extra (Family Requests plan §6): the link lives
+  // in the boarding event's details, which isn't indexed, so it's a scan.
+  { table: 'events', field: 'details.sale_id', label: 'a training stay booked with one of its extras', scan: true },
+  // Money a family carried from a lost pup's sale (Payment Schedule plan §3.2a): a
+  // credit for funds received naming that sale; older entries hold it as carried_payment.
+  { table: 'waitlist_entries', field: 'received_credits[].from_sale_id', label: 'money a family carried from this sale, as a credit', scan: true },
+  { table: 'waitlist_entries', field: 'carried_payment.from_sale_id', label: 'money a family carried from this sale', scan: true }
+];
+
+// --- StudService: what can point at a StudService (Stage 4) ----------------
+export const STUD_SERVICE_REFERENCES = [
+  { table: 'contracts', field: 'related_stud_service_id', label: 'documented by a contract' },
+  { table: 'expenses', field: 'stud_service_id', label: 'its stud fee expense' }
+];
+
+// --- Contract: a leaf entity — nothing points at a Contract (Stage 4). Always
+// hard-deletable; Data Model v3 §5.7.
+export const CONTRACT_REFERENCES = [];
+
+// --- Event: an Expense captured from an event points back at it via
+// expenses.event_id (the ONE canonical event↔cost link; the event queries it,
+// never mirrors it). So an event carrying a linked expense can't be hard-deleted
+// out from under its cost — archive it, or remove the cost first. Events were a
+// leaf before the Financials ledger; this is the only thing that points at one.
+export const EVENT_REFERENCES = [
+  { table: 'expenses', field: 'event_id', label: 'linked expense' }
+];
+
+// --- Waitlist (Waitlist Spec §4.5): an entry's offers point at it, and a
+// program is pointed at by the entries assigned to it. Offers are leaves.
+export const WAITLIST_ENTRY_REFERENCES = [
+  { table: 'waitlist_offers', field: 'entry_id', label: 'offer to this family' },
+  // The application a do-not-sell row was added from. Not indexed (only a delete asks).
+  { table: 'do_not_sell', field: 'source_entry_id', label: 'application a do-not-sell listing came from', scan: true },
+  // A side sale to this family (Side Sale Spec). Not indexed (only a delete asks).
+  { table: 'sales', field: 'side_entry_id', label: 'a side sale to this family', scan: true }
+];
+
+export const WAITLIST_PROGRAM_REFERENCES = [
+  { table: 'waitlist_entries', field: 'waitlist_program_id', label: 'family in this program' }
+];
+
+export const WAITLIST_OFFER_REFERENCES = [];
+
+// --- Do-not-sell: a leaf entity — nothing points at a do-not-sell row. Its own
+// FKs (contact_id, source_entry_id) are guarded on contacts and waitlist entries.
+export const DO_NOT_SELL_REFERENCES = [];
+
+// --- Expense: a leaf entity — nothing points at an Expense. Its own FKs
+// (event_id, subject_id) point OUTWARD and are guarded on those targets above.
+export const EXPENSE_REFERENCES = [];
+
+// --- BreedFeedingSchedule: a leaf entity — nothing points at one. `breed` is a
+// free-text lookup key (matched against Dog.breed), not a stored FK, so there is
+// no reverse reference to guard.
+export const BREED_FEEDING_SCHEDULE_REFERENCES = [];
+
+// --- Account: a business account (AKC, Chewy…) is program-wide and points at
+// nothing; an expense may name the account it was paid through, and a sale the
+// account it was sold / paid through.
+export const ACCOUNT_REFERENCES = [
+  { table: 'expenses', field: 'account_id', label: 'account on an expense' },
+  // The channel a sale went through (Integrations plan §5): Good Dog, Stripe…
+  { table: 'sales', field: 'sales_channel_account_id', label: 'sales channel on a sale' },
+  // How each payment was taken (Integrations plan §4–§5, db.version(4)).
+  { table: 'sales', field: 'deposit_paid_via_account_id', label: 'deposit paid via, on a sale' },
+  { table: 'sales', field: 'balance_paid_via_account_id', label: 'balance paid via, on a sale' },
+  { table: 'waitlist_entries', field: 'fee_paid_via_account_id', label: 'application fee paid via, on a waitlist family' },
+  { table: 'kennels', field: 'waitlist_fee_account_id', label: 'online application fee account of a kennel' },
+  // Each payment recorded on a sale (Payment Schedule plan §3.2): the account it came
+  // in through. Inside a list, so it's a scan.
+  { table: 'sales', field: 'payments[].account_id', label: 'a payment received on a sale', scan: true }
+];
+
+// --- Document: a leaf entity — nothing points at a Document. Its own FK
+// (dog_id) points OUTWARD and is guarded on Dog above (DOG_REFERENCES). Its
+// file_id is not a referenceRegistry entry — a file is owned by exactly one
+// document and is deleted alongside it (documentRepo.hardDelete), not guarded.
+export const DOCUMENT_REFERENCES = [];
+
+// Count rows matching one registry entry for the given target id.
+async function countReferences(ref, id) {
+  const table = db.table(ref.table);
+  if (ref.compoundIndex) {
+    // Polymorphic reference (Event): match [discriminatorValue, id] on the
+    // compound index so we only count events whose subject_type is right.
+    return table.where(ref.compoundIndex).equals([ref.discriminatorValue, id]).count();
+  }
+  // An unindexed path (`scan`): every row is read. Only for rare deletes.
+  if (ref.scan) {
+    const at = (obj, dotted) => dotted.split('.').reduce((v, k) => (v == null ? v : v[k]), obj);
+    const [list, item] = ref.field.split('[].');
+    if (item != null) return table.filter((row) => { const xs = at(row, list); return Array.isArray(xs) && xs.some((x) => at(x, item) === id); }).count();
+    return table.filter((row) => at(row, ref.field) === id).count();
+  }
+  // Both single-field and multi-entry (*) indexes answer .where(field).equals(id).
+  return table.where(ref.field).equals(id).count();
+}
+
+// Generic guard: returns the list of human-readable blockers ({ label, count })
+// for `id` against `registry`, skipping any table not present in the current
+// schema. Empty array => hard delete is allowed.
+export async function findBlockingReferences(registry, id) {
+  const existing = new Set(existingTableNames());
+  const blockers = [];
+  for (const ref of registry) {
+    if (!existing.has(ref.table)) continue; // stage-honest: don't probe absent tables
+    const count = await countReferences(ref, id);
+    if (count > 0) blockers.push({ label: ref.label, count });
+  }
+  return blockers;
+}
+
+// --- Which registry guards which table --------------------------------------
+// For code that removes a whole set of records at once and has to deal with what
+// points at them (data/recordDetach.js: clearing the tour's sample data, Kels's
+// leftover tour records). Every table with a registry above, by table name.
+export const REFERENCES_BY_TABLE = {
+  dogs: DOG_REFERENCES, litters: LITTER_REFERENCES, pairings: PAIRING_REFERENCES,
+  contacts: CONTACT_REFERENCES, kennels: KENNEL_REFERENCES, sales: SALE_REFERENCES,
+  stud_services: STUD_SERVICE_REFERENCES, contracts: CONTRACT_REFERENCES, events: EVENT_REFERENCES,
+  waitlist_entries: WAITLIST_ENTRY_REFERENCES, waitlist_programs: WAITLIST_PROGRAM_REFERENCES,
+  waitlist_offers: WAITLIST_OFFER_REFERENCES, do_not_sell: DO_NOT_SELL_REFERENCES,
+  expenses: EXPENSE_REFERENCES, accounts: ACCOUNT_REFERENCES, documents: DOCUMENT_REFERENCES
+};
+
+// The value at a registry entry's field: a dotted path, `list[].key` (every
+// matching item's key), or a multi-entry array. Always a list of ids.
+export function refIdsOf(row, ref) {
+  const at = (obj, dotted) => dotted.split('.').reduce((v, k) => (v == null ? v : v[k]), obj);
+  if (ref.compoundIndex) return row.subject_type === ref.discriminatorValue && row.subject_id != null ? [row.subject_id] : [];
+  const [list, item] = ref.field.split('[].');
+  if (item != null) {
+    const xs = at(row, list);
+    return Array.isArray(xs) ? xs.map((x) => at(x, item)).filter((v) => v != null) : [];
+  }
+  const v = at(row, ref.field);
+  if (Array.isArray(v)) return v.filter((x) => x != null);
+  return v == null ? [] : [v];
+}
+
+// Every row matching one registry entry for ANY of `ids` (a Set). One query per
+// entry: the index when there is one, else one pass over the table (`scan`).
+export async function findReferencingRows(ref, ids) {
+  if (!ids.size || !new Set(existingTableNames()).has(ref.table)) return [];
+  const table = db.table(ref.table);
+  const list = [...ids];
+  if (ref.compoundIndex) return table.where(ref.compoundIndex).anyOf(list.map((id) => [ref.discriminatorValue, id])).toArray();
+  if (ref.scan) return table.filter((row) => refIdsOf(row, ref).some((id) => ids.has(id))).toArray();
+  const rows = await table.where(ref.field).anyOf(list).toArray();
+  // A multi-entry index answers a row once per matching id: keep each row once.
+  const seen = new Set();
+  return rows.filter((r) => (seen.has(r.id) ? false : (seen.add(r.id), true)));
+}

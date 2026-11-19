@@ -1,0 +1,309 @@
+// licenseGate.js — the Pro license gate's UI (editions plan §Licensing). Pairs
+// with the logic in data/license.js the way app.js's demo banner pairs with
+// demoMode.js. Renders three states over the app:
+//   • activation wall — first run, no key yet: enter the Lemon Squeezy key.
+//   • renewal wall — subscription lapsed past its grace window: renew / re-enter.
+//   • grace banner — validated but past the printed expiry (or offline within
+//     grace): a dismissible strip; the app stays usable.
+// Every wall also offers "Download a backup of this device" once the device holds
+// records: the license gates the app, never her records.
+//
+// The walls are a full-screen, non-dismissible overlay reusing the .modal look.
+// This is a GATE, not a vault (see the honest caveat in license.js) — a blocking
+// overlay is the right weight: it keeps honest buyers honest without pretending to
+// be uncrackable. ensureLicensed() returns false once a wall is painted, so
+// app.js's boot() stops before the rest of the app starts (the nav is already
+// drawn under the overlay).
+import { esc } from './ui.js';
+import { licenseConfig } from '../data/editionConfig.js';
+import { activate, validate, resetLicense, cachedLicense, licenseCheckDue, askLicenseStore } from '../data/license.js';
+import { getProLicense } from '../data/settings.js';
+import { isCloudAvailable } from '../data/cloud/cloudConfig.js';
+
+export { isLicenseGated } from '../data/license.js';
+
+// A buy/renew link, only when a checkout URL is configured (it's a placeholder
+// until launch — see pro/editionConfig.js). Returns '' when unset so the walls
+// degrade to just the key field rather than a dead link.
+function checkoutLinkHtml(label) {
+  const url = licenseConfig?.checkoutUrl;
+  if (!url) return '';
+  return `<a class="btn btn-sm" href="${esc(url)}" target="_blank" rel="noopener">${esc(label)}</a>`;
+}
+
+function portalLinkHtml(label) {
+  const url = licenseConfig?.portalUrl;
+  if (!url) return '';
+  return `<a class="license-link" href="${esc(url)}" target="_blank" rel="noopener">${esc(label)}</a>`;
+}
+
+// Mount a full-screen, non-dismissible overlay hosting `innerHtml` in a card, and
+// return the card element so the caller can wire its controls. Replaces any prior
+// wall so re-renders (e.g. "use a different key") don't stack.
+function mountWall(innerHtml) {
+  document.getElementById('license-wall')?.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'license-wall';
+  overlay.className = 'license-wall-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.innerHTML = `<div class="license-wall modal">${innerHtml}</div>`;
+  document.body.appendChild(overlay);
+  return overlay.querySelector('.license-wall');
+}
+
+// --- Her records, from behind any wall ---------------------------------------
+// The editions plan: whatever the license does, the records stay exportable. Each
+// wall offers the same download as Import/Export, shown once this device holds any
+// records (a first-run device has nothing to save). Loaded only when a wall shows
+// (review K05-3).
+const BACKUP_HTML = `<div class="license-backup" id="license-backup" hidden>
+    <p class="license-note"><span id="license-backup-count"></span> They stay here whatever happens to the license, and you can take a copy any time:
+      <button type="button" class="license-link" id="license-download">Download a backup of this device</button></p>
+    <p class="license-note" id="license-backup-status" role="status"></p>
+  </div>`;
+
+async function wireBackup(card) {
+  const block = card.querySelector('#license-backup');
+  if (!block) return;
+  let mod;
+  try {
+    mod = await import('../data/importExport.js');
+    const n = await mod.countRecords();
+    if (!n) return;
+    card.querySelector('#license-backup-count').textContent = `This device holds ${n} record${n === 1 ? '' : 's'}.`;
+    block.hidden = false;
+  } catch (err) {
+    console.warn('KennelOS: license wall backup', err);
+    return;
+  }
+  const button = card.querySelector('#license-download');
+  const status = card.querySelector('#license-backup-status');
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    status.textContent = 'Preparing the backup…';
+    try {
+      const data = await mod.downloadBackup();
+      status.textContent = `Saved to your downloads (the backup of ${data.exported_at.slice(0, 10)}). Keep it somewhere safe: Import brings it back on any device.`;
+    } catch (err) {
+      status.textContent = `The backup didn't download (${err?.message || err}). Try again.`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+
+// "Free a lost device's slot", through the cloud backup account (Cloud Phase 1
+// plan §2.5): the wall can't reach Import/Export, so it's opened from here.
+const lostDeviceHtml = () => (isCloudAvailable()
+  ? `<p class="license-note">Lost a device, and every slot is used? <a href="#" class="license-link" id="license-lost-device">Free a lost device's slot</a> through your cloud backup account (for devices that had cloud backup on).</p>`
+  : '');
+
+function wireLostDevice(card, keyOf) {
+  card.querySelector('#license-lost-device')?.addEventListener('click', async (e) => {
+    e.preventDefault();
+    try {
+      const { openDevicesFromLicenseWall } = await import('./cloudBackupUI.js');
+      await openDevicesFromLicenseWall({ key: keyOf() });
+    } catch (err) {
+      console.warn('KennelOS: lost device', err);
+    }
+  });
+}
+
+// --- Activation wall (first run) -------------------------------------------
+function renderActivationWall() {
+  const card = mountWall(`
+    <h2 class="license-title">Activate KennelOS&nbsp;Pro</h2>
+    <p class="license-lead">Enter the license key from your Lemon Squeezy purchase confirmation email to unlock Pro on this device. <strong class="license-lead-note">NOTE: If you are already using KennelOS Pro on another device, you do NOT need to purchase another; simply enter the same key below.</strong></p>
+    <form id="license-form" novalidate>
+      <label class="license-label" for="license-key-input">License key</label>
+      <input id="license-key-input" class="license-input" type="text" autocomplete="off"
+             spellcheck="false" placeholder="XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" />
+      <div class="license-field">
+        <label class="license-label" for="license-device-input">
+          Name this device <span class="license-hint">— optional</span>
+        </label>
+        <input id="license-device-input" class="license-input" type="text" autocomplete="off"
+               maxlength="60" placeholder="Kitchen laptop" />
+      </div>
+      <div class="license-error" id="license-error" role="alert"></div>
+      <div class="license-actions">
+        <button type="submit" class="btn btn-primary" id="license-activate">Activate</button>
+        ${checkoutLinkHtml('Buy Pro →')}
+      </div>
+    </form>
+    <p class="license-note">Your key covers a set number of devices. Naming this one makes it easy to tell your devices apart later — you can release a device from <strong>Settings</strong> when you stop using it, which frees its slot.</p>
+    ${lostDeviceHtml()}
+    <p class="license-note">Just upgrading from Lite? After activating, use <strong>Import</strong> to bring in the backup you exported.</p>
+    ${BACKUP_HTML}
+  `);
+  wireActivationForm(card);
+  wireBackup(card);
+}
+
+function wireActivationForm(card) {
+  const form = card.querySelector('#license-form');
+  const input = card.querySelector('#license-key-input');
+  wireLostDevice(card, () => input.value.trim());
+  const deviceInput = card.querySelector('#license-device-input');
+  const errorSlot = card.querySelector('#license-error');
+  const button = card.querySelector('#license-activate');
+  input.focus();
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errorSlot.textContent = '';
+    button.disabled = true;
+    button.textContent = 'Activating…';
+    try {
+      await activate(input.value, deviceInput.value);
+      // Re-evaluate from scratch on a fresh load so the app boots licensed.
+      location.reload();
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = 'Activate';
+      errorSlot.textContent = err?.message || 'Activation failed. Try again.';
+    }
+  });
+}
+
+// A lifetime key that walls because its offline check-in window ran out is a
+// completely different situation from a lapsed subscription: nothing is wrong,
+// nothing was lost, and there is nothing to renew — the app just hasn't reached
+// the store in months. Telling that owner their "subscription needs attention"
+// and selling them a renewal would be wrong on both counts, so both walls and the
+// grace banner branch on it. Detected as: a perpetual key we still believe is
+// active, which can only have walled on staleness (a revoked one has a status
+// that isn't 'active', and gets the ordinary wall).
+const isStaleLifetime = (record) => record?.interval === 'lifetime' && record.status === 'active';
+
+// --- Reconnect wall (lifetime key, offline past its check-in window) --------
+function renderReconnectWall() {
+  const card = mountWall(`
+    <h2 class="license-title">Reconnect to confirm your license</h2>
+    <p class="license-lead">Your Lifetime license doesn't expire — but this device hasn't been able to reach us in a few months, so we need one online check to confirm it. Connect to the internet and check again. Nothing has been lost, and your records are untouched.</p>
+    <div class="license-error" id="license-error" role="alert"></div>
+    <div class="license-actions">
+      <button type="button" class="btn btn-primary" id="license-recheck">Check again</button>
+    </div>
+    <div class="license-secondary">
+      ${portalLinkHtml('Manage my license')}
+      <button type="button" class="license-link" id="license-reset">Use a different key</button>
+    </div>
+    ${BACKUP_HTML}
+  `);
+  wireRenewalWall(card);
+}
+
+// --- Renewal wall (lapsed past grace) --------------------------------------
+function renderRenewalWall() {
+  const card = mountWall(`
+    <h2 class="license-title">Your Pro subscription needs attention</h2>
+    <p class="license-lead">We couldn't confirm an active subscription for this device. Renew to continue, or activate a different key.</p>
+    <div class="license-error" id="license-error" role="alert"></div>
+    <div class="license-actions">
+      <button type="button" class="btn btn-primary" id="license-recheck">Check again</button>
+      ${checkoutLinkHtml('Renew Pro →')}
+    </div>
+    <div class="license-secondary">
+      ${portalLinkHtml('Manage subscription')}
+      <button type="button" class="license-link" id="license-reset">Use a different key</button>
+    </div>
+    ${lostDeviceHtml()}
+    ${BACKUP_HTML}
+  `);
+  wireRenewalWall(card);
+}
+
+function wireRenewalWall(card) {
+  wireBackup(card);
+  wireLostDevice(card, () => getProLicense()?.key || '');
+  const errorSlot = card.querySelector('#license-error');
+  const recheck = card.querySelector('#license-recheck');
+  recheck.addEventListener('click', async () => {
+    errorSlot.textContent = '';
+    recheck.disabled = true;
+    recheck.textContent = 'Checking…';
+    const refreshed = await validate(getProLicense());
+    if (refreshed && refreshed.status === 'active') {
+      location.reload();
+      return;
+    }
+    // The store no longer knows this activation (validate cleared it): ask for the key.
+    if (!getProLicense()) { renderActivationWall(); return; }
+    recheck.disabled = false;
+    recheck.textContent = 'Check again';
+    errorSlot.textContent = refreshed
+      ? (refreshed.interval === 'lifetime'
+        ? 'That license is no longer active. If you think that\'s wrong, get in touch — your records are safe either way.'
+        : 'That subscription is still not active. Renew to continue.')
+      : "Couldn't reach the licensing server. Check your connection and try again.";
+  });
+  // "Use a different key" now also hands this browser's activation slot back, so
+  // switching keys doesn't quietly consume one on the old key forever. Best-effort
+  // by design (data/license.js): the owner is already walled, so a failed release
+  // still drops them to the activation wall rather than trapping them here.
+  const reset = card.querySelector('#license-reset');
+  reset.addEventListener('click', async () => {
+    reset.disabled = true;
+    reset.textContent = 'Releasing…';
+    await resetLicense();
+    renderActivationWall();
+  });
+}
+
+// --- Grace banner (validated, but past expiry / offline within grace) ------
+function renderGraceBanner(record) {
+  if (document.getElementById('license-grace-banner')) return;
+  const bar = document.createElement('div');
+  bar.id = 'license-grace-banner';
+  bar.className = 'license-grace-banner';
+  bar.setAttribute('role', 'status');
+  // A lifetime key in grace needs a reconnect, not a renewal — there is nothing
+  // to buy, and offering it would read as being asked to pay twice.
+  if (isStaleLifetime(record)) {
+    bar.innerHTML = '⚠️ <strong>Reconnect soon</strong> — your Lifetime license is fine, but this device hasn\'t been able to confirm it in a while. Connect to the internet once and it\'s sorted.';
+    document.body.insertBefore(bar, document.body.firstChild);
+    return;
+  }
+  const renew = licenseConfig?.checkoutUrl
+    ? ` <a href="${esc(licenseConfig.checkoutUrl)}" target="_blank" rel="noopener">Renew now →</a>`
+    : '';
+  bar.innerHTML = `⚠️ <strong>Pro grace period</strong> — we couldn't confirm your subscription. Reconnect to verify, or renew to avoid losing access.${renew}`;
+  document.body.insertBefore(bar, document.body.firstChild);
+}
+
+// The gate entry point, called from app.js boot() in the Pro edition, after the
+// nav is drawn. Returns true when the app may carry on, false when a blocking wall
+// has been painted (boot then stops). In the 'grace' state it returns true but
+// drops a banner so the owner knows to reconnect/renew.
+//
+// When to ask the store (D6 of the Load Performance plan, data/license.js): the
+// stored verdict decides at once, and the store is asked at most once per
+// browsing session and again after 6 hours, in the background. A stored verdict
+// that walls is the exception: the store is always asked before walling (with
+// its 5 s timeout), so a renewal made elsewhere unlocks on the next load.
+// A background answer that walls paints the wall over the page then.
+export async function ensureLicensed() {
+  const cached = cachedLicense();
+  const walls = cached.state === 'wall' || cached.state === 'unactivated';
+  if (walls && cached.record) return applyVerdict(await askLicenseStore());
+  if (walls) return applyVerdict(cached); // no key on this device: nothing to ask
+  applyVerdict(cached);
+  if (licenseCheckDue()) {
+    askLicenseStore().then((live) => {
+      if (live.state !== cached.state) applyVerdict(live);
+    }).catch((e) => console.warn('KennelOS: license check', e));
+  }
+  return true;
+}
+
+function applyVerdict({ state, record }) {
+  if (state === 'valid') return true;
+  if (state === 'grace') { renderGraceBanner(record); return true; }
+  if (state === 'unactivated') { renderActivationWall(); return false; }
+  // 'wall' — a stale lifetime key needs a reconnect, not a renewal.
+  if (isStaleLifetime(record)) renderReconnectWall();
+  else renderRenewalWall();
+  return false;
+}

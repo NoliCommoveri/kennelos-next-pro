@@ -1,0 +1,163 @@
+// pro/editionConfig.js — Pro edition config.
+//
+// Pro is the full, unlimited app. This is identical to the shared default:
+// no-op cap hooks + full-feature flags. It's kept as its own file so the
+// edition set is uniform (every edition owns one), and so a deploy can place
+// the right config at shared's fixed path (shared/data/editionConfig.js) for
+// each origin — Pro's shipped bytes therefore contain NO cap logic (cap spec §8).
+
+export const edition = 'pro';
+
+// Suffix shown after "KennelOS" in the nav brand (nav.js). Null renders nothing.
+export const editionLabel = 'Next'; // next channel (build/nextChannel.mjs)
+
+// No in-app upgrade CTA in this edition (Pro is already the full app; Demo is a
+// read-only showcase). Exported so shared code that reads it always resolves.
+export const upgradeUrl = null;
+
+// No outbound edition links from Pro (Lite is the hub that links out). Null so
+// hasEditionLinks() is false and the nav/Today footer render nothing.
+export const demoUrl = null;
+
+// Where "Take the tour" goes once this device has a program of its own (Load
+// Performance plan D3): the seeded, read-only Demo, in a new tab. Not an edition
+// link: Pro's nav still has none.
+export const tourUrl = 'https://demo.kennelos.app/';
+
+// Cloud backup API (Cloud Phase 1 plan §7): production, live since the go-live
+// change (plan §9 step 6). Back to null is how a shutdown release turns every
+// cloud feature off: the final build (build/finalRelease.mjs) does that. `devCloudUrl` (the staging Worker) applies when served from
+// localhost, or in a browser that opted in with ?cloud=staging (the test-server
+// switch); see data/cloud/cloudConfig.js.
+export const cloudUrl = 'https://kennelos-api-staging.admin-kennelos.workers.dev'; // next channel: the staging server, never production
+export const devCloudUrl = 'https://kennelos-api-staging.admin-kennelos.workers.dev';
+
+// Her KennelPort website (KennelPort plan 5.5; data/kennelportApi.js). Null: no
+// Connect website, no Update website, no request to KennelPort. `devKennelportUrl`
+// is KennelPort's staging Worker, used on localhost and with ?cloud=staging, like
+// devCloudUrl. Pro only (KennelPort decision 27).
+export const kennelportUrl = 'https://kennelport-staging.kennelport.workers.dev'; // next channel: the staging server, never production
+export const devKennelportUrl = 'https://kennelport-staging.kennelport.workers.dev';
+
+// --- License gate (editions plan §Licensing) -------------------------------
+// Pro is a Lemon Squeezy subscription unlocked by a browser-validated license
+// key (data/license.js + assets/licenseGate.js). This config is read only when
+// editionFlags.licenseGate is true — which it is ONLY here, in Pro. Lite/Demo
+// export a null config (their import must resolve) but never run the gate.
+export const licenseConfig = {
+  // Where "Buy Pro →" (activation wall) and "Renew Pro →" (renewal wall) point.
+  // Set the store checkout's post-purchase redirect to this Pro origin so a buyer
+  // lands here to activate + import.
+  //
+  // This is the all-tiers pricing section, NOT a single Lemon Squeezy variant link,
+  // because one slot serves both walls: a direct variant URL is right for at most
+  // one visitor. "Buy Pro" should let a first-time buyer choose monthly / yearly /
+  // lifetime, and "Renew Pro" must not push a lapsed monthly subscriber at a $69.99
+  // one-time purchase (or a lifetime owner at a subscription). The per-variant
+  // checkout links live on that page, one per tier. For a lapsed subscriber who just
+  // wants to manage billing, set `portalUrl` below — that's the better door.
+  checkoutUrl: 'https://kennelos.app/pro.html#pricing',
+  // Optional Lemon Squeezy customer-portal URL ("Manage subscription") shown on
+  // the renewal wall. Null hides that link. PLACEHOLDER — set at launch if used.
+  portalUrl: null,
+  // The billing interval drives the offline grace window (yearly 7d, monthly 3d).
+  // Lemon Squeezy returns the variant NAME, not a clean interval, so we match it
+  // against this pattern (case-insensitive) → yearly; anything else → monthly (the
+  // shorter, stricter window). Tune to the store's variant names.
+  yearlyVariantPattern: 'year|annual|12\\s*-?\\s*months?|\\byrs?\\b',
+  // A one-time Lifetime purchase is PERPETUAL — matched by name against this
+  // pattern → a license that never expires, but still confirms itself online every
+  // 90 days, then has a month's grace before the reconnect wall (data/license.js,
+  // the lifetime check-in). A lifetime name this misses is read as monthly: walled
+  // after 3 days offline, on the renewal wall. Tune to the store's variant name.
+  lifetimeVariantPattern: 'lifetime|perpetual|forever|one[\\s-]?time',
+};
+
+export async function enforceDogCap(/* { candidate, existing, id } */) {
+  // no-op: Pro is unlimited.
+}
+
+export async function enforceLitterCap(/* { candidate } */) {
+  // no-op: Pro is unlimited.
+}
+
+// Bulk-import cap hook (cap spec §9). The shared restore path (importExport.js)
+// awaits this before writing a JSON backup, passing the backup's dog rows and the
+// restore mode. No-op here, so Pro restores any backup unchanged.
+export async function enforceImportDogCap(/* { incomingDogs, mode } */) {
+  // no-op: Pro is unlimited.
+}
+
+// The litter half of the bulk-import cap (K13-5): every restore passes the
+// litters as they'll be after it. No-op here.
+export async function enforceImportLitterCap(/* { incomingLitters, mode } */) {
+  // no-op: Pro is unlimited.
+}
+
+// Read by dog.js's "New Dog" page for its cap-status banner. Null means
+// uncapped, so Pro shows nothing.
+export async function dogCapStatus() {
+  return null;
+}
+
+// Read before a task that would make a litter (Kels's Record a litter), so it can
+// stop before any question. Null means uncapped, so Pro shows nothing.
+export async function litterCapStatus() {
+  return null;
+}
+
+export const editionFlags = {
+  manualDogArchive: true,
+  includeArchivedToggles: true,
+  archivedDogLinks: true,
+  fullDogStatuses: true,
+  licenseGate: false, // next channel: testers need no key
+  // Pro-only feature gates — all on in Pro.
+  contactsSection: true,
+  studServices: true,
+  contracts: true,
+  documents: true,
+  companion: true,
+  furever: true,
+  reports: true,
+  invoicing: true,
+  extraCharges: true,
+  puppyRecord: true,
+  fosterArrangement: true,
+  receiptAttach: true,
+  externalOwnership: true,
+  assistant: true,
+  feedingSchedule: true,
+  accounts: true,
+  shows: true,             // Show tracking (Show Tracking Spec §7)
+  waitlist: true,         // Per-kennel waitlist (Waitlist Spec)
+  // Multi-kennel scope (Multi-Kennel Scope Spec §12) — Pro is the edition that
+  // gets more than one own kennel and the active-kennel switcher.
+  multiKennel: true,
+  liveSync: true,
+  // Her KennelPort website (KennelPort plan 5.5): the Show on website marks, Connect
+  // website and Update website. Pro only; Lite and Demo can't link (decision 27).
+  websiteLink: true,
+  // Dog Cards (Shared Dogs Plan §3): send dogs, with their ancestors, tests and titles,
+  // to another breeder's KennelOS, and add or update them from one. Pro only: Lite's dog
+  // cap would make a bulk add half-fail, and Demo can't write.
+  dogCards: true,
+};
+
+// Full nav bar (Pro has every hub).
+export const navItems = [
+  { label: 'Today',    path: 'pages/today.html' },
+  { label: 'Dogs',     path: 'pages/dogs.html' },
+  { label: 'Breeding', path: 'pages/breeding.html' },
+  { label: 'People',   path: 'pages/contacts.html' },
+  { label: 'Placements & Contracts', path: 'pages/sales.html' },
+  { label: 'Financials', path: 'pages/financials.html' },
+  { label: 'Storage',    path: 'pages/documents.html' }, // documents + shows + accounts, seg-tabbed
+  { label: 'Sharing',    path: 'pages/companion.html' }, // Companion + Furever + Assistant, seg-tabbed
+];
+
+export const moreItems = [
+  { label: 'Reports',       path: 'pages/reports.html' },
+  { label: 'Import/Export', path: 'pages/import-export.html' },
+  { label: 'Settings',      path: 'pages/settings.html' },
+];

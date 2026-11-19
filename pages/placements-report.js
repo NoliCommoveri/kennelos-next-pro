@@ -1,0 +1,88 @@
+// placements-report.js — "Placements" analytics (Stage 5, Build Brief §5): Sales
+// by status / registration_type / period. Derived read over Sale; buyer resolves to
+// a Contact (there is no Buyer table). Reuses the reporting framework; no new
+// schema, no stored aggregate.
+import { loadPlacements } from '../data/reportSources.js';
+import { placementFigures } from '../data/reportFigures.js';
+import { createReportView } from '../assets/reportView.js';
+import { fmtDate, fmtMoney } from '../assets/ui.js';
+import { REGISTRATION_TYPE, SALE_STATUS, RELEASED_SALE_STATUSES, descriptor } from '../data/vocab.js';
+import { periodSeries, sumOf, pct } from '../data/reportMath.js';
+import { byRegistration } from '../data/moneyReport.js';
+import { SERIES_COLORS } from '../assets/chartView.js';
+
+// A sale that went home (or is on its way): not released (voided, cancelled, returned).
+const placed = (s) => !RELEASED_SALE_STATUSES.includes(s.status);
+const priced = (s) => s.price !== '' && s.price != null && Number.isFinite(Number(s.price));
+// Each registration keeps one color in every chart (its vocab slot), whatever is filtered.
+const regColor = (v) => SERIES_COLORS[REGISTRATION_TYPE.findIndex((r) => r.value === v)];
+
+async function init() {
+  const src = await loadPlacements();
+  const dogsById = new Map(src.dogs.map((d) => [d.id, d]));
+  const contactsById = new Map(src.contacts.map((c) => [c.id, c]));
+  const dogName = (s) => dogsById.get(s.dog_id)?.call_name || '—';
+  const buyerName = (s) => contactsById.get(s.buyer_contact_id)?.name || '—';
+
+  createReportView({
+    mount: document.getElementById('report-mount'),
+    // Active-kennel scope (Multi-Kennel Scope Spec §7) — a sale carries the kennel
+    // it was placed FROM, inherited from the dog at creation, so a dog moved or
+    // sold on afterwards never re-files the historic sale.
+    scope: src.scope,
+    csvFilename: `placements-${new Date().toISOString().slice(0, 10)}.csv`,
+    search: { placeholder: 'Search dog or buyer…', text: (s) => `${dogName(s)} ${buyerName(s)}` },
+    filters: [
+      { id: 'registration_type', label: 'Registration', options: REGISTRATION_TYPE, match: (s, v) => s.registration_type === v },
+      { id: 'status', label: 'Status', options: SALE_STATUS, match: (s, v) => s.status === v }
+    ],
+    dateRange: { label: 'Sold', date: src.date },
+    kpis: (rows) => {
+      const f = placementFigures(rows);
+      const count = (v) => f.byRegistration.find((r) => r.value === v)?.count || 0;
+      const of = (n) => (f.placed ? `${n} of ${f.placed}` : '—');
+      return [
+        { label: 'Placements', value: String(f.placed), hint: f.fellThrough ? `${f.fellThrough} fell through` : '' },
+        { label: 'Sale value', value: fmtMoney(f.value) || '$0.00', hint: 'prices, placed sales' },
+        { label: 'Average price', value: f.avgPrice == null ? '—' : fmtMoney(f.avgPrice) },
+        { label: 'Limited registration', value: of(count('limited')), hint: pct(count('limited'), f.placed) || '' },
+        { label: 'Full registration', value: of(count('full')), hint: pct(count('full'), f.placed) || '' }
+      ];
+    },
+    charts: (rows, ctx) => {
+      const live = rows.filter(placed).filter((s) => s.sale_date);
+      const regs = REGISTRATION_TYPE.filter((r) => live.some((s) => s.registration_type === r.value));
+      const p = periodSeries(live, ctx.range, {
+        date: (s) => s.sale_date,
+        series: regs.map((r) => ({ name: r.label, color: regColor(r.value), when: (s) => s.registration_type === r.value }))
+      });
+      const regRows = byRegistration(rows.filter(placed));
+      const placedCount = sumOf(regRows, (r) => r.count);
+      const valueTotal = sumOf(regRows, (r) => r.total);
+      const sales = (n) => `${n} sale${n === 1 ? '' : 's'}`;
+      const avg = regRows.map((r) => ({ label: r.label, value: r.priced ? r.total / r.priced : 0, note: `${sales(r.priced)} with a price` }));
+      return [
+        { type: 'bar', stacked: true, title: `Placements by ${p.granularity}`, subtitle: 'By registration; sales that fell through are left out', categories: p.categories, series: p.series },
+        { type: 'hbar', title: 'Pups placed by registration', sort: false, format: (v) => `${v} (${pct(v, placedCount) || '0%'})`,
+          rows: regRows.map((r) => ({ label: r.label, value: r.count })), emptyText: 'No placements in this range.' },
+        { type: 'hbar', title: 'Sale value by registration', subtitle: 'Prices of placed sales', sort: false, color: SERIES_COLORS[2],
+          format: (v) => `${fmtMoney(Math.round(v))} (${pct(v, valueTotal) || '0%'})`,
+          rows: regRows.map((r) => ({ label: r.label, value: r.total, note: sales(r.priced) })), emptyText: 'No priced placements in this range.' },
+        { type: 'hbar', title: 'Average price by registration', subtitle: 'Placed sales with a price', sort: false, rows: avg, format: (v) => fmtMoney(Math.round(v)) }
+      ];
+    },
+    columns: [
+      { header: 'Sale date', value: (s) => (s.sale_date ? fmtDate(s.sale_date) : ''), csv: (s) => s.sale_date || '' },
+      { header: 'Dog', value: dogName },
+      { header: 'Buyer', value: buyerName },
+      { header: 'Price', value: (s) => (priced(s) ? fmtMoney(s.price) : ''), csv: (s) => (priced(s) ? String(s.price) : ''), className: 'num', total: (rows) => fmtMoney(sumOf(rows.filter(placed).filter(priced), (s) => s.price)) },
+      { header: 'Registration', value: (s) => s.registration_type || '', badge: REGISTRATION_TYPE, csv: (s) => s.registration_type ? descriptor(REGISTRATION_TYPE, s.registration_type).label : '' },
+      { header: 'Status', value: (s) => s.status || '', badge: SALE_STATUS, csv: (s) => s.status ? descriptor(SALE_STATUS, s.status).label : '' }
+    ],
+    onRowClick: (s) => { location.href = `sale.html?id=${encodeURIComponent(s.id)}`; },
+    load: () => Promise.resolve(src.rows),
+    emptyText: 'No sales recorded yet.'
+  });
+}
+
+init();

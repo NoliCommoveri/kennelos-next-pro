@@ -1,0 +1,70 @@
+// pl-report.js — "Profit & Loss by Month" (Reports plan, phase 1). One row per
+// month: money in (earned income, filed under the date it moved), money out
+// (expenses by expense_date), net, and anticipated income falling due that month.
+// Built from data/moneyReport.js over the same scoped sources as the Financials
+// Overview, so the two always agree. A date range counts the money dated inside it,
+// month by month (reportSources.loadProfitLoss rowsIn).
+import { moneyBreakdown } from '../data/moneyReport.js';
+import { loadProfitLoss } from '../data/reportSources.js';
+import { profitLossFigures } from '../data/reportFigures.js';
+import { createReportView } from '../assets/reportView.js';
+import { fmtMoney } from '../assets/ui.js';
+import { periodsBetween, periodLabel, sumOf, inRange } from '../data/reportMath.js';
+import { todayYMD } from '../data/dateUtils.js';
+import { INCOME_COMPONENTS, EXPENSE_CATEGORIES, descriptor } from '../data/vocab.js';
+
+const money = (v) => fmtMoney(Math.round((Number(v) || 0) * 100) / 100);
+
+async function init() {
+  const today = todayYMD();
+  // Every month newest first, like every other ledger; a range keeps the months it
+  // touches, each with only the money dated inside it (reportSources.loadProfitLoss).
+  const src = await loadProfitLoss(today);
+  const { entries, expenses } = src;
+
+  createReportView({
+    mount: document.getElementById('report-mount'),
+    // Scope is applied at load (moneyReport.loadMoney), so every month already
+    // holds only the active kennel's money.
+    csvFilename: `profit-loss-${today}.csv`,
+    dateRange: { label: 'Months', date: src.date, rowsIn: src.rowsIn, initial: 'this_year' },
+    kpis: (rows) => {
+      const f = profitLossFigures(rows);
+      return [
+        { label: 'Money in', value: money(f.income) },
+        { label: 'Money out', value: money(f.expenses) },
+        { label: 'Net', value: money(f.net), hint: f.income ? `${Math.round((f.net / f.income) * 100)}% of money in` : '' },
+        { label: 'Anticipated', value: money(f.anticipated), hint: 'falling due in these months' }
+      ];
+    },
+    charts: (rows, ctx) => {
+      const asc = [...rows].reverse();
+      const cats = asc.map((m) => ({ key: m.period, label: periodLabel(m.period), short: periodLabel(m.period, { short: true }) + (m.period.endsWith('-01') ? ` ’${m.period.slice(2, 4)}` : '') }));
+      let run = 0;
+      const running = asc.map((m) => { run += m.net; return { x: m.period, y: Math.round(run * 100) / 100 }; });
+      const within = (ymd) => inRange(ymd, ctx.range);
+      const { income, spent } = moneyBreakdown(entries, expenses, within);
+      return [
+        { type: 'bar', money: true, title: 'Money in vs money out', format: money, categories: cats,
+          series: [{ name: 'Money in', values: asc.map((m) => m.income) }, { name: 'Money out', values: asc.map((m) => m.expenses) }] },
+        { type: 'line', money: true, title: 'Running net', subtitle: 'Net added up month by month across the range', format: money, categories: cats,
+          series: [{ name: 'Running net', points: running }] },
+        { type: 'hbar', title: 'Money in by source', format: money,
+          rows: [...income].map(([k, v]) => ({ label: descriptor(INCOME_COMPONENTS, k).label, value: v })) },
+        { type: 'hbar', title: 'Money out by category', format: money, color: '#eb6834',
+          rows: [...spent].map(([k, v]) => ({ label: descriptor(EXPENSE_CATEGORIES, k).label, value: v })) }
+      ];
+    },
+    columns: [
+      { header: 'Month', value: (m) => periodLabel(m.period), csv: (m) => m.period },
+      { header: 'Money in', value: (m) => (m.income ? money(m.income) : ''), csv: (m) => String(m.income), className: 'num', total: (rows) => money(sumOf(rows, (m) => m.income)) },
+      { header: 'Money out', value: (m) => (m.expenses ? money(m.expenses) : ''), csv: (m) => String(m.expenses), className: 'num', total: (rows) => money(sumOf(rows, (m) => m.expenses)) },
+      { header: 'Net', value: (m) => money(m.net), csv: (m) => String(m.net), className: 'num', total: (rows) => money(sumOf(rows, (m) => m.net)) },
+      { header: 'Anticipated', value: (m) => (m.anticipated ? money(m.anticipated) : ''), csv: (m) => String(m.anticipated), className: 'num', total: (rows) => money(sumOf(rows, (m) => m.anticipated)) }
+    ],
+    load: () => Promise.resolve(src.rows),
+    emptyText: 'No money in or out in this range.'
+  });
+}
+
+init();

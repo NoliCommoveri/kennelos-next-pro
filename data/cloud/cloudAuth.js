@@ -1,0 +1,207 @@
+// cloudAuth.js — the opt-in cloud account: email + 6-digit code, and the
+// session that lives in settings.js (Cloud Phase 1 plan §2.1, §3.1, §3.3).
+//
+// Why a typed code and not a magic link: an iPhone home-screen PWA has separate
+// storage from Safari, and a tapped link would sign in the wrong copy of the app.
+//
+// The email address is kept in the session on THIS device (to show "signed in
+// as"); the server keeps only a keyed hash of it.
+import * as api from './cloudApi.js';
+import { isCloudAvailable } from './cloudConfig.js';
+import {
+  getCloudSession, setCloudSession, clearCloudSession, getCloudDeviceId, setCloudDeviceId,
+  updateCloudBackupState, updateCloudSyncState
+} from '../settings.js';
+import { clearSyncMeta } from './syncState.js';
+import { clearLostVersions } from './syncLost.js';
+
+// This device's place in live sync (its cursor and sync_meta) belongs to one
+// program. Signing out, or into another account, forgets it, so a later sign-in
+// joins afresh instead of uploading nothing and pulling from the old account's
+// cursor (K03 review, 4). The device keeps every record, as turning sync off does.
+async function forgetSyncPosition() {
+  updateCloudSyncState({ enabled: false, joining: false, cursor: 0, rejected: {}, waiting: {}, lastError: null, activity: [] });
+  await clearSyncMeta();
+  await clearLostVersions();
+}
+
+function requireCloud() {
+  if (!isCloudAvailable()) throw new api.CloudUnavailableError();
+}
+
+// Step 1: email the code. Always resolves for a well-formed address, account or
+// not (the server never says which). Throws CloudRequestError 'bad_email',
+// 'rate_limited', 'email_unavailable' or 'email_failed'.
+export async function startSignIn(email) {
+  requireCloud();
+  await api.startSignIn(String(email ?? '').trim());
+}
+
+// Step 2: the typed code. Stores the session and returns it. Throws
+// CloudRequestError 'invalid_code' or 'too_many_attempts'.
+// `deviceLabel` is what other devices see in "Backups are coming from …".
+export async function verifySignIn(email, code, { deviceLabel = defaultDeviceLabel() } = {}) {
+  requireCloud();
+  const cleanEmail = String(email ?? '').trim();
+  const res = await api.verifyCode({
+    email: cleanEmail,
+    code: String(code ?? '').replace(/\s/g, ''),
+    deviceId: getCloudDeviceId(),
+    deviceLabel
+  });
+  setCloudDeviceId(res.deviceId); // the server may have minted one
+  const previous = getCloudSession();
+  if (previous && previous.programId && previous.programId !== res.programId) {
+    // A different account on this device: this device's backup position was
+    // for the other program, so forget it.
+    // (The vault key here is tagged with the other program, so it's never used.)
+    updateCloudBackupState({ enabled: false, lastSnapshotId: null, lastCounts: null, lastContentHash: null, lastError: null, vault: null });
+    await forgetSyncPosition();
+  }
+  return setCloudSession({
+    token: res.token, email: cleanEmail, programId: res.programId, deviceId: res.deviceId, deviceLabel: deviceLabel || null,
+    emailSince: new Date().toISOString(),
+    // A program KennelOS support set up for her: this first sign-in takes it over
+    // (cloudAssist.js claimAssisted).
+    ...(res.assisted ? { assisted: true } : {})
+  });
+}
+
+// Support's device, signed in to her account through an assist link (cloudAssist.js).
+// The session shows her label in place of an email.
+export function setHelperSession(res, { deviceLabel = null } = {}) {
+  setCloudDeviceId(res.deviceId);
+  updateCloudBackupState({ enabled: false, lastSnapshotId: null, lastCounts: null, lastContentHash: null, lastError: null, vault: null });
+  return setCloudSession({
+    token: res.token, email: null, programId: res.programId, deviceId: res.deviceId, deviceLabel,
+    role: 'helper', helperLabel: res.label || null
+  });
+}
+
+// Her takeover is done: her later sign-ins are ordinary.
+export function clearAssisted() {
+  const s = getCloudSession();
+  if (s?.assisted) { const { assisted, ...rest } = s; setCloudSession(rest); }
+}
+
+// --- Changing the account's email (Phase 1 plan §2.6) -------------------------------
+// The new address's code comes from startSignIn(newEmail). With the old inbox
+// (its code from startSignIn(oldEmail), or a sign-in under 15 minutes old) the
+// change happens at once and this device shows the new address; without it,
+// it waits a day, shown on every signed-in device with Cancel.
+// → { status: 'changed' } | { status: 'pending', effectiveAt }
+export async function changeAccountEmail({ email, code, oldEmail = null, oldCode = null }) {
+  requireCloud();
+  const token = sessionToken();
+  if (!token) throw new api.CloudAuthError({ status: 401, code: 'unauthorized' });
+  const cleanEmail = String(email ?? '').trim();
+  const res = await api.changeEmail(token, {
+    email: cleanEmail,
+    code: String(code ?? '').replace(/\s/g, ''),
+    ...(oldCode ? { oldEmail: String(oldEmail ?? '').trim(), oldCode: String(oldCode).replace(/\s/g, '') } : {})
+  });
+  if (res.status === 'changed') {
+    const s = getCloudSession();
+    if (s) setCloudSession({ ...s, email: cleanEmail, emailSince: new Date().toISOString() });
+    updateCloudBackupState({ emailChange: null });
+  } else {
+    updateCloudBackupState({ emailChange: { requestedAt: new Date().toISOString(), effectiveAt: res.effectiveAt, deviceLabel: currentAccount()?.deviceLabel || null } });
+  }
+  return res;
+}
+
+export async function cancelAccountEmailChange() {
+  requireCloud();
+  const token = sessionToken();
+  if (!token) throw new api.CloudAuthError({ status: 401, code: 'unauthorized' });
+  await api.cancelEmailChange(token);
+  updateCloudBackupState({ emailChange: null, emailChangeFailed: null });
+}
+
+// Records what the server said (check-in, or the Account card's read): the
+// pending change for every device to show, and, when the email changed after
+// this device last knew it, forgets the old address here. The server holds
+// only a hash, so it can't say what the new one is: the UI then says "your
+// new email" until this device signs in with it.
+export function recordEmailChangeState(state) {
+  if (!state || typeof state !== 'object') return;
+  // A change whose address was taken while it waited (review K4-8): shown until
+  // she dismisses it.
+  updateCloudBackupState({ emailChange: state.pending || null, emailChangeFailed: state.failed || null });
+  const s = getCloudSession();
+  if (s && state.changedAt && (!s.emailSince || state.changedAt > s.emailSince)) {
+    setCloudSession({ ...s, email: null, emailSince: state.changedAt });
+  }
+}
+
+export async function refreshEmailChangeState() {
+  requireCloud();
+  const token = sessionToken();
+  if (!token) return null;
+  const state = await api.getEmailChange(token);
+  recordEmailChangeState(state);
+  return state;
+}
+
+// The session, or null. `signedIn` is false when the token was dropped after a
+// 401 (the email and program are kept so the UI can offer "sign in again").
+export function currentAccount() {
+  const s = getCloudSession();
+  if (!s) return null;
+  return {
+    email: s.email || null, programId: s.programId || null, deviceId: s.deviceId || null,
+    deviceLabel: s.deviceLabel || null, signedIn: !!s.token,
+    role: s.role === 'helper' ? 'helper' : 'owner', helperLabel: s.helperLabel || null, assisted: !!s.assisted
+  };
+}
+
+export function sessionToken() {
+  return getCloudSession()?.token || null;
+}
+
+// After a 401: keep who they were, drop the token, and pause backup until a
+// new code is typed (plan §6.2). Local data is untouched.
+export function markSessionExpired() {
+  const s = getCloudSession();
+  if (s) setCloudSession({ ...s, token: null });
+}
+
+// Sign out of this device. Revokes the token server-side when it can (best
+// effort: offline still signs out locally), turns backup and live sync off, and
+// forgets both positions. The cloud copy stays.
+export async function signOut() {
+  const token = sessionToken();
+  // Alerts end with the sign-in (review K12-8). Loaded here, not at the top:
+  // cloudNotify imports this module.
+  try { const { forgetAlertsHere } = await import('./cloudNotify.js'); await forgetAlertsHere(token && isCloudAvailable() ? token : null); } catch { /* best effort */ }
+  if (token && isCloudAvailable()) {
+    try { await api.signOut(token); } catch { /* offline or already revoked */ }
+  }
+  clearCloudSession();
+  updateCloudBackupState({ enabled: false, lastSnapshotId: null, lastCounts: null, lastContentHash: null, lastError: null });
+  await forgetSyncPosition();
+}
+
+// "Sign out other devices". Returns how many sessions were revoked. Throws
+// CloudRequestError 'reauth_required' when this sign-in is more than 15
+// minutes old: send a code (startSignIn) and pass { email, code } (plan §2.5).
+export async function signOutOtherDevices(reauth = {}) {
+  requireCloud();
+  const token = sessionToken();
+  if (!token) throw new api.CloudAuthError({ status: 401, code: 'unauthorized' });
+  return (await api.signOutOthers(token, reauth)).revoked ?? 0;
+}
+
+// A readable default for the device label ("iPhone", "Mac", …). The UI lets the
+// user change it. Reads the user agent only to name the device for its owner.
+export function defaultDeviceLabel() {
+  const ua = String(globalThis.navigator?.userAgent || '');
+  if (/iPhone/.test(ua)) return 'iPhone';
+  if (/iPad/.test(ua)) return 'iPad';
+  if (/Android/.test(ua)) return /Mobile/.test(ua) ? 'Android phone' : 'Android tablet';
+  if (/Macintosh|Mac OS X/.test(ua)) return 'Mac';
+  if (/Windows/.test(ua)) return 'Windows PC';
+  if (/CrOS/.test(ua)) return 'Chromebook';
+  if (/Linux/.test(ua)) return 'Linux computer';
+  return 'This device';
+}

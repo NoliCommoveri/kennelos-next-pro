@@ -1,0 +1,114 @@
+// pedigree.js — the standalone Pedigree page. Two views (seg tabs):
+//   One dog (default) — picks a root dog (from ?id= or the dropdown), renders the
+//     ancestor tree, and re-centers in place when a node is clicked (updating the
+//     URL so the view is shareable/bookmarkable).
+//   Whole kennel (?view=kennel) — every dog connected to its sire and dam at once,
+//     grouped into families (assets/kennelTree.js); a name opens One dog on it.
+//
+// DELIBERATELY NOT KENNEL-SCOPED (Multi-Kennel Scope Spec §7) — neither the
+// tree (see assets/pedigree.js) nor the root picker below. §9 makes ordinary
+// dog pickers scope-by-default with an escape, but this one is the exception:
+// its whole job is to center lineage on any dog you have a record of, and a
+// pedigree that stops at a kennel boundary is worse than no filter at all.
+import { dogRepo, dogName } from '../data/dogRepo.js';
+import { renderPedigree } from '../assets/pedigree.js';
+import { renderKennelTree, focusKennelTreeDog } from '../assets/kennelTree.js';
+import { esc, param, dogOptgroups } from '../assets/ui.js';
+import { editionFlags } from '../data/editionConfig.js';
+
+const rootSel = document.getElementById('ped-root');
+const gensSel = document.getElementById('ped-gens');
+const openLink = document.getElementById('ped-open-record');
+const mount = document.getElementById('pedigree-mount');
+const msg = document.getElementById('page-msg');
+
+let dogs = [];
+let currentId = null;
+
+function fillPicker(selectedId) {
+  const opts = dogs
+    .slice()
+    // Lite excludes departed (archived) dogs from the root picker so the tree
+    // can't be centered on one (cap spec §7); the renderer still draws them as
+    // static ancestor/offspring nodes for lineage.
+    .filter((d) => editionFlags.includeArchivedToggles || !d.is_archived)
+    // Pedigree-only ancestors aren't offered as roots (there can be hundreds);
+    // the one being viewed is, so re-centering onto an ancestor keeps the picker true.
+    .filter((d) => !d.pedigree_only || d.id === selectedId);
+  const opt = (d) => `<option value="${esc(d.id)}"${d.id === selectedId ? ' selected' : ''}>${esc(dogName(d) || '(unnamed)')}${d.call_name && d.registered_name && d.registered_name !== d.call_name ? ' — ' + esc(d.registered_name) : ''}${d.is_archived ? ' (archived)' : ''}</option>`;
+  rootSel.innerHTML = `<option value="">— select —</option>` + dogOptgroups(opts, opt, dogName);
+}
+
+async function show(id) {
+  currentId = id;
+  // Lite: a departed (archived) dog isn't a reachable pedigree root (cap spec §7)
+  // — even a hand-typed ?id= for one falls back to the empty state, and its
+  // open-record link never shows.
+  const rootDog = id ? dogs.find((d) => d.id === id) : null;
+  const hiddenArchived = rootDog && rootDog.is_archived && !editionFlags.archivedDogLinks;
+  if (!id || hiddenArchived) {
+    mount.innerHTML = `<div class="empty-state">Choose a dog to view its pedigree.</div>`;
+    openLink.style.visibility = 'hidden';
+    return;
+  }
+  openLink.style.visibility = 'visible';
+  openLink.href = `dog.html?id=${encodeURIComponent(id)}`;
+  // Keep the URL in sync so the view is shareable and the back button works.
+  const url = new URL(location.href);
+  url.searchParams.set('id', id);
+  history.replaceState(null, '', url);
+  if (rootSel.value !== id) {
+    if (![...rootSel.options].some((o) => o.value === id)) fillPicker(id);
+    rootSel.value = id;
+  }
+
+  await renderPedigree({
+    mount,
+    rootId: id,
+    generations: Number(gensSel.value),
+    onNavigate: (nextId) => show(nextId),
+    editable: true
+  });
+}
+
+async function showKennel() {
+  const findSel = document.getElementById('kt-find');
+  const ancestorsBox = document.getElementById('kt-ancestors');
+  document.getElementById('ped-dog-toolbar').hidden = true;
+  document.getElementById('ped-kennel-toolbar').hidden = false;
+
+  async function draw() {
+    const drawn = await renderKennelTree({ mount, includePedigreeOnly: ancestorsBox.checked });
+    // Lite: a departed dog isn't findable (it's drawn static, cap spec §7).
+    findSel.innerHTML = `<option value="">— select —</option>` + dogOptgroups(
+      drawn.filter((d) => editionFlags.archivedDogLinks || !d.is_archived),
+      (d) => `<option value="${esc(d.id)}">${esc(dogName(d) || '(unnamed)')}</option>`, dogName);
+  }
+  ancestorsBox.addEventListener('change', draw);
+  findSel.addEventListener('change', () => findSel.value && focusKennelTreeDog(mount, findSel.value));
+  await draw();
+}
+
+async function main() {
+  const kennelView = param('view') === 'kennel';
+  document.querySelectorAll('#ped-view-tabs .seg-tab').forEach((t) => {
+    t.classList.toggle('active', (t.dataset.view === 'kennel') === kennelView);
+  });
+  if (kennelView) return showKennel();
+
+  dogs = await dogRepo.getAll({ includeArchived: true, includePedigreeOnly: true });
+  if (!dogs.length) {
+    msg.innerHTML = `<div class="inline-warn" style="color:var(--accent-dark);background:var(--accent-soft);border-color:#bfe0cd;">No dogs yet. Add dogs first, then explore their pedigree here.</div>`;
+    rootSel.disabled = true;
+    gensSel.disabled = true;
+    openLink.style.visibility = 'hidden';
+    return;
+  }
+  const initial = param('id') || '';
+  fillPicker(initial);
+  rootSel.addEventListener('change', () => show(rootSel.value));
+  gensSel.addEventListener('change', () => currentId && show(currentId));
+  await show(initial);
+}
+
+main();

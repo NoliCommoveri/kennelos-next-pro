@@ -1,0 +1,529 @@
+// pedigreeParse.js — reads a pedigree chart's positioned text into a tree of dogs.
+// Pure: no PDF library, no OCR, no DOM. The page (pages/pedigree-import.js) gets
+// positioned words out of a PDF's text layer or out of OCR (data/pedigreeReader.js)
+// and hands them here, so both routes share one layout reader and it's tested
+// directly (tests/pedigreeParse.test.js).
+//
+// The layout it understands is the bracket chart every registry and pedigree
+// program prints: the dog on the left, each generation a column to its right, and
+// each ancestor's box vertically centred between the boxes of its own two parents
+// (sire above, dam below). Built against AKC Research Pedigrees (text PDFs and
+// images of them) and AKC Certified Pedigrees (the dog's box sits between its
+// parents' in the first column); other programs' charts are read best-effort. Nothing here is
+// trusted blindly — the import page shows every dog for review before saving.
+//
+// Ancestors are addressed by PATH from the dog: '' is the dog, 's' its sire, 'd'
+// its dam, 'sd' the sire's dam, and so on. A path's last letter is its sex.
+//
+// Its one import is registryCountries.js (pure, import-free too): which country a
+// registry code belongs to, for reading every registry on the map and for the
+// country-of-origin and Imported suggestions (Dog Titles Field Plan D7, D8).
+import { REGISTRY_COUNTRIES, normCode, countryOfRegistry, countryName } from './registryCountries.js';
+
+// ---------------------------------------------------------------------------
+// 1. Words → segments
+// ---------------------------------------------------------------------------
+// A segment is a run of words on one line that sit close together — narrower than
+// a full line, so two columns side by side never merge into one line of text.
+// words: [{ text, x, y, w, h, conf? }] — y is the TOP edge, page units, top-left origin.
+export function wordsToSegments(words, { minConf = 0 } = {}) {
+  const ws = words
+    .filter((w) => String(w.text || '').trim() && (w.conf == null || w.conf >= minConf))
+    .map((w) => ({ ...w, text: String(w.text).trim(), cy: w.y + w.h / 2 }))
+    .sort((a, b) => a.cy - b.cy);
+  // Lines first (by vertical centre), then each line read left to right and cut
+  // wherever the gap is wider than a word space — so a wrapped name's second
+  // line never interleaves with its first, and neighbouring columns stay apart.
+  const lines = [];
+  for (const w of ws) {
+    const line = lines.find((l) => Math.abs(l.cy - w.cy) < Math.max(l.h, w.h) * 0.5);
+    if (line) { line.words.push(w); line.h = Math.max(line.h, w.h); } else lines.push({ cy: w.cy, h: w.h, words: [w] });
+  }
+  const segs = [];
+  for (const line of lines) {
+    let seg = null;
+    for (const w of line.words.sort((a, b) => a.x - b.x)) {
+      const gap = seg ? w.x - (seg.x + seg.w) : Infinity;
+      if (seg && gap < Math.max(seg.h, w.h) * 1.6) {
+        seg.text += gap > seg.h * 0.12 ? ` ${w.text}` : w.text;
+        seg.y = Math.min(seg.y, w.y);
+        seg.h = Math.max(seg.h, w.h);
+        seg.w = Math.max(seg.x + seg.w, w.x + w.w) - seg.x;
+        seg.confs.push(w.conf ?? 100);
+      } else {
+        seg = { text: w.text, x: w.x, y: w.y, w: w.w, h: w.h, confs: [w.conf ?? 100] };
+        segs.push(seg);
+      }
+    }
+  }
+  return segs.map(({ confs, ...s }) => ({ ...s, cy: s.y + s.h / 2, conf: confs.reduce((a, b) => a + b, 0) / confs.length }));
+}
+
+// ---------------------------------------------------------------------------
+// 2. Classifying a line of text
+// ---------------------------------------------------------------------------
+// The digits allow OCR's usual letter-for-digit swaps (S/5, O/0, I/l/1, B/8, Z/2),
+// mapped back by akcDigits — "NPS60004/04" is NP560004/04 misread.
+const AKC_REG = /\b([A-Z]{2})\s?([0-9OSIlBZ]{6})\s?\/\s?([0-9OSIlBZ]{2})\b/;
+// The same number as an AKC Certified Pedigree prints it: no slash, eight plain
+// digits ("NP80670402"). With no slash to anchor it, OCR swaps aren't accepted.
+const AKC_RUN = /\b([A-Z]{2})(\d{6})(\d{2})\b/;
+// The "03-25" / "03/25" after an AKC number — not followed by more of a date —
+// or, on a Certified Pedigree, in brackets: "(05-24)".
+const AKC_TAIL = /^\s*(?:\((\d{2}[-/]\d{2})\)|(\d{2}[-/]\d{2})(?![\d/-]))/;
+const akcDigits = (t) => t.replace(/O/g, '0').replace(/S/g, '5').replace(/[Il]/g, '1').replace(/B/g, '8').replace(/Z/g, '2');
+// The abbreviations an AKC Certified Pedigree prints ("BLK BRDL & WH"), spelled out.
+const COLOR_ABBR = { blk: 'Black', brdl: 'Brindle', wh: 'White', bl: 'Blue', fn: 'Fawn', sl: 'Seal', rd: 'Red',
+  brn: 'Brown', crm: 'Cream' };
+const COLOR_WORDS = new Set([...Object.keys(COLOR_ABBR), 'white', 'black', 'brindle', 'seal', 'blue', 'fawn', 'red', 'brown', 'cream',
+  'merle', 'liver', 'chocolate', 'lilac', 'isabella', 'tan', 'gray', 'grey', 'sable', 'pied', 'piebald',
+  'champagne', 'gold', 'golden', 'yellow', 'apricot', 'silver', 'tricolor', 'tri', 'parti', 'wheaten',
+  'mahogany', 'orange', 'lemon', 'buff', 'platinum', 'harlequin', 'mantle', 'roan', 'ticked', 'spotted',
+  'markings', 'and', '&', 'with', 'w/', '/', ',']);
+// The titles printed in front of a name (Dog Titles Field Plan D3): the
+// championship and show-win abbreviations charts print there, plus AKC's
+// published prefix titles (docs/KennelOS_Registry_Title_Facts.md §3). Every other
+// title goes after the name, AKC's default. Upper case, no dots.
+export const TITLE_PREFIXES = Object.freeze(new Set([
+  'CH', 'GCH', 'GCHB', 'GCHS', 'GCHG', 'GCHP', 'INT', 'MBIS', 'MBISS', 'BIS', 'BISS',
+  'RBIS', 'NBISS', 'UCH', 'GRCH', 'DC', 'FC', 'AFC', 'OTCH', 'MACH', 'PACH', 'CT', 'TC', 'BPIS', 'MBPIS',
+  // AKC's main prefix list
+  'AGCH', 'CCH', 'CFC', 'CGCH', 'CGF', 'CGN', 'CGW', 'CNC', 'CSG', 'CSGF', 'CSGN', 'CSGW', 'CWC', 'CWSG',
+  'GDSC', 'GAFC', 'GFC', 'HC', 'NAC', 'NAFC', 'NAGDC', 'NFC', 'NGDC', 'NOC', 'PNAC', 'POC', 'RACH', 'RAFC',
+  'RFC', 'RGDSC', 'RNC', 'RWAFC', 'RWFC', 'VCCH', 'WNC',
+  // AKC's alphabetical list, beyond the main one
+  'CJN', 'CRCG', 'CWGN', 'FCB', 'FCGD', 'FCLP', 'NBC', 'NLPC', 'NSPC', 'NWGDC'
+]));
+const TITLES = TITLE_PREFIXES;
+// A prefix token as looked up: upper case, a trailing dot gone, and a repeat
+// number allowed on the end (GCHP2, MACH3).
+const prefixToken = (tok) => {
+  const t = tok.replace(/\.$/, '').toUpperCase();
+  const m = t.match(/^([A-Z]+)\d{1,2}$/);
+  return TITLES.has(t) || (m && TITLES.has(m[1])) ? t : '';
+};
+const HEADER = /^(name|akc\s*#|birth\s*date|date of birth|date whelped|micro\s*chip|breed|sex|colou?rs?\b|breeder|report date|registration|owner|dob|whelped)\b|(american kennel club|research pedigree|certified pedigree|executive secretary|founded 18\d\d|\bgeneration\b|recreated|copyright|©|all rights|reserved|accuracy|warranty)/i;
+// A column heading is the whole line ("Dog", "Gr-Gr-", "Great-Grandparents"),
+// never just its first word — a dog may well be named "Dog Gone It".
+const GEN_LABEL = /^(dog|parents?|grand-?parents|great-?|gr-?|gr-gr-?|gr-gr-gr-?|great-?grand-?parents|gr-?great-?grand-?parents)$/i;
+const isGenLabel = (t) => GEN_LABEL.test(t.replace(/[^A-Za-z-]/g, '')) || /^(sire|dam)$/i.test(t.trim());
+// A Certified Pedigree prints breed, sex and color as one line under the dog's
+// name: "BOSTON TERRIER FEMALE BRDL & WH".
+const BREED_SEX = /^([A-Za-z][A-Za-z' -]*?)\s+(MALE|FEMALE|DOG|BITCH)\b\s*(.*)$/i;
+const breedSexLine = (t) => { const m = t.trim().match(BREED_SEX); return m && (!m[3] || isColorOnly(m[3])) ? m : null; };
+
+export function isAkcReg(text) { const m = text.match(AKC_REG); return (!!m && /\d/.test(m[2])) || AKC_RUN.test(text); }
+
+// The first AKC number in a line, slashed or not: { at, length, number } with the
+// number in the slashed form ("NP806704/02").
+function findAkc(t) {
+  const m = t.match(AKC_REG);
+  if (m && /\d/.test(m[2])) return { at: m.index, length: m[0].length, number: `${m[1]}${akcDigits(m[2])}/${akcDigits(m[3])}`, run: false };
+  const r = t.match(AKC_RUN);
+  return r ? { at: r.index, length: r[0].length, number: `${r[1]}${r[2]}/${r[3]}`, run: true } : null;
+}
+
+// "BLK BRDL & WH" → "Black Brindle & White"; full words are left as printed.
+export function expandColor(text) {
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (!t.split(/[\s,/&]+/).some((w) => COLOR_ABBR[w.toLowerCase()])) return t;
+  return t.split(' ').map((w) => COLOR_ABBR[w.toLowerCase()] || w).join(' ');
+}
+
+// Every registry code on the map (D7) as a pattern for the start of a line: as
+// printed, its dots optional, longest first so "RKF R." wins over "RKF" and
+// "KSS JR" reads as KSS then the number. A code must be followed by a space, a dot
+// or a hyphen, or by a digit when it's all letters ("S12345/2019").
+const escRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const MAP_CODES = [...new Set(Object.values(REGISTRY_COUNTRIES).flat())]
+  .sort((a, b) => normCode(b).length - normCode(a).length)
+  .map((code) => {
+    // As printed ("JoKC", "N Reg") or in capitals, dots optional after any letter.
+    const pat = (c) => c.replace(/\./g, '').replace(/\s+/g, ' ').trim().replace(/-$/, '').split('')
+      .map((ch) => (ch === ' ' ? '\\.?\\s+' : `${escRe(ch)}\\.?`)).join('');
+    const alts = [...new Set([pat(code), pat(normCode(code))])].join('|');
+    return { code, re: new RegExp(`^((?:${alts})-?)(?=[\\s./-]|\\d)`) };
+  });
+// A registry code at the start of a line: one on the map, else 2–5 plain capitals
+// (a registry the map leaves out on purpose: CKC, KCSB…). → { code, rest } | null,
+// `code` as printed without a trailing dot or hyphen.
+function regCodeAt(t) {
+  for (const { re } of MAP_CODES) {
+    const m = t.match(re);
+    // As printed, less a trailing hyphen, and a trailing dot unless it's dotted
+    // throughout ("K.C.T." stays, "RKF R." → "RKF R").
+    if (m) return { code: m[1].replace(/-$/, '').replace(/^([^.]*)\.$/, '$1'), rest: t.slice(m[0].length).replace(/^[.\s/-]+/, ''), mapped: true };
+  }
+  const m = t.match(/^([A-Z]{2,5})\.?\s+(.*)$/);
+  return m ? { code: m[1], rest: m[2], mapped: false } : null;
+}
+
+// A line that starts with another registry on the map ("KC AV01234501") is that
+// registry's, even when its number looks like an unslashed AKC one.
+const leadsWithOtherReg = (t) => isOtherReg(t) && regCodeAt(t.trim()).mapped && normCode(regCodeAt(t.trim()).code) !== 'AKC';
+
+// A foreign or non-AKC registration: a registry code (any on the map, D7, or 2–5
+// capitals), then something with a digit, and no ordinary lowercase words
+// ("MET BOST.T.915/19", "PKR IX-75080", "KCSB 3847CY", "ACR A 394-22/140",
+// "ÖHZB 1234/19", "K.C.T. 2020/123").
+export function isOtherReg(text) {
+  const t = text.trim();
+  // "AKC DNA V516516", "OFA…", "CHIC…" are an AKC dog's details, not a registration.
+  if (/\b(DNA|CHIC|OFA)\b/i.test(t)) return false;
+  const at = regCodeAt(t);
+  if (!at || !/\d/.test(at.rest)) return false;
+  return !/\b(?!bost\b|bst\b)[a-z]{3,}\b/.test(at.rest);
+}
+
+export function isColorOnly(text) {
+  const tokens = text.toLowerCase().replace(/([,/&])/g, ' $1 ').split(/\s+/).filter(Boolean);
+  return tokens.length > 0 && tokens.some((t) => COLOR_WORDS.has(t) && !['and', '&', 'with', 'w/', '/', ','].includes(t))
+    && tokens.every((t) => COLOR_WORDS.has(t));
+}
+
+export function isDetail(text) {
+  const t = text.trim();
+  return isAkcReg(t) || isOtherReg(t) || isColorOnly(t) || /\bDNA\b/i.test(t) || /^CHIC\s?#?\d/i.test(t)
+    || /[()]/.test(t)
+    // A wrapped tail of a detail line ("V10117423", "08-23", "#V10032399"): a
+    // digit and no lowercase letters.
+    || (/\d/.test(t) && !/[a-z]/.test(t));
+}
+
+// Pull a registration, color and notes out of an entry's detail lines.
+export function parseDetails(lines) {
+  // An AKC Certified Pedigree runs a dog's details on as one wrapped paragraph
+  // ("NP24941501 (10-11) OFA46G CHIC80937 BLK BRDL &" / "WH AKC DNA V627089"),
+  // so when its number is in that unslashed form the lines are read as one.
+  const first = lines.map((l) => (leadsWithOtherReg(l) ? null : findAkc(l.trim()))).find(Boolean);
+  if (first?.run) return parseRunOn(lines.join(' '));
+  const out = { registration_number: '', registry: '', color_markings: '', notes: [], additional_registrations: [], country: '' };
+  // The first registration read is the dog's; a second one (a dual-registered
+  // dog, D8) is kept in additional_registrations.
+  const addReg = (registry, registration_number) => {
+    if (!out.registration_number) { out.registry = registry; out.registration_number = registration_number; }
+    else out.additional_registrations.push({ registry, registration_number, registered_name: '' });
+  };
+  let akcSeen = false;
+  for (const raw of lines) {
+    let t = raw.trim();
+    const akc = leadsWithOtherReg(t) ? null : findAkc(t);
+    if (akc && !akcSeen) {
+      akcSeen = true;
+      let number = akc.number;
+      t = t.slice(0, akc.at) + t.slice(akc.at + akc.length);
+      // The four digits AKC prints after the number ("NP888072/07 03-25") are
+      // part of it as breeders record it, so they're kept, as printed.
+      const tail = t.slice(akc.at).match(AKC_TAIL);
+      if (tail) { number += ` ${tail[1] || tail[2]}`; t = t.slice(0, akc.at) + t.slice(akc.at + tail[0].length); }
+      addReg('AKC', number);
+    } else if (isOtherReg(t) && out.additional_registrations.length < 3) {
+      const { code, rest } = regCodeAt(t);
+      // The number as printed, code and all ("KSS JR 71592 BST"). Peel a trailing
+      // color phrase off ("MET 1234/19 Black & White" on one line).
+      const printed = t.replace(/\s+/g, ' ');
+      const colorTail = rest.match(/\s((?:[A-Za-z]+\s*(?:&|and)?\s*)+)$/);
+      if (colorTail && isColorOnly(colorTail[1])) {
+        addReg(code, printed.slice(0, -colorTail[0].length).trim());
+        if (!out.color_markings) out.color_markings = colorTail[1].trim();
+      } else {
+        addReg(code, printed);
+      }
+      continue;
+    }
+    const country = t.match(/\(([^)]+)\)/);
+    if (country) {
+      out.notes.push(`Registered in ${country[1].trim()}`);
+      if (!out.country && !/\d/.test(country[1])) out.country = countryName(country[1]);
+      t = t.replace(country[0], '');
+    }
+    t = t.trim();
+    if (!t) continue;
+    if (/\bDNA\b/i.test(t)) out.notes.push(t.replace(/\s+/g, ' '));
+    else if (/^CHIC/i.test(t)) out.notes.push(t);
+    else if (isColorOnly(t)) { if (!out.color_markings) out.color_markings = expandColor(t); }
+    else out.notes.push(t);
+  }
+  return out;
+}
+
+// One AKC Certified Pedigree detail paragraph:
+// "<number> (<date>) [OFA…] [CHIC…] <color> [(<country>)] [AKC DNA V…]".
+function parseRunOn(text) {
+  const out = { registration_number: '', registry: 'AKC', color_markings: '', notes: [], additional_registrations: [], country: '' };
+  let t = ` ${text.replace(/\s+/g, ' ')} `;
+  const akc = findAkc(t);
+  out.registration_number = akc.number;
+  t = t.slice(0, akc.at) + t.slice(akc.at + akc.length);
+  const tail = t.slice(akc.at).match(AKC_TAIL);
+  if (tail) { out.registration_number += ` ${tail[1] || tail[2]}`; t = t.slice(0, akc.at) + t.slice(akc.at + tail[0].length); }
+  const take = (re, fn) => { t = t.replace(re, (...m) => { fn(...m); return ' '; }); };
+  take(/\(([^)]+)\)/g, (_, c) => {
+    out.notes.push(`Registered in ${c.trim()}`);
+    if (!out.country && !/\d/.test(c)) out.country = countryName(c);
+  });
+  take(/\bOFA\s?#?[A-Z0-9]*\d[A-Z0-9]*\b/g, (m) => out.notes.push(m.replace(/\s+/g, '')));
+  take(/\bCHIC\s?#?\d+\b/g, (m) => out.notes.push(m.replace(/\s+/g, '')));
+  take(/\b(?:AKC\s+)?DNA\s*#?\s*(V?\d+)\b/g, (_, n) => out.notes.push(`AKC DNA ${n}`));
+  // A bare trailing "AKC" (its DNA number on another dog's line, or none).
+  t = t.replace(/\bAKC\b/g, ' ').replace(/\s+/g, ' ').trim();
+  if (t && isColorOnly(t)) out.color_markings = expandColor(t);
+  else if (t) out.notes.push(t);
+  return out;
+}
+
+// "CH Crazy Crys Key To Smitten's Heart" → { name, titles: ['CH'] };
+// "GCHP2 CH Bella" → { name: 'Bella', titles: ['GCHP2', 'CH'] }.
+export function splitTitles(name) {
+  const tokens = name.trim().split(/\s+/);
+  const titles = [];
+  while (tokens.length > 1 && prefixToken(tokens[0])) titles.push(prefixToken(tokens.shift()));
+  return { name: tokens.join(' '), titles };
+}
+
+// ---------------------------------------------------------------------------
+// 3. Header fields
+// ---------------------------------------------------------------------------
+const MALE = /\bsex:?\s*(male|dog)\b/i;
+const FEMALE = /\bsex:?\s*(female|bitch)\b/i;
+
+function afterLabel(segs, re) {
+  for (const s of segs) {
+    const m = s.text.match(re);
+    if (m) return m[1].split('|')[0].trim();
+  }
+  return '';
+}
+
+export function parseHeader(segs) {
+  const all = segs.map((s) => s.text).join('\n');
+  const h = {};
+  h.name = afterLabel(segs, /\bName:\s*(.+)$/i).replace(/\s{2,}.*$/, '').replace(/[.,;:]+(?=\s|$)/g, '').trim();
+  const breed = afterLabel(segs, /\bBreed(?:\s*\/\s*Variety)?:\s*(.+)$/i);
+  h.breed = breed.replace(/\b(Grandparents|Parents|Dog|Sex:.*|Birth.*)$/i, '').trim();
+  h.sex = FEMALE.test(all) ? 'female' : MALE.test(all) ? 'male' : '';
+  const bs = segs.map((s) => breedSexLine(s.text)).find(Boolean);
+  if (bs) {
+    if (!h.breed) h.breed = bs[1].trim().toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase());
+    if (!h.sex) h.sex = /^(female|bitch)$/i.test(bs[2]) ? 'female' : 'male';
+  }
+  const dob = all.match(/(?:Birth\s*Date|Date\s*Whelped|Whelped):?\s*(\d{1,2})\s*\/\s*(\d{1,2})\s*\/\s*(\d{4})/i);
+  h.date_of_birth = dob ? `${dob[3]}-${dob[1].padStart(2, '0')}-${dob[2].padStart(2, '0')}` : '';
+  const chip = all.match(/Micro\s*chip(?:\s*(?:#|No\.?|ID))?:?\s*(\d[\d\s-]{7,20}\d)/i);
+  h.microchip_id = chip ? chip[1].replace(/[\s-]/g, '') : '';
+  h.color_markings = afterLabel(segs, /Colou?rs?\s*\/\s*Markings:\s*(.+)$/i) || (bs?.[3] ? expandColor(bs[3]) : '');
+  h.breeder = afterLabel(segs, /Breeder\(?s?\)?:\s*(.+)$/i).replace(/\s*\/\s*$/, '').replace(/\s*Report Date.*$/i, '').trim();
+  const reg = all.match(/AKC\s*#:?\s*([A-Z]{2})\s?(\d{6})\s?\/\s?(\d{2})(?:[ \t]+(\d{2}[-/]\d{2})(?![\d/-]))?/i);
+  h.registration_number = reg ? `${reg[1].toUpperCase()}${reg[2]}/${reg[3]}${reg[4] ? ` ${reg[4]}` : ''}` : '';
+  h.registry = /american kennel club|\bAKC\b/i.test(all) ? 'AKC' : '';
+  // An AKC Certified Pedigree prints only AKC titles, so its titles are AKC's.
+  h.certified = /certified pedigree/i.test(all) && /american kennel club|\bAKC\b/i.test(all);
+  return h;
+}
+
+// ---------------------------------------------------------------------------
+// 4. The chart
+// ---------------------------------------------------------------------------
+// segs: from wordsToSegments. page: { width, height }.
+// Returns { header, dogs: Map(path → dog), generations, warnings }.
+export function parsePedigree(segs, page) {
+  const warnings = [];
+  const header = parseHeader(segs);
+
+  // The chart starts at the generation-label row ("Parents", "Grandparents"…);
+  // the header block may sit above it or beside the far columns, so header lines
+  // are dropped by what they say, not where they are.
+  const labelTops = segs.filter((s) => /\b(grand-?parents|parents)\b/i.test(s.text)).map((s) => s.y);
+  const top = labelTops.length ? Math.min(...labelTops) : 0;
+  const body = segs.filter((s) => s.y > top + 0.5
+    && !HEADER.test(s.text.trim()) && !isGenLabel(s.text.trim()) && !breedSexLine(s.text)
+    && !/\b(grand-?parents)\b/i.test(s.text)
+    && (s.text.match(/[A-Za-z0-9]/g) || []).length >= 3
+    // Page-wide prose (a disclaimer, a footer) is wider than any one column, and
+    // OCR's low-confidence fragments are usually ornament, not text.
+    && s.w <= page.width * 0.24 && (s.conf ?? 100) >= 50);
+
+  // Columns: cluster left edges; a real column holds at least one registration,
+  // which keeps decorations and OCR noise from posing as a generation.
+  const tol = page.width * 0.035;
+  const clusters = [];
+  for (const s of [...body].sort((a, b) => a.x - b.x)) {
+    const c = clusters.find((k) => Math.abs(k.x - s.x) <= tol);
+    if (c) { c.segs.push(s); c.x = c.segs.reduce((a, b) => a + b.x, 0) / c.segs.length; } else clusters.push({ x: s.x, segs: [s] });
+  }
+  let cols = clusters.filter((c) => c.segs.some((s) => isAkcReg(s.text) || isOtherReg(s.text))).sort((a, b) => a.x - b.x);
+  if (!cols.length) return { header, dogs: new Map(), generations: 0, warnings: ['No pedigree chart was found on this page.'] };
+  // Everything else joins its nearest real column when it's close enough.
+  for (const c of clusters) {
+    if (cols.includes(c)) continue;
+    const near = cols.reduce((a, b) => (Math.abs(b.x - c.x) < Math.abs(a.x - c.x) ? b : a));
+    if (Math.abs(near.x - c.x) <= tol * 2) near.segs.push(...c.segs);
+  }
+
+  // Entries within each column: a name line (or a wrapped pair) and its details.
+  const gens = cols.map((c) => {
+    const entries = [];
+    let cur = null;
+    let prev = null;
+    for (const s of [...c.segs].sort((a, b) => a.y - b.y)) {
+      // A line after a gap wider than a line space starts the next box, so it's
+      // that dog's name even when it reads like a detail: an all-caps name with
+      // digits in it ("MRF WIGGLES BLUE 17 50-3", "MRF WILBER 13 12-2").
+      const startsBox = !prev || s.y - (prev.y + prev.h) > Math.max(prev.h, s.h);
+      if (isDetail(s.text) && !(startsBox && !isAkcReg(s.text))) {
+        if (cur) { cur.details.push(s.text); cur.bottom = Math.max(cur.bottom, s.y + s.h); }
+      } else if (cur && prev && !isDetail(prev.text) && s.y - (prev.y + prev.h) < prev.h * 0.9) {
+        cur.name += ` ${s.text}`;
+        cur.bottom = Math.max(cur.bottom, s.y + s.h);
+      } else {
+        cur = { name: s.text, details: [], top: s.y, bottom: s.y + s.h };
+        entries.push(cur);
+      }
+      prev = s;
+    }
+    for (const e of entries) e.cy = (e.top + e.bottom) / 2;
+    return entries;
+  });
+
+  const dogs = new Map();
+  const toDog = (e, path) => {
+    // A Certified Pedigree's "Sire" / "Dam" label can read as part of the name beside it.
+    // The label is printed in that case and the name in capitals, so only that is a
+    // label: "DAM PRESTIGE TINA" is a name.
+    const raw = e.name.replace(/\s+/g, ' ').replace(/[|_]+/g, '').trim();
+    const { name, titles } = splitTitles(path.length === 1 ? raw.replace(/^(Sire|Dam)[\s:]+(?=[^a-z]*$)/, '') : raw);
+    const det = parseDetails(e.details);
+    // Titles go to the dog's Titles (Dog Titles Field Plan §8 phase 4), not notes.
+    // On an AKC Certified Pedigree they're AKC's; on any other chart the
+    // organization is left blank.
+    return {
+      path, registered_name: name, registration_number: det.registration_number, registry: det.registry,
+      additional_registrations: det.additional_registrations,
+      titles: titles.map((abbr) => ({ abbr, organization: header.certified ? 'AKC' : '', earned_on: '' })),
+      // The bracketed country an AKC chart prints on a dog born abroad ("(SRB)").
+      origin_printed: det.country,
+      color_markings: det.color_markings, notes: [...det.notes], sex: path ? (path.endsWith('s') ? 'male' : 'female') : '', cy: e.cy
+    };
+  };
+
+  // Generation 0: the dog. When the leftmost column holding a registration has
+  // two or more boxes it's the parents — the dog's own box went unread (common on
+  // an image) — so the dog comes from the header, centred between those parents.
+  let root;
+  if (gens[0].length === 3 && gens.length > 1 && gens[1].length > 2) {
+    // An AKC Certified Pedigree: the dog's box sits in the parents' column,
+    // between its sire's (above) and its dam's (below).
+    const [sire, dog, dam] = gens[0];
+    root = dog;
+    gens.splice(0, 1, [root], [sire, dam]);
+  } else if (gens[0].length >= 2) {
+    const left = clusters.filter((c) => !cols.includes(c) && c.x < cols[0].x - tol)
+      .flatMap((c) => c.segs).filter((s) => !isDetail(s.text)).sort((a, b) => a.y - b.y);
+    root = { name: left.map((s) => s.text).join(' '), details: [], cy: (gens[0][0].cy + gens[0][gens[0].length - 1].cy) / 2 };
+    gens.unshift([root]);
+  } else {
+    root = gens[0][0];
+  }
+  const subject = toDog(root, '');
+  if (header.name) {
+    const h = splitTitles(header.name);
+    subject.registered_name = h.name;
+    for (const abbr of h.titles) {
+      if (!subject.titles.some((t) => t.abbr === abbr)) subject.titles.push({ abbr, organization: header.certified ? 'AKC' : '', earned_on: '' });
+    }
+  }
+  if (header.registration_number) {
+    // The header's AKC number is the dog's; a different one read from its box stays as a second.
+    if (subject.registration_number && subject.registry !== 'AKC') {
+      subject.additional_registrations.unshift({ registry: subject.registry, registration_number: subject.registration_number, registered_name: '' });
+    }
+    subject.registration_number = header.registration_number;
+    subject.registry = 'AKC';
+  }
+  if (!subject.color_markings && header.color_markings) subject.color_markings = header.color_markings;
+  subject.sex = header.sex || 'unknown';
+  subject.date_of_birth = header.date_of_birth;
+  if (header.microchip_id) subject.microchip_id = header.microchip_id;
+  if (header.breeder) subject.notes.push(`Breeder: ${header.breeder}`);
+  dogs.set('', subject);
+  if (!subject.registered_name) warnings.push('The dog’s own name could not be read; type it in on the review screen.');
+
+  // Each later generation: an entry's child is the nearest entry one column to
+  // its left, and it's the sire when it sits above that child, the dam below.
+  let prevGen = [subject];
+  const unplaced = [];
+  const overfull = [];
+  for (let g = 1; g < gens.length; g++) {
+    const placed = [];
+    for (const e of gens[g]) {
+      if (!prevGen.length) break;
+      const child = prevGen.reduce((a, b) => (Math.abs(b.cy - e.cy) < Math.abs(a.cy - e.cy) ? b : a));
+      const path = child.path + (e.cy < child.cy ? 's' : 'd');
+      const dog = toDog(e, path);
+      if (dogs.has(path)) { unplaced.push(dog.registered_name); continue; }
+      dogs.set(path, dog);
+      placed.push(dog);
+    }
+    if (gens[g].length > 2 ** g) overfull.push(`generation ${g} has ${gens[g].length} (at most ${2 ** g})`);
+    prevGen = placed;
+  }
+  if (overfull.length) warnings.push(`More boxes than a pedigree chart holds — ${overfull.join('; ')}. Some dogs may be misplaced.`);
+  if (unplaced.length) {
+    warnings.push(`${unplaced.length} box${unplaced.length === 1 ? '' : 'es'} couldn’t be placed in the tree and ${unplaced.length === 1 ? 'was' : 'were'} left out: ${unplaced.slice(0, 6).map((n) => `“${n}”`).join(', ')}${unplaced.length > 6 ? '…' : ''}. The chart may not follow the usual layout.`);
+  }
+  for (const d of dogs.values()) delete d.cy;
+  return { header, dogs, generations: gens.length - 1, warnings };
+}
+
+// ---------------------------------------------------------------------------
+// 5. Country of origin and Imported (Dog Titles Field Plan §4, D7, D8)
+// ---------------------------------------------------------------------------
+// What a chart says about where each dog comes from, given her home country
+// (registryCountries.homeCountry). Worked out over the chart's tree, since a dog's
+// parents are the best sign it was imported. Only ever suggestions: the review
+// screen shows each one for her to keep, change or untick.
+//
+// dogs: Map(path → parsed dog). → Map(path → { country, imported, importCountry })
+//   country       the dog's country of origin: the bracketed country first
+//                 (countryName), then the first registry on the map that isn't
+//                 home, else '' (a home-only or unmapped dog gets none)
+//   imported      'ticked' (pre-ticked): a home registration plus a bracketed
+//                 foreign country, or dual-registered (home and foreign), or both
+//                 parents foreign-only;
+//                 'offer' (unticked): a home registration with one foreign-only parent;
+//                 null: foreign-only (a chart can't say it left), or an all-home line
+//   importCountry the country it'd be imported from: its own, else its foreign
+//                 parent's (the sire's first)
+export function originSuggestions(dogs, home) {
+  const regCountries = (d) => [d?.registry, ...(d?.additional_registrations || []).map((r) => r.registry)]
+    .map((code) => countryOfRegistry(code)).filter(Boolean);
+  const facts = new Map();
+  for (const [path, d] of dogs || []) {
+    const cs = regCountries(d);
+    const printed = d.origin_printed ? countryName(d.origin_printed) : '';
+    const foreignReg = cs.find((c) => c !== home) || '';
+    facts.set(path, {
+      hasHome: cs.includes(home),
+      foreignOnly: cs.length > 0 && !cs.includes(home),
+      printed,
+      country: printed || foreignReg,
+      foreignReg
+    });
+  }
+  const out = new Map();
+  for (const [path, f] of facts) {
+    const sire = facts.get(`${path}s`);
+    const dam = facts.get(`${path}d`);
+    let imported = null;
+    if (f.hasHome) {
+      const printedForeign = f.printed && f.printed !== home;
+      const foreignParents = [sire, dam].filter((p) => p?.foreignOnly);
+      if (printedForeign || f.foreignReg || (sire?.foreignOnly && dam?.foreignOnly)) imported = 'ticked';
+      else if (foreignParents.length === 1) imported = 'offer';
+    }
+    const parentCountry = [sire, dam].find((p) => p?.foreignOnly)?.country || '';
+    const country = f.country && f.country !== home ? f.country : '';
+    out.set(path, { country, imported, importCountry: imported ? (country || parentCountry) : '' });
+  }
+  return out;
+}

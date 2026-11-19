@@ -1,0 +1,854 @@
+// guidedLitter.js — the guided "Record a new litter" flow's data half (the screens
+// are assets/guidedLitterUI.js). One question per screen for a breeder who finds
+// the full forms hard. The order:
+//   1. Who is the mom? 2. Who is the dad? Each can be "a dog that isn't in
+//      KennelOS yet": she types the name, and any dog already on file with that
+//      name (outside and pedigree-only dogs included) is offered first ("We found
+//      Nell. Is this the mom?"), so a dog is never entered twice. A truly new
+//      dog gets the fewest answers that make a record: name, breed, and (Pro)
+//      whether she's someone else's, with the owner and their kennel.
+//   3. A litter of those two parents with no puppies yet? "Is this the litter?"
+//   4. Otherwise (or when that litter has no breeding linked) a breeding of those
+//      two? "Is this the breeding?" Failing both, the new-breeding questions.
+//   5. The stud service (Pro) for an outside stud, the birth, each puppy, the
+//      plans and prices that make them ready to sell, then one review she
+//      approves before anything is written.
+//
+// Three parts, all here so they can be tested without a browser:
+//   - the DRAFT: a plain object of her answers (kept after every step by the UI
+//     through settings.js, so closing the window loses nothing);
+//   - pure helpers: which steps apply, what each step checks, the choices and
+//     matches it offers, and the review summary;
+//   - saveGuidedLitter(): the writes, every one through the repos (no db here),
+//     so each record lands exactly as the normal pages would make it. It is
+//     RESUMABLE: each record's id goes back on the draft the moment it's made,
+//     so a save that stops halfway picks up where it got to and never makes
+//     anything twice.
+import { dogRepo } from './dogRepo.js';
+import { litterRepo } from './litterRepo.js';
+import { pairingRepo } from './pairingRepo.js';
+import { contactRepo } from './contactRepo.js';
+import { kennelRepo, withSeededTests } from './kennelRepo.js';
+import { studServiceRepo } from './studServiceRepo.js';
+import { eventRepo } from './eventRepo.js';
+import { enforceLitterCap, dogCapStatus } from './editionConfig.js';
+import { CapExceededError } from './repoBase.js';
+import { baseFromLitter } from './puppyDefaults.js';
+import { addDaysToYMD, todayYMD } from './dateUtils.js';
+import { similarNamed } from './dogSearch.js';
+import {
+  SEX, DISPOSITION, REGISTRATION_TYPE, PAIRING_METHOD, FEE_STRUCTURE, STUD_SERVICE_TYPE, LITTER_DELIVERY_TYPE, descriptor
+} from './vocab.js';
+
+// 2: the parents-first order (a version-1 draft from the earlier order is dropped).
+export const DRAFT_VERSION = 2;
+export const MAX_PUPS = 20;
+// The same defaults the Litter and Pairing pages prefill.
+export const READY_DAYS_AFTER_WHELP = 56;
+export const DUE_DAYS_AFTER_BREEDING = 63;
+
+// Newborns usually wear a colored collar before they have names, so each new pup
+// starts named for one; she types over it.
+export const COLLAR_COLORS = [
+  'Red', 'Blue', 'Green', 'Yellow', 'Purple', 'Orange', 'Pink', 'Black', 'White', 'Brown',
+  'Teal', 'Lime', 'Navy', 'Gray', 'Gold', 'Silver', 'Maroon', 'Lavender', 'Mint', 'Coral'
+];
+
+// A breeding that's over without a litter isn't one she's recording a birth of.
+const DEAD_PAIRING_STATUSES = ['not_pregnant', 'failed', 'cancelled'];
+// Dogs offered as the mom or dad: alive and in use.
+const usable = (d) => !d.is_archived && !d.pedigree_only && d.status !== 'deceased' && d.status !== 'puppy';
+const isMine = (d) => ['owned', 'co_owned', 'leased_in'].includes(d.ownership_type);
+// A dog somebody else owns: an outside stud is the case a stud service records.
+export const isOutsideDog = (d) => Boolean(d) && ['external', 'leased_in'].includes(d.ownership_type);
+
+const blank = (v) => v == null || String(v).trim() === '';
+const trimmed = (v) => (blank(v) ? '' : String(v).trim());
+const whole = (v) => Number.isInteger(Number(v)) && Number(v) >= 0 && !blank(v);
+const money = (v) => blank(v) || (Number.isFinite(Number(v)) && Number(v) >= 0);
+const num = (v) => (blank(v) ? null : Number(v));
+const key = () => (globalThis.crypto?.randomUUID?.() || `k${Math.random().toString(36).slice(2)}`);
+const norm = (s) => trimmed(s).toLowerCase().replace(/\s+/g, ' ');
+
+// The two parents, by role: which draft fields hold each.
+export const ROLES = {
+  dam: { idKey: 'damId', newKey: 'newDam', sex: 'female', word: 'mom', pronoun: 'she', possessive: 'her' },
+  sire: { idKey: 'sireId', newKey: 'newSire', sex: 'male', word: 'dad', pronoun: 'he', possessive: 'his' }
+};
+
+export function emptyDraft({ litterId = null } = {}) {
+  const now = new Date().toISOString();
+  return {
+    v: DRAFT_VERSION,
+    startedAt: now,
+    updatedAt: now,
+    step: null,
+    label: '',
+    // 'new' until she picks an existing litter ('litter') or breeding ('pairing').
+    source: litterId ? 'litter' : 'new',
+    // Opened from an Expected litter's page: the parents and litter are known.
+    lockedSource: Boolean(litterId),
+    litterId,
+    pairingId: null,
+    damId: null,
+    sireId: null,
+    showAllDams: false,
+    showAllSires: false,
+    // A parent who isn't in KennelOS yet: see newDogSpec.
+    newDam: null,
+    newSire: null,
+    // Her answer to "Is this the litter?" / "Is this the breeding?": null = not
+    // asked yet, 'none' = no, else the record's id.
+    litterChoice: litterId || null,
+    pairingChoice: null,
+    bredDate: '',
+    lastBredDate: '',
+    method: '',
+    // An outside stud's service (Pro): null = not asked yet.
+    stud: null, // { record: bool, fee_structure, fee_amount, type }
+    whelpDate: '',
+    alive: '',
+    deceased: '0',
+    abnormalities: '',
+    delivery: '',       // LITTER_DELIVERY_TYPE value, or 'later'
+    kennelId: null,     // chosen on the kennel step (only asked when it can't be worked out)
+    autoKennelId: null, // worked out from the parents / breeding / active kennel
+    pups: [],
+    // The puppies' registry ("AKC"…), asked once for the litter: null = not asked
+    // yet (the step starts on the dam's); '' = none.
+    registry: null,
+    prices: {
+      expected_price_male: '', expected_deposit_male: '', full_reg_surcharge_male: '',
+      expected_price_female: '', expected_deposit_female: '', full_reg_surcharge_female: ''
+    },
+    pricesFilled: false,
+    acceptDepositsDate: '',
+    readyDate: '',
+    nickname: '',
+    photosUrl: '', // the litter's photos link (Litter.photos_url)
+    // Ids of what the save has made so far (see saveGuidedLitter).
+    saved: {},
+    done: false
+  };
+}
+
+// A parent who isn't in KennelOS yet. `mine` false = somebody else's dog (Pro),
+// which needs an owner. `matchIds` are dogs already on file by that name, offered
+// before a new one is made; `matchesFor` is the name they were looked up for.
+export function newDogSpec(breed = '') {
+  return {
+    call_name: '', registered_name: '', breed, mine: true,
+    ownerId: null, owner: { name: '', phone: '', email: '' }, kennelId: null, kennelName: '',
+    matchIds: [], matchesFor: null, matchDeclined: false,
+    // "Yes, that's her" on a pedigree-only dog: that dog is brought into use
+    // with these answers (the Dog page's bring-in) instead of a new one made.
+    bringInId: null
+  };
+}
+
+export function newPup(existingNames = []) {
+  const taken = new Set(existingNames.map((n) => String(n || '').trim().toLowerCase()));
+  const color = COLLAR_COLORS.find((c) => !taken.has(`${c} collar`.toLowerCase()));
+  return {
+    key: key(),
+    id: null,
+    call_name: color ? `${color} collar` : `Puppy ${existingNames.length + 1}`,
+    sex: '',
+    color_markings: '',
+    birth_oz: '',
+    disposition: 'undecided',
+    intended_registration: '',
+    microchip_id: '',
+    url: '',
+    weightSaved: false
+  };
+}
+
+// A puppy record already on the chosen litter, as a draft pup (updated, not made).
+export function pupFromDog(d) {
+  return {
+    key: d.id,
+    id: d.id,
+    call_name: d.call_name || '',
+    sex: d.sex === 'unknown' ? '' : (d.sex || ''),
+    color_markings: d.color_markings || '',
+    birth_oz: '',
+    disposition: d.disposition || 'undecided',
+    intended_registration: d.intended_registration || '',
+    microchip_id: d.microchip_id || '',
+    url: d.url || '',
+    weightSaved: false
+  };
+}
+
+// Make draft.pups match the "born alive" count: new pups are added at the end,
+// extra NEW ones come off the end. A pup already saved as a record is never
+// dropped (the count step says so).
+export function syncPups(draft) {
+  const want = Math.min(MAX_PUPS, Math.max(0, Number(draft.alive) || 0));
+  const pups = [...draft.pups];
+  while (pups.length < want) pups.push(newPup(pups.map((p) => p.call_name)));
+  while (pups.length > want && !pups[pups.length - 1].id) pups.pop();
+  draft.pups = pups;
+  return draft;
+}
+
+export const recordedPupCount = (draft) => draft.pups.filter((p) => p.id).length;
+
+// --- Choices ------------------------------------------------------------------
+
+const byName = (a, b) => (a.call_name || '').localeCompare(b.call_name || '', undefined, { numeric: true });
+
+// Moms: her own girls first; "show all" adds every other usable girl.
+export function damChoices(dogs, { showAll = false } = {}) {
+  return dogs.filter((d) => usable(d) && d.sex === 'female' && (showAll || isMine(d))).sort(byName);
+}
+
+// Dads: her own boys, or with showAll every usable boy (an outside stud included).
+export function sireChoices(dogs, { showAll = false, excludeId = null } = {}) {
+  return dogs.filter((d) => usable(d) && d.sex === 'male' && d.id !== excludeId && (showAll || isMine(d))).sort(byName);
+}
+
+// --- A resumed draft (K11-2, K11-3) -------------------------------------------
+
+// What a draft points at that isn't on file any more (Clear sample data, a
+// restore, a delete on another device). `has(kind, id)` answers for 'dog',
+// 'litter', 'pairing', 'kennel', 'contact'. Returns { gone, madeGone }:
+// `gone` the answers that named a missing record; `madeGone` true when a record
+// the save already made is gone too, so the draft can't be finished. Pure.
+export function goneDraftRefs(draft, has) {
+  const gone = [];
+  const check = (kind, id, label) => { if (id && id !== 'none' && !has(kind, id)) gone.push(label); };
+  check('dog', draft.damId, 'mom');
+  check('dog', draft.sireId, 'dad');
+  check('litter', draft.litterId, 'litter');
+  check('litter', draft.litterChoice, 'litter');
+  check('pairing', draft.pairingId, 'breeding');
+  check('pairing', draft.pairingChoice, 'breeding');
+  check('kennel', draft.kennelId, 'kennel');
+  for (const role of ['newDam', 'newSire']) {
+    const spec = draft[role];
+    if (!spec) continue;
+    check('dog', spec.bringInId, role === 'newDam' ? 'mom' : 'dad');
+    check('contact', spec.ownerId, 'owner');
+    check('kennel', spec.kennelId, 'kennel');
+  }
+  const s = draft.saved || {};
+  const madeGone = [
+    ['dog', s.dam?.dogId], ['dog', s.sire?.dogId], ['litter', s.litterId], ['pairing', s.pairingId]
+  ].some(([kind, id]) => id && !has(kind, id)) || (draft.pups || []).some((p) => p.saved && p.id && !has('dog', p.id));
+  return { gone: [...new Set(gone)], madeGone };
+}
+
+// Clear the answers that named a missing record, so the steps ask them again:
+// the parents (and with them the litter and breeding matched to them), a missing
+// kennel, a new parent's missing owner. Pups taken from a missing litter become
+// new pups. Mutates and returns the draft. Pure.
+export function clearGoneDraftRefs(draft, has) {
+  const missing = (kind, id) => id && id !== 'none' && !has(kind, id);
+  const parentGone = missing('dog', draft.damId) || missing('dog', draft.sireId)
+    || ['newDam', 'newSire'].some((r) => draft[r] && missing('dog', draft[r].bringInId));
+  const litterGone = missing('litter', draft.litterId) || missing('litter', draft.litterChoice);
+  if (parentGone || litterGone) {
+    if (missing('dog', draft.damId)) draft.damId = null;
+    if (missing('dog', draft.sireId)) draft.sireId = null;
+    for (const r of ['newDam', 'newSire']) if (draft[r] && missing('dog', draft[r].bringInId)) draft[r].bringInId = null;
+    draft.source = 'new';
+    draft.lockedSource = false;
+    draft.litterId = null;
+    draft.litterChoice = null;
+    draft.pairingId = null;
+    draft.pairingChoice = null;
+    draft.pups = (draft.pups || []).map((p) => (p.id && !has('dog', p.id) ? { ...p, id: null, key: p.key } : p));
+  }
+  if (missing('pairing', draft.pairingId) || missing('pairing', draft.pairingChoice)) { draft.pairingId = null; draft.pairingChoice = null; }
+  if (missing('kennel', draft.kennelId)) draft.kennelId = null;
+  if (missing('kennel', draft.autoKennelId)) draft.autoKennelId = null;
+  for (const r of ['newDam', 'newSire']) {
+    const spec = draft[r];
+    if (!spec) continue;
+    if (missing('contact', spec.ownerId)) spec.ownerId = null;
+    if (missing('kennel', spec.kennelId)) spec.kennelId = null;
+  }
+  return draft;
+}
+
+// A litter of these parents recorded since the draft was started (on the Litter
+// page, or on another device; made after `startedAt`): born within `days` of the
+// draft's birth date, with
+// or without puppies, and not the one the draft is filling in or already made.
+// Asked again before a second copy is built (K11-3). Pure.
+export function litterRecordedSince(draft, litters, { days = 3 } = {}) {
+  if (!draft.damId || !draft.sireId || draft.lockedSource) return null;
+  const own = new Set([draft.litterId, draft.litterChoice, draft.saved?.litterId, draft.notThisLitter].filter(Boolean));
+  const near = (a, b) => {
+    if (!a || !b) return true; // no date on one side: the parents decide
+    return Math.abs((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86400000) <= days;
+  };
+  const since = (l) => !draft.startedAt || String(l.created_at || '') >= draft.startedAt;
+  return litters.find((l) => !l.is_archived && l.dam_id === draft.damId && l.sire_id === draft.sireId
+    && !own.has(l.id) && since(l) && near(l.whelp_date, draft.whelpDate)) || null;
+}
+
+// Litters of these two parents with no puppies yet: "Is this the litter?"
+export function litterCandidates({ litters, dogs, damId, sireId }) {
+  if (!damId || !sireId) return [];
+  const withPups = new Set(dogs.filter((d) => d.litter_id).map((d) => d.litter_id));
+  return litters
+    .filter((l) => !l.is_archived && l.dam_id === damId && l.sire_id === sireId && !withPups.has(l.id))
+    .sort((a, b) => (b.whelp_date || b.created_at || '').localeCompare(a.whelp_date || a.created_at || ''));
+}
+
+// Breedings of these two parents that are still open and have no litter yet:
+// "Is this the breeding?"
+export function pairingCandidates({ pairings, litters, damId, sireId }) {
+  if (!damId || !sireId) return [];
+  const linked = new Set(litters.filter((l) => l.pairing_id).map((l) => l.pairing_id));
+  return pairings
+    .filter((p) => !p.is_archived && p.dam_id === damId && p.sire_id === sireId && !linked.has(p.id) && !DEAD_PAIRING_STATUSES.includes(p.status))
+    .sort((a, b) => (b.planned_date || b.created_at || '').localeCompare(a.planned_date || a.created_at || ''));
+}
+
+// The newest litter of this breed that has a price list: its prices are the
+// suggested starting point (she changes them).
+export function suggestedPrices({ litters, dogsById, breed, excludeLitterId = null }) {
+  const target = norm(breed);
+  if (!target) return null;
+  const keys = Object.keys(emptyDraft().prices);
+  const priced = litters
+    .filter((l) => l.id !== excludeLitterId && keys.some((k) => !blank(l[k])))
+    .filter((l) => norm(dogsById.get(l.dam_id)?.breed) === target)
+    .sort((a, b) => (b.whelp_date || b.created_at || '').localeCompare(a.whelp_date || a.created_at || ''));
+  if (!priced.length) return null;
+  return Object.fromEntries(keys.map((k) => [k, blank(priced[0][k]) ? '' : String(priced[0][k])]));
+}
+
+// --- Steps --------------------------------------------------------------------
+
+// The steps for one parent: pick, or the new-dog questions (with "we found…").
+function parentSteps(draft, role, ctx) {
+  const r = ROLES[role];
+  const steps = [role];
+  const spec = draft[r.newKey];
+  if (spec) {
+    steps.push(`${role}-new`);
+    if (spec.matchIds?.length) steps.push(`${role}-match`);
+    if (ctx.canOutsideDog && !spec.mine) steps.push(`${role}-owner`, `${role}-kennel`);
+  }
+  return steps;
+}
+
+// ctx (worked out by the UI from the live records):
+//   litterOptions / pairingOptions — litterCandidates / pairingCandidates for
+//                    the chosen parents
+//   linkedPairing  — the chosen litter already has a breeding linked
+//   needsKennel    — no kennel could be worked out, so she's asked
+//   canOutsideDog  — this edition records somebody else's dogs (externalOwnership)
+//   canStudService — this edition has stud services
+//   sireIsOutside  — the dad she picked is somebody else's dog
+//   hasStudService — a stud service is already recorded for the breeding
+export function stepsFor(draft, ctx = {}) {
+  const steps = [];
+  if (!draft.lockedSource) {
+    steps.push(...parentSteps(draft, 'dam', ctx), ...parentSteps(draft, 'sire', ctx));
+    if (ctx.litterOptions?.length) steps.push('match-litter');
+  }
+  const hasBreeding = Boolean(ctx.linkedPairing) || (draft.pairingChoice && draft.pairingChoice !== 'none');
+  if (!ctx.linkedPairing && ctx.pairingOptions?.length) steps.push('match-pairing');
+  if (!hasBreeding) steps.push('bred');
+  const outside = (draft.newSire && !draft.newSire.mine) || ctx.sireIsOutside;
+  if (ctx.canStudService && outside && !ctx.hasStudService) steps.push('stud-service');
+  steps.push('born', 'count');
+  // How they were delivered, unless the litter she picked already says.
+  if (!ctx.litter?.delivery_type) steps.push('delivery');
+  if (ctx.needsKennel) steps.push('kennel');
+  draft.pups.forEach((_, i) => steps.push(`pup:${i}`));
+  if (draft.pups.length) steps.push('plans', 'registry', 'prices', 'dates', 'extras');
+  else steps.push('dates');
+  steps.push('review');
+  return steps;
+}
+
+// A check she can tap past (kelsSteps): asked once per key.
+const check = (draft, key, message) => (draft.warned?.[key] ? null : { key, message });
+
+// One plain-language problem with the step's answers (a string stays until
+// fixed; a check() she can tap past), or null when it's fine. ctx also carries
+// `contacts` and `outsideKennels`, for "is that one you have?".
+export function stepProblem(step, draft, ctx = {}) {
+  const today = todayYMD();
+  const [role, part] = step.split('-');
+  if (ROLES[role]) {
+    const r = ROLES[role];
+    const spec = draft[r.newKey];
+    if (!part) {
+      if (!draft[r.idKey] && !spec) return `Tap the ${r.word}.`;
+      if (role === 'sire' && draft.sireId && draft.sireId === draft.damId) return 'The dad can\'t be the same dog as the mom.';
+      if (role === 'dam' && ctx.dam && blank(ctx.dam.breed)) return `${ctx.dam.call_name} has no breed recorded, so ${r.possessive} puppies can't get one. Add ${r.possessive} breed on ${r.possessive} page, then come back: your answers are saved.`;
+      return null;
+    }
+    // She picked a dog on file instead: the new-dog questions no longer apply.
+    if (!spec) return null;
+    if (part === 'new') {
+      if (blank(spec?.call_name)) return `Type the ${r.word}'s name.`;
+      if (blank(spec?.breed)) return `Pick ${r.possessive} breed, or type a new one.`;
+      // A breed she has, spelled a little differently, would make a second breed.
+      const like = similarNamed((ctx.breeds || []).filter((b) => norm(b) !== norm(spec.breed)), spec.breed, (b) => b);
+      if (like) return check(draft, `breed:${role}:${norm(spec.breed)}`, `Did you mean ${like}? That's how your other dogs have it.`);
+      return null;
+    }
+    // "We found Nell. Is this the mom?": a found dog clears the new-dog answers;
+    // "No, a different dog" sets matchDeclined.
+    if (part === 'match') return spec?.matchDeclined || spec?.bringInId ? null : 'Tap one of the choices.';
+    if (part === 'owner') {
+      if (!spec?.ownerId && blank(spec?.owner?.name)) return `Pick ${r.possessive} owner, or type the owner's name.`;
+      const like = spec?.ownerId ? null : similarNamed(ctx.contacts || [], spec.owner.name, (c) => c.name);
+      if (like) return check(draft, `owner:${role}:${norm(spec.owner.name)}`, `Is that ${like.name}, already in your contacts? Pick them from the list if so.`);
+      return null;
+    }
+    if (part === 'kennel' && spec && !spec.kennelId && !blank(spec.kennelName)) {
+      const like = similarNamed(ctx.outsideKennels || [], spec.kennelName, (k) => k.kennel_name);
+      if (like) return check(draft, `kennel:${role}:${norm(spec.kennelName)}`, `Is that ${like.kennel_name}, already in your kennels? Pick it from the list if so.`);
+    }
+    return null; // -kennel is optional
+  }
+  switch (step) {
+    case 'match-litter':
+      return draft.litterChoice ? null : 'Tap one of the choices.';
+    case 'match-pairing':
+      return draft.pairingChoice ? null : 'Tap one of the choices.';
+    case 'bred':
+      if (!blank(draft.bredDate) && draft.bredDate > today) return 'The breeding date can\'t be in the future.';
+      if (!blank(draft.lastBredDate) && !blank(draft.bredDate) && draft.lastBredDate < draft.bredDate) return 'The last breeding date can\'t be before the first one.';
+      return null;
+    case 'stud-service': {
+      const st = draft.stud;
+      if (!st || st.record == null) return 'Choose yes or no.';
+      if (st.record && !money(st.fee_amount)) return 'The fee must be a number, like 1500.';
+      return null;
+    }
+    case 'born':
+      if (blank(draft.whelpDate)) return 'Pick the day they were born.';
+      if (draft.whelpDate > today) return 'The birth date can\'t be in the future.';
+      if (!blank(draft.bredDate) && draft.whelpDate < draft.bredDate) return 'The birth date can\'t be before the breeding date.';
+      return null;
+    case 'count': {
+      if (!whole(draft.alive) || !whole(draft.deceased || 0)) return 'Use whole numbers.';
+      if (!blank(draft.abnormalities) && !whole(draft.abnormalities)) return 'Use whole numbers.';
+      if (Number(draft.alive) + Number(draft.deceased || 0) < 1) return 'Add at least one puppy.';
+      if (Number(draft.alive) > MAX_PUPS) return `This guide handles up to ${MAX_PUPS} puppies at a time.`;
+      if (Number(draft.alive) < recordedPupCount(draft)) return `${recordedPupCount(draft)} puppies are already entered on this litter, so born alive can't be fewer.`;
+      return null;
+    }
+    case 'delivery':
+      return blank(draft.delivery) ? 'Pick how they were delivered, or "I\'ll add it later".' : null;
+    case 'kennel':
+      return draft.kennelId ? null : 'Pick the kennel this litter belongs to.';
+    case 'prices':
+      return Object.values(draft.prices).every(money) ? null : 'Prices must be numbers, like 2500.';
+    case 'dates':
+      if (!blank(draft.readyDate) && !blank(draft.whelpDate) && draft.readyDate < draft.whelpDate) return 'Going-home day can\'t be before they were born.';
+      return null;
+    default:
+      if (step.startsWith('pup:')) {
+        const p = draft.pups[Number(step.slice(4))];
+        if (!p) return null;
+        if (blank(p.call_name)) return 'Give this puppy a name. A collar color is fine.';
+        if (!['male', 'female'].includes(p.sex)) return 'Tap Boy or Girl.';
+        if (!blank(p.birth_oz) && !(Number(p.birth_oz) > 0)) return 'Birth weight must be a number of ounces, like 12.';
+        const dup = draft.pups.findIndex((q) => q !== p && trimmed(q.call_name).toLowerCase() === trimmed(p.call_name).toLowerCase());
+        if (dup !== -1) return `Puppy ${dup + 1} already has that name.`;
+      }
+      return null;
+  }
+}
+
+// Picking an existing litter or breeding: what it fills in. `litter` / `pairing`
+// are the records (null = she said no). Pups already on the litter are kept.
+export function applyLitterChoice(draft, litter, dogs = []) {
+  draft.litterChoice = litter ? litter.id : 'none';
+  draft.litterId = litter ? litter.id : null;
+  draft.source = litter ? 'litter' : (draft.pairingChoice && draft.pairingChoice !== 'none' ? 'pairing' : 'new');
+  if (!litter) return draft;
+  // An Expected litter's whelp date is a placeholder (often the day it was made),
+  // never the birth date (K9-3): she types the real one.
+  if (litter.status !== 'expected' && litter.whelp_date && litter.whelp_date <= todayYMD()) draft.whelpDate = litter.whelp_date;
+  for (const k of Object.keys(draft.prices)) if (!blank(litter[k])) draft.prices[k] = String(litter[k]);
+  draft.pricesFilled = Object.values(draft.prices).some((v) => v !== '');
+  draft.acceptDepositsDate = litter.accept_deposits_date || draft.acceptDepositsDate;
+  draft.readyDate = litter.estimated_ready_date || draft.readyDate;
+  // A ready date that is just its whelp date + 8 weeks follows the real birth
+  // date (refreshReadyDate); one she set herself stays.
+  draft.readyFromWhelp = litter.whelp_date && litter.estimated_ready_date === defaultReadyDate(litter.whelp_date) ? litter.whelp_date : null;
+  draft.nickname = litter.nickname || draft.nickname;
+  draft.photosUrl = litter.photos_url || draft.photosUrl;
+  const pups = dogs.filter((d) => d.litter_id === litter.id && d.status === 'puppy' && !d.is_archived);
+  if (pups.length) { draft.pups = pups.map(pupFromDog); draft.alive = String(pups.length); }
+  return draft;
+}
+
+export function applyPairingChoice(draft, pairing) {
+  draft.pairingChoice = pairing ? pairing.id : 'none';
+  draft.pairingId = pairing ? pairing.id : null;
+  if (draft.source !== 'litter') draft.source = pairing ? 'pairing' : 'new';
+  if (pairing) {
+    draft.bredDate = pairing.planned_date || '';
+    draft.lastBredDate = pairing.last_observed_date || '';
+    draft.method = pairing.method || '';
+  }
+  return draft;
+}
+
+// --- Review -------------------------------------------------------------------
+
+const label = (vocab, v, fallback = 'Not decided') => (blank(v) ? fallback : descriptor(vocab, v).label);
+const usd = (v) => (blank(v) ? '' : `$${Number(v).toLocaleString('en-US', { maximumFractionDigits: 2 })}`);
+
+// The pup's asking price as a buyer would see it: the litter's price for its sex,
+// plus the Full surcharge when it's planned for Full (saleDefaults' rule).
+export function pupPriceText(pup, prices) {
+  const sex = pup.sex === 'female' ? 'female' : 'male';
+  const base = num(prices[`expected_price_${sex}`]);
+  if (base == null) return '';
+  const extra = pup.intended_registration === 'full' ? (num(prices[`full_reg_surcharge_${sex}`]) || 0) : 0;
+  const dep = num(prices[`expected_deposit_${sex}`]);
+  return `${usd(base + extra)}${dep != null ? `, ${usd(dep)} deposit` : ''}`;
+}
+
+function newDogLines(spec, role, names) {
+  const s = spec;
+  const reg = blank(s.registered_name) ? '' : ` (${trimmed(s.registered_name)})`;
+  const what = s.bringInId ? (s.mine ? 'Brought into your dogs from a pedigree' : 'Brought in from a pedigree as an outside dog') : (s.mine ? 'A new dog of yours' : 'A new outside dog');
+  if (s.mine) return [`${what}: ${trimmed(s.call_name)}${reg}, ${trimmed(s.breed)}.`];
+  const lines = [`${what}: ${trimmed(s.call_name)}${reg}, ${trimmed(s.breed)}, owned by ${names.owner || trimmed(s.owner?.name)}${names.kennel ? `, ${names.kennel}` : ''}.`];
+  if (!s.ownerId) lines.push(`A new contact for ${trimmed(s.owner?.name)}.`);
+  if (!s.kennelId && !blank(s.kennelName)) lines.push(`A new outside kennel, ${trimmed(s.kennelName)}.`);
+  return lines;
+}
+
+// Sections of plain lines for the "Here's what I'll save" screen. Each section
+// names the step its [Change] link goes back to. ctx: { dam, sire, pairing (the
+// breeding being used, if any), litter, kennelName, names: { dam: { owner,
+// kennel }, sire: { owner, kennel } } }.
+export function reviewSections(draft, ctx = {}) {
+  const sections = [];
+  const damName = draft.newDam ? trimmed(draft.newDam.call_name) : (ctx.dam?.call_name || ctx.dam?.registered_name || 'the mom');
+  const sireName = draft.newSire ? trimmed(draft.newSire.call_name) : (ctx.sire?.call_name || ctx.sire?.registered_name || 'the dad');
+  const names = ctx.names || {};
+
+  const breeding = [];
+  if (draft.newDam) breeding.push(...newDogLines(draft.newDam, 'dam', names.dam || {}));
+  if (draft.newSire) breeding.push(...newDogLines(draft.newSire, 'sire', names.sire || {}));
+  if (!ctx.pairing) {
+    breeding.push(`A breeding of ${damName} and ${sireName}${blank(draft.bredDate) ? '' : ` on ${fmt(draft.bredDate)}`}${blank(draft.method) ? '' : ` (${descriptor(PAIRING_METHOD, draft.method).label})`}, marked Whelped.`);
+  } else {
+    breeding.push(`The breeding of ${damName} and ${sireName}${ctx.pairing.planned_date ? ` (${fmt(ctx.pairing.planned_date)})` : ''}${ctx.pairing.status === 'whelped' ? '' : ' is marked Whelped'}${ctx.litter && !ctx.litter.pairing_id ? ' and linked to the litter' : ''}.`);
+  }
+  if (draft.stud?.record) {
+    const fee = draft.stud.fee_structure ? descriptor(FEE_STRUCTURE, draft.stud.fee_structure).label : '';
+    breeding.push(`A stud service for ${sireName}${fee ? `: ${fee}` : ''}${blank(draft.stud.fee_amount) ? '' : `, ${usd(draft.stud.fee_amount)}`}.`);
+  }
+  sections.push({ title: 'The parents & breeding', step: draft.lockedSource ? (ctx.pairing ? 'born' : 'bred') : 'dam', lines: breeding });
+
+  const alive = Number(draft.alive) || 0;
+  const deceased = Number(draft.deceased) || 0;
+  const birth = [
+    `${ctx.litter ? 'The litter you entered before' : 'A new litter'} for ${damName} × ${sireName}, born ${fmt(draft.whelpDate)}.`,
+    `${alive} born alive${deceased ? `, ${deceased} not alive` : ''}${blank(draft.abnormalities) || Number(draft.abnormalities) === 0 ? '' : `, ${draft.abnormalities} with abnormalities`}.`
+  ];
+  if (!blank(draft.delivery) && draft.delivery !== 'later') birth.push(`Delivery: ${label(LITTER_DELIVERY_TYPE, draft.delivery)}.`);
+  if (ctx.kennelName) birth.push(`Kennel: ${ctx.kennelName}.`);
+  if (!blank(draft.nickname)) birth.push(`Nickname: ${trimmed(draft.nickname)}.`);
+  if (!blank(draft.photosUrl)) birth.push('A photos link for the litter.');
+  sections.push({ title: 'The birth', step: 'born', lines: birth });
+
+  if (draft.pups.length) {
+    sections.push({
+      title: 'The puppies',
+      step: 'pup:0',
+      lines: draft.pups.map((p) => {
+        const bits = [label(SEX, p.sex, '?')];
+        if (!blank(p.color_markings)) bits.push(trimmed(p.color_markings));
+        if (!blank(p.birth_oz)) bits.push(`${p.birth_oz} oz at birth`);
+        return `${trimmed(p.call_name)}: ${bits.join(', ')}${p.id ? ' (already entered, updated)' : ''}`;
+      })
+    });
+    sections.push({
+      title: 'Plans & prices',
+      step: 'plans',
+      lines: draft.pups.map((p) => {
+        const price = p.disposition === 'available' ? pupPriceText(p, draft.prices) : '';
+        return `${trimmed(p.call_name)}: ${label(DISPOSITION, p.disposition)}, ${label(REGISTRATION_TYPE, p.intended_registration)} registration${price ? `, ${price}` : ''}`;
+      })
+    });
+    if (!blank(draft.registry)) {
+      const left = draft.pups.filter((p) => !pupRegistry(p, draft.registry)).length;
+      sections.push({ title: 'Registry', step: 'registry', lines: [`${trimmed(draft.registry)} for ${left ? `every puppy but the ${left} marked Unregistered` : 'every puppy'}.`] });
+    }
+  }
+
+  const dates = [];
+  if (!blank(draft.acceptDepositsDate)) dates.push(`Deposits accepted from ${fmt(draft.acceptDepositsDate)}.`);
+  if (!blank(draft.readyDate)) dates.push(`Ready to go home ${fmt(draft.readyDate)}.`);
+  const chips = draft.pups.filter((p) => !blank(p.microchip_id)).length;
+  const photos = draft.pups.filter((p) => !blank(p.url)).length;
+  if (chips) dates.push(`Microchip numbers for ${chips} ${chips === 1 ? 'puppy' : 'puppies'}.`);
+  if (photos) dates.push(`Photo links for ${photos} ${photos === 1 ? 'puppy' : 'puppies'}.`);
+  if (dates.length) sections.push({ title: 'Dates & extras', step: 'dates', lines: dates });
+  return sections;
+}
+
+// "Oct 12, 2026" from YYYY-MM-DD, without a time zone shift.
+export function fmt(ymd) {
+  if (blank(ymd)) return '';
+  const [y, m, d] = ymd.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// --- Saving -------------------------------------------------------------------
+
+function litterFieldsFromDraft(draft) {
+  const alive = Number(draft.alive) || 0;
+  const deceased = Number(draft.deceased) || 0;
+  const fields = {
+    status: 'whelped',
+    whelp_date: draft.whelpDate,
+    puppies_born_total: alive + deceased,
+    puppies_born_alive: alive,
+    puppies_born_deceased: deceased
+  };
+  if (!blank(draft.abnormalities)) fields.puppies_born_abnormalities = Number(draft.abnormalities);
+  if (!blank(draft.delivery) && draft.delivery !== 'later') fields.delivery_type = draft.delivery;
+  for (const [k, v] of Object.entries(draft.prices)) if (!blank(v)) fields[k] = Number(v);
+  if (!blank(draft.acceptDepositsDate)) fields.accept_deposits_date = draft.acceptDepositsDate;
+  if (!blank(draft.readyDate)) fields.estimated_ready_date = draft.readyDate;
+  if (!blank(draft.nickname)) fields.nickname = trimmed(draft.nickname);
+  if (!blank(draft.photosUrl)) fields.photos_url = trimmed(draft.photosUrl);
+  return fields;
+}
+
+// The litter's registry goes on every pup but one planned as Unregistered.
+export const pupRegistry = (pup, registry) => (!blank(registry) && pup.intended_registration !== 'none' ? trimmed(registry) : null);
+
+function pupFields(pup, registry = null) {
+  const fields = {
+    call_name: trimmed(pup.call_name),
+    sex: pup.sex,
+    disposition: pup.disposition || 'undecided',
+    intended_registration: pup.intended_registration || null
+  };
+  const reg = pupRegistry(pup, registry);
+  if (reg) fields.registry = reg;
+  for (const k of ['color_markings', 'microchip_id', 'url']) if (!blank(pup[k])) fields[k] = trimmed(pup[k]);
+  return fields;
+}
+
+export const methodType = (method) => (blank(method) ? null : method === 'natural' ? 'in_person' : 'ai');
+
+// Make a parent who isn't in KennelOS yet: her own dog (in the litter's kennel),
+// or somebody else's with the owner and their kennel. Ids land on `s` as made.
+// The new moms and dads of hers this draft would still make (each one an adult
+// on her roster, so each takes a slot under Lite's dog cap). Parents already made
+// by a save that stopped partway don't count again.
+export function newParentsToMake(draft) {
+  return ['dam', 'sire'].filter((role) => {
+    const spec = draft[ROLES[role].newKey];
+    return Boolean(spec && spec.mine && !draft.saved?.[role]?.dogId);
+  }).length;
+}
+
+// Room for one more new parent of hers, given Lite's { current, cap } (null where
+// dogs aren't capped) and the other parent already planned as new. `role` is the
+// one she's choosing now.
+export function roomForNewParent(capStatus, draft, role) {
+  if (!capStatus) return true;
+  const other = role === 'dam' ? 'sire' : 'dam';
+  const otherSpec = draft[ROLES[other].newKey];
+  const otherNeeds = otherSpec && otherSpec.mine && !draft.saved?.[other]?.dogId ? 1 : 0;
+  return capStatus.current + otherNeeds < capStatus.cap;
+}
+
+async function createParent(spec, role, s, ownKennelId, step) {
+  const r = ROLES[role];
+  const made = s[role] || (s[role] = {});
+  if (made.dogId) return made.dogId;
+  const base = {
+    call_name: trimmed(spec.call_name), registered_name: trimmed(spec.registered_name), breed: trimmed(spec.breed),
+    sex: r.sex, status: 'active_breeding'
+  };
+  // A new dog, or a pedigree-only one brought into use: the names and breed the
+  // pedigree has stay; what she typed fills only what it left blank.
+  const write = async (fields) => {
+    if (!spec.bringInId) return (await dogRepo.create(fields)).id;
+    const on = await dogRepo.getById(spec.bringInId);
+    const keep = Object.fromEntries(['call_name', 'registered_name', 'breed'].filter((k) => !blank(on?.[k])).map((k) => [k, on[k]]));
+    await dogRepo.update(spec.bringInId, { ...fields, ...keep, pedigree_only: false });
+    return spec.bringInId;
+  };
+  if (spec.mine) {
+    // A new dog of hers starts with her kennel's planned tests, as on the Dog page.
+    const own = { ...base, ownership_type: 'owned', kennel_id: ownKennelId };
+    made.dogId = await write(spec.bringInId ? own : withSeededTests(own, await kennelRepo.getAll()));
+    await step();
+    return made.dogId;
+  }
+  let kennelId = spec.kennelId || made.kennelId || null;
+  if (!kennelId && !blank(spec.kennelName)) {
+    const { kennel: k } = await kennelRepo.findOrCreateOutside(spec.kennelName);
+    kennelId = made.kennelId = k.id;
+    await step();
+  }
+  let ownerId = spec.ownerId || made.ownerId || null;
+  if (!ownerId) {
+    const c = await contactRepo.create({
+      name: trimmed(spec.owner?.name), email: trimmed(spec.owner?.email), phone: trimmed(spec.owner?.phone),
+      contact_type: ['breeder'], kennel_id: kennelId
+    });
+    ownerId = made.ownerId = c.id;
+    await step();
+  }
+  made.dogId = await write({ ...base, ownership_type: 'external', owner_contact_id: ownerId, kennel_id: kennelId });
+  await step();
+  return made.dogId;
+}
+
+// Write everything the review listed. Where a refusal is possible (Lite's litter
+// cap) the litter comes before the breeding, so it refuses before that's made.
+// `onProgress(draft)` runs after every write so the UI keeps the draft (and its
+// saved ids) current. Returns { litterId }.
+export async function saveGuidedLitter(draft, { onProgress = () => {} } = {}) {
+  const s = draft.saved || (draft.saved = {});
+  const step = async () => { draft.updatedAt = new Date().toISOString(); await onProgress(draft); };
+  const existingLitter = draft.litterId ? await litterRepo.getById(draft.litterId) : null;
+  const kennelId = existingLitter?.kennel_id || draft.kennelId || draft.autoKennelId;
+
+  // 0. Lite's litter cap, asked before anything is made: a new litter it would
+  // refuse must not leave a new parent behind (K13-14).
+  if (!existingLitter && !s.litterId) await enforceLitterCap({ candidate: litterFieldsFromDraft(draft) });
+  // And room for every new parent of hers, so the cap can't take the mom and then
+  // refuse the dad (K11-1).
+  const needed = existingLitter ? 0 : newParentsToMake(draft);
+  if (needed) {
+    const cap = await dogCapStatus();
+    if (cap && cap.current + needed > cap.cap) throw new CapExceededError('dogs', cap.current, cap.cap);
+  }
+
+  // 1. Parents who weren't in KennelOS yet.
+  const damId = existingLitter?.dam_id || (draft.newDam ? await createParent(draft.newDam, 'dam', s, kennelId, step) : draft.damId);
+  const sireId = existingLitter?.sire_id || (draft.newSire ? await createParent(draft.newSire, 'sire', s, kennelId, step) : draft.sireId);
+  const dam = await dogRepo.getById(damId);
+
+  // 2. The litter: the one she picked, or a new one. `litterUpdated` is cleared by
+  // the UI when she changes an answer after a save that stopped partway.
+  const chosenPairingId = draft.pairingChoice && draft.pairingChoice !== 'none' ? draft.pairingChoice : null;
+  let litterId = existingLitter?.id || s.litterId || null;
+  if (!litterId) {
+    const created = await litterRepo.create({
+      ...litterFieldsFromDraft(draft), dam_id: damId, sire_id: sireId, kennel_id: kennelId, pairing_id: chosenPairingId
+    });
+    litterId = s.litterId = created.id;
+    s.litterUpdated = true;
+    await step();
+  } else if (!s.litterUpdated) {
+    await litterRepo.update(litterId, litterFieldsFromDraft(draft));
+    s.litterUpdated = true;
+    await step();
+  }
+
+  // 3. The breeding: the litter's own, the one she picked (linked to the litter),
+  // or a new one, marked Whelped either way.
+  let pairingId = existingLitter?.pairing_id || chosenPairingId || s.pairingId || null;
+  if (!pairingId) {
+    const p = await pairingRepo.create({
+      dam_id: damId, sire_id: sireId, pairing_type: 'actual', status: 'whelped',
+      method: draft.method || null,
+      planned_date: draft.bredDate || null,
+      last_observed_date: draft.lastBredDate || null,
+      expected_due_date: draft.bredDate ? addDaysToYMD(draft.bredDate, DUE_DAYS_AFTER_BREEDING) : null,
+      kennel_id: kennelId
+    });
+    pairingId = s.pairingId = p.id;
+    await step();
+  } else if (!s.pairingWhelped) {
+    const p = await pairingRepo.getById(pairingId);
+    if (p && p.status !== 'whelped') await pairingRepo.update(pairingId, { status: 'whelped' });
+    s.pairingWhelped = true;
+    await step();
+  }
+  if (!s.litterLinked) {
+    const l = await litterRepo.getById(litterId);
+    if (l.pairing_id !== pairingId) await litterRepo.update(litterId, { pairing_id: pairingId });
+    s.litterLinked = true;
+    await step();
+  }
+
+  // 4. The stud service (Pro), for an outside stud.
+  if (draft.stud?.record && !s.studServiceId) {
+    const sire = await dogRepo.getById(sireId);
+    const fee = draft.stud.fee_structure || null;
+    const ss = await studServiceRepo.create({
+      // Who travelled isn't asked here: shipped for AI, else our dam went to him.
+      direction: (draft.stud.type || methodType(draft.method)) === 'ai' ? 'shipped' : 'to_partner',
+      our_dog_id: damId, partner_dog_id: sireId,
+      partner_contact_id: sire?.owner_contact_id || null,
+      status: 'completed', kennel_id: kennelId, pairing_id: pairingId,
+      type: draft.stud.type || methodType(draft.method),
+      fee_structure: fee,
+      fee_amount: num(draft.stud.fee_amount),
+      pick_status: ['pick_of_litter', 'flat_plus_pick'].includes(fee) ? 'pending' : null
+    });
+    s.studServiceId = ss.id;
+    await step();
+  }
+
+  // 5. The puppies, each inheriting from the litter exactly as Add Puppies does.
+  const litter = await litterRepo.getById(litterId);
+  const base = baseFromLitter(litter, dam);
+  for (const pup of draft.pups) {
+    if (!pup.id) {
+      const made = await dogRepo.create({ ...base, ...pupFields(pup, draft.registry) });
+      pup.id = made.id;
+      pup.saved = true;
+      await step();
+    } else if (!pup.saved) {
+      const current = await dogRepo.getById(pup.id);
+      const changes = pupFields(pup, draft.registry);
+      if (current && !current.date_of_birth && base.date_of_birth) changes.date_of_birth = base.date_of_birth;
+      if (current?.registry) delete changes.registry; // one she already set stays
+      await dogRepo.update(pup.id, changes);
+      pup.saved = true;
+      await step();
+    }
+    if (!blank(pup.birth_oz) && !pup.weightSaved) {
+      const oz = Number(pup.birth_oz);
+      await eventRepo.create({
+        subject_type: 'dog', subject_id: pup.id, event_type: 'weight_check',
+        event_date: draft.whelpDate, title: 'Birth weight',
+        details: { weight_lbs: Math.floor(oz / 16), weight_oz: Math.round((oz % 16) * 10) / 10 }
+      });
+      pup.weightSaved = true;
+      await step();
+    }
+  }
+
+  draft.done = true;
+  draft.savedLitterId = litterId;
+  await step();
+  return { litterId };
+}
+
+// Default "ready to go home" date for a birth date.
+export const defaultReadyDate = (whelpDate) => (blank(whelpDate) ? '' : addDaysToYMD(whelpDate, READY_DAYS_AFTER_WHELP));
+
+// Once the birth date is known: a blank ready date, or one still derived from an
+// earlier whelp date (an Expected litter's placeholder), becomes birth + 8 weeks.
+export function refreshReadyDate(draft) {
+  if (blank(draft.whelpDate)) return draft;
+  const derived = draft.readyFromWhelp && draft.readyDate === defaultReadyDate(draft.readyFromWhelp);
+  if (blank(draft.readyDate) || derived) {
+    draft.readyDate = defaultReadyDate(draft.whelpDate);
+    draft.readyFromWhelp = draft.whelpDate;
+  }
+  return draft;
+}
+export { STUD_SERVICE_TYPE };

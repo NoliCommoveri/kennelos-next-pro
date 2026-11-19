@@ -1,0 +1,2505 @@
+// waitlist-entry.js — one family's run through a kennel's waitlist (Waitlist Spec
+// §5–§6; End-State guide §29). A new application entry (?new=1&kennel=…) or one
+// family, in three tabs (decided 2026-10-10, like the hubs' segment tabs):
+//  - Details: where they stand (position, in line since, passes, their place for
+//    what they want), their answers and application, Edit, and the one way off the
+//    list for their status ("Remove from list…": they withdrew, or you remove them;
+//    "Close application…" before they're on it).
+//  - Interact: what needs her (their status-page requests, a turn they hold, a lost
+//    pup) and what she can start: Offer pups / Move place for a family on the list
+//    (Approve, Fee received, Undo removal or Re-apply in other statuses), and
+//    Communicate… (email from her templates with a preview, or "Message via…"),
+//    and View their page (their live status page as they see it signed in).
+//  - History: their messages and the emails sent, every offer, answer changes, key
+//    dates, and documents (fee receipt, Sale invoice/receipt as PDFs).
+// Archive, Delete, New status link and "Same family as another application…" (a
+// duplicate application, merged after she confirms: assets/applicationMergeUI.js)
+// sit in the header's ⋯ menu. Application
+// answers follow her own form (Spec §15.1, data/waitlistForm.js). Every multi-step
+// write goes through data/waitlistActions.js. Pro-only page (proPages.js).
+import { waitlistEntryRepo, ReferenceBlockedError } from '../data/waitlistEntryRepo.js';
+import { waitlistOfferRepo } from '../data/waitlistOfferRepo.js';
+import { waitlistProgramRepo } from '../data/waitlistProgramRepo.js';
+import { contactRepo } from '../data/contactRepo.js';
+import { kennelRepo } from '../data/kennelRepo.js';
+import { litterRepo } from '../data/litterRepo.js';
+import { pairingRepo } from '../data/pairingRepo.js';
+import { dogRepo } from '../data/dogRepo.js';
+import { saleRepo } from '../data/saleRepo.js';
+import { contractRepo } from '../data/contractRepo.js';
+import { earlyPortalState } from '../data/portalFeed.js';
+import * as actions from '../data/waitlistActions.js';
+import { kennelChargeList, kennelChargeGroups, chargeRules, planText, groupedChargeList, saleExtraCharges } from '../data/extraCharges.js';
+import { pendingExtraRequests, familySale, pupBirthDate } from '../data/familyExtras.js';
+import { offerStayAndPickup } from '../assets/stayPickupUI.js';
+import { suggestOutcome, policyRowText, backOutReasons, ageWeeks, BACK_OUT_OUTCOMES } from '../data/backOut.js';
+import { pendingPickupRequests, requestText as pickupRequestText, ownPlaceAllowed } from '../data/familyPickup.js';
+import { standardLocation, timeRange } from '../data/pickupSlots.js';
+import { transportQuote, mapsLink, milesErrorText } from '../data/transportFee.js';
+import { locationRuleOn } from '../data/waitlistForm.js';
+import { programSuggestions, suggestionWhy } from '../data/programSuggest.js';
+import { doNotSellRepo } from '../data/doNotSellRepo.js';
+import { entryDoNotSellMatches, doNotSellWarning } from '../data/doNotSell.js';
+import { applicationMatches, matchReasonText, isLiveEntry } from '../data/applicationDuplicates.js';
+import { sameFamilyDialog, mergedMessage, isPairDismissed, markNotSame } from '../assets/applicationMergeUI.js';
+import { PLACEMENT_METHODS, BOARDING_FREQUENCY_OPTIONS } from '../data/vocab.js';
+import { trainingStaysFor, boardingChargeText, addedStays } from '../data/goHome.js';
+import { eventRepo } from '../data/eventRepo.js';
+import { offerEmails, syncSoon, communicateDialog } from '../assets/waitlistEmailUI.js';
+import { programIconHtml } from '../assets/programIcons.js';
+import { offerSpecs, retryEmail, dropEmail, isHeldEmail, kennelEmailsOn, familyEmail, emailErrorText } from '../data/waitlistOutbox.js';
+import {
+  waitlistConfig, overallPositions, passesUsed, anchorDate, isMovedByBreeder, contactMatches, contactMatchReason,
+  entryName, publicSourceName, holdsPlace, waitlistLitters, isWaitlistLitter, LISTEN_LIVE_PAIRING, canUndoRemoval, canUndoWithdrawal, canUndoDecline, canUndoExpire, canUndoFeeReceived, isPaused, isReadyHeld, readyFromDate, readyCheck, rankedList, REMOVAL_UNDO_DAYS,
+  eligiblePupsFor, openTurns, turnOffers, turnIdOf, isListeningFor, isListenOnly,
+  describeOfferChanges, isAwaitingDeposit, switchablePups, canSwitchAcceptedPick, undoPassBlocker,
+  kennelBreeds, resolveBreed, prefChangeEffect, autoOffers, closingTrigger, listenParentChoices,
+  PREF_FIELD_LABEL, prefValueText, prefChangeSummary, lostSaleFamily, listedName, privateName, publicName, prefPlaces,
+  sideSaleOf, pupClaims, isFamilyPageOnly, offerBlocker, nextOfferedTurn, turnRespondBy, isTurnOverdue, holdsTurn, isPrepassedRow
+} from '../data/waitlistRules.js';
+import { sideSaleDialog, sideDepositDialog, cancelSideSaleDialog } from '../assets/sideSaleUI.js';
+import {
+  formQuestions, entryQuestions, snapshotQuestions, answerText, isAnswerQuestion, missingRequired, formFaq
+} from '../data/waitlistForm.js';
+import {
+  WAITLIST_ENTRY_STATUS, WAITLIST_PREF_SEX, WAITLIST_LISTEN_MODE, WAITLIST_OFFER_OUTCOME,
+  WAITLIST_REMOVED_REASON, WAITLIST_READY_TIMING, PLACEMENT_PURPOSE, FEE_CREDIT_POLICY, PAYMENT_METHODS, SEX, RELEASED_SALE_STATUSES, descriptor
+} from '../data/vocab.js';
+import { addDaysToYMD } from '../data/dateUtils.js';
+import { getEntryCredit, getSaleStatement } from '../data/incomeView.js';
+import { loadFamilyAccount, familyDocs } from '../data/familyMoney.js';
+import { savedSchedules } from '../data/paymentSchedule.js';
+import { accountRepo } from '../data/accountRepo.js';
+import { paymentsCardHtml, wirePaymentsCard, askAboutNewFees } from '../assets/paymentScheduleUI.js';
+import { creditsOf, carriedCreditsOf } from '../data/receivedCredits.js';
+import { CREDIT_USES } from '../data/vocab.js';
+import { applicationFields, answerField, prefField as prefFieldHtml, privateField, readAnswers, readPrefs } from '../assets/waitlistApplicationForm.js';
+import { editionFlags } from '../data/editionConfig.js';
+import { CLOUD_DATA_CHANGED_EVENT } from '../data/settings.js';
+import { isCloudAvailable } from '../data/cloud/cloudConfig.js';
+import { sessionToken } from '../data/cloud/cloudAuth.js';
+import { esc, badge, fmtDate, fmtMoney, param, todayYMD, kennelToday, confirmModal, alertModal, wireActionMenu } from '../assets/ui.js';
+import {
+  resolveWaitlistKennel, prefsSummary, entryFlags, readyHoldText, formModal,
+  pickDialog, depositDialog, changePickDialog, undoPassDialog, restoreLostPupDialog, endSaleDialog, backOutDialog, statusLinkFor, copyLink, creditDialog,
+  openStatusPage
+} from '../assets/waitlistUI.js';
+
+const els = {
+  title: document.getElementById('entry-title'),
+  subtitle: document.getElementById('entry-subtitle'),
+  back: document.getElementById('back-link'),
+  headerActions: document.getElementById('header-actions'),
+  tabs: document.getElementById('entry-tabs'),
+  panes: {
+    details: document.getElementById('tab-details'),
+    interact: document.getElementById('tab-interact'),
+    history: document.getElementById('tab-history')
+  },
+  edit: document.getElementById('edit-section'),
+  editTitle: document.getElementById('edit-title'),
+  profileActions: document.getElementById('profile-actions'),
+  body: document.getElementById('profile-body'),
+  error: document.getElementById('page-error'),
+  note: document.getElementById('page-note')
+};
+
+// The family's sales and dogs, for their number (a family with a pup selected keeps theirs).
+const numbering = () => ({ sales: ctx.sales, dogs: ctx.dogsById });
+// A family picks which sires and dams they're listening for only once they're ON
+// the list: approved AND their fee received (or waived, which makes them active at
+// approval). Before that there's nothing to listen for, and after they leave the
+// list it no longer matters (their picks are kept, just not shown for editing).
+const LISTEN_STATUSES = ['active'];
+
+const ctx = {
+  mode: 'view', tab: null, entry: null, draft: null, kennel: null, config: null,
+  contact: null, contacts: [], programs: new Map(), kennelEntries: [], offers: [],
+  litters: [], pairings: [], dogsById: new Map(), breeds: [], form: [], kennelOffers: [], sales: [],
+  doNotSell: []
+};
+
+const none = '<span class="faint">—</span>';
+const showError = (msg) => { els.error.innerHTML = `<div class="inline-error">${esc(msg)}</div>`; };
+const clearError = () => { els.error.innerHTML = ''; };
+const row = (label, html) => (html ? `<dt>${esc(label)}</dt><dd>${html}</dd>` : '');
+const multiline = (s) => (s ? esc(s).replace(/\n/g, '<br>') : '');
+const dogName = (id) => ctx.dogsById.get(id)?.call_name || '—';
+const litterLabel = (l) => l.nickname || `${dogName(l.dam_id)} × ${dogName(l.sire_id)}`;
+const pairingLabel = (p) => `${dogName(p.dam_id)} × ${dogName(p.sire_id)}`;
+const options = (vocab, current, blankLabel) =>
+  (blankLabel != null ? `<option value="">${esc(blankLabel)}</option>` : '') +
+  vocab.map((o) => `<option value="${esc(o.value)}"${o.value === current ? ' selected' : ''}>${esc(o.label)}</option>`).join('');
+const programOptions = (current) => `<option value="">— none —</option>` + [...ctx.programs.values()]
+  .filter((p) => !p.is_archived || p.id === current)
+  .sort((a, b) => a.name.localeCompare(b.name))
+  .map((p) => `<option value="${esc(p.id)}"${p.id === current ? ' selected' : ''}>${esc(p.name)}${p.is_archived ? ' (archived)' : ''}</option>`).join('');
+
+// --- Loading ------------------------------------------------------------------
+
+async function loadKennelContext(kennelId) {
+  const [kennel, programs, kennelEntries, contacts, litters, pairings, dogs, kennelOffers, sales, doNotSell] = await Promise.all([
+    kennelRepo.getById(kennelId),
+    waitlistProgramRepo.getMapForKennel(kennelId),
+    waitlistEntryRepo.getByKennel(kennelId),
+    contactRepo.getAll({ includeArchived: true }),
+    litterRepo.getAll({ includeArchived: true }),
+    pairingRepo.getAll({ includeArchived: true }),
+    dogRepo.getAll({ includeArchived: true }),
+    waitlistOfferRepo.getByKennel(kennelId),
+    saleRepo.getAll({ includeArchived: true }),
+    doNotSellRepo.getAll()
+  ]);
+  Object.assign(ctx, {
+    doNotSell,
+    kennel, config: waitlistConfig(kennel), form: formQuestions(waitlistConfig(kennel)), programs, kennelEntries, contacts,
+    litters: litters.filter((l) => l.kennel_id === kennelId),
+    pairings: pairings.filter((p) => p.kennel_id === kennelId),
+    dogsById: new Map(dogs.map((d) => [d.id, d])),
+    // The breed dropdown's choices: this kennel's breeds only (never free text).
+    breeds: kennelBreeds(kennel, dogs), kennelOffers, sales
+  });
+}
+
+async function reload() {
+  ctx.entry = await waitlistEntryRepo.getById(ctx.entry.id);
+  await loadKennelContext(ctx.entry.kennel_id);
+  ctx.contact = ctx.contacts.find((c) => c.id === ctx.entry.contact_id) || null;
+  ctx.offers = await waitlistOfferRepo.getByEntry(ctx.entry.id);
+  ctx.credit = (await getEntryCredit(ctx.entry.id)).credit;
+  // Their open sale's payments (Payment Schedule plan §5): the sale they're placed with,
+  // or their pick's while its deposit is pending.
+  const sale = familySale(ctx.entry, ctx.sales, ctx.kennelOffers, ctx.kennelEntries);
+  ctx.payments = sale ? await getSaleStatement(sale) : null;
+  // Their puppy portal before the contract (Pro with a KennelPort website, portal on).
+  const early = sale && editionFlags.websiteLink ? earlyPortalState({ kennel: ctx.kennel, sale, contracts: await contractRepo.getBySale(sale.id) }) : null;
+  ctx.portalEarly = early ? { state: early, sale } : null;
+  ctx.paymentAccounts = editionFlags.accounts ? (await accountRepo.getAll({ includeArchived: true })).filter((a) => a.account_type === 'payment_service') : [];
+  // Their money across the fee and the sale, for the Documents card (Payment Schedule plan §6.2).
+  ctx.family = editionFlags.invoicing ? await loadFamilyAccount({ entryId: ctx.entry.id }) : null;
+}
+
+// --- Status card + actions --------------------------------------------------------
+
+// A lost pup's sale this family can be put back in line for (Spec §16.11): the sale
+// they were placed with, or a pick of their open turn, voided or returned for a
+// health problem. Null when there's none. Normally she's asked as she marks the
+// sale; this is the way back if she said "Not now".
+function lostSale(e) {
+  const offers = ctx.kennelOffers.filter((o) => o.entry_id === e.id);
+  const ids = new Set([e.placed_sale_id, ...offers.map((o) => o.sale_id)].filter(Boolean));
+  return ctx.sales.find((x) => ids.has(x.id) && lostSaleFamily(x, [e], offers)) || null;
+}
+
+// The sale "End the sale…" ends (decided 2026-10-11): the one they're placed with,
+// or the one holding the pup they picked in an open turn, while it hasn't ended
+// already. Null when there's none. { sale, placed }.
+function endableSale(e) {
+  const live = (x) => x && !x.is_archived && !RELEASED_SALE_STATUSES.includes(x.status);
+  if (e.status === 'placed') {
+    const sale = ctx.sales.find((x) => x.id === e.placed_sale_id);
+    return live(sale) ? { sale, placed: true } : null;
+  }
+  const picked = ctx.kennelOffers.find((o) => o.entry_id === e.id && !o.is_archived && o.outcome === 'open' && o.chosen_dog_id && o.sale_id);
+  const sale = picked && ctx.sales.find((x) => x.id === picked.sale_id);
+  return live(sale) ? { sale, placed: false } : null;
+}
+
+// Their place for what they want (decided 2026-10-10), as their status page shows it:
+// for all their narrowed answers together, then each one, skipping a number
+// already shown. Escaped HTML, or '' for a family whose answers are all open.
+function prefPlacesText(e, overall) {
+  const places = prefPlaces(ctx.kennelEntries, ctx.kennel.id, ctx.programs, ctx.config, numbering()).get(e.id) || {};
+  const label = {
+    all: 'for their preferences',
+    sex: `for ${descriptor(WAITLIST_PREF_SEX, e.pref_sex).label}`,
+    breed: `for ${e.pref_breed || ''}`,
+    purposes: `for ${(e.pref_purposes || []).map((p) => descriptor(PLACEMENT_PURPOSE, p).label).join(', ')}`,
+    colors: `for ${(Array.isArray(e.pref_colors) ? e.pref_colors : [e.pref_colors]).filter(Boolean).join(', ')}`
+  };
+  const seen = new Set([overall]);
+  const parts = [];
+  for (const k of ['all', 'sex', 'breed', 'purposes', 'colors']) {
+    const n = places[k];
+    if (!Number.isInteger(n) || seen.has(n)) continue;
+    seen.add(n);
+    parts.push(`<strong>#${esc(n)}</strong> ${esc(label[k])}`);
+  }
+  return parts.length ? `${parts.join(' · ')} <span class="faint">(counting only families ahead who'd take a pup they want)</span>` : '';
+}
+
+// A pup they lost (Spec §16.11), as one line; '' when there's none.
+function lostLine(e) {
+  const lost = lostSale(e);
+  return lost ? `<span class="badge badge-amber">Pup lost</span> ${esc(dogName(lost.dog_id))}'s sale was ${esc(lost.status)}. <a href="sale.html?id=${encodeURIComponent(lost.id)}">Open the sale →</a>` : '';
+}
+
+function statusLines(e) {
+  const today = kennelToday(ctx.kennel);
+  const lines = [];
+  const lost = lostLine(e);
+  if (lost) lines.push(lost);
+  // Money carried from a pup they lost: a credit for funds received (plan §3.2a), shown
+  // with their credits; this says what it's for while they're waiting for a pup.
+  const carried = e.status === 'active' ? carriedCreditsOf(e) : [];
+  if (carried.length) {
+    lines.push(`Carrying <strong>${esc(fmtMoney(carried.reduce((t, c) => t + c.amount, 0)))}</strong> they paid on a pup they lost, as a credit for funds received: it comes off their next pup, starting with the deposit.`);
+  }
+  // Paid online (Integrations plan §4): before approval it waits on the entry;
+  // after, what they paid and what the payment service kept.
+  if (e.fee_paid_online && !e.fee_received_date) {
+    const p = e.fee_paid_online;
+    lines.push(`<span class="badge badge-green">Fee paid online</span> ${esc(fmtDate(p.date))}${p.amount != null ? `, ${esc(fmtMoney(p.amount))}` : ''}${p.fee != null ? ` (the payment service kept ${esc(fmtMoney(p.fee))})` : ''}. ${e.status === 'applied' ? 'Approving puts them on the list from that day.' : 'They aren\'t on the list: refund it in your payment service if it\'s owed.'}`);
+  } else if (e.fee_received_date && e.fee_processing_amount != null) {
+    lines.push(`<span class="faint">Fee paid online${e.fee_paid_amount != null ? `: ${esc(fmtMoney(e.fee_paid_amount))}` : ''}; the payment service kept ${esc(fmtMoney(e.fee_processing_amount))}.</span>`);
+  }
+  if (e.status === 'applied') {
+    lines.push(`Applied ${e.applied_date ? esc(fmtDate(e.applied_date)) : ''}${e.source === 'online_form' ? ' through your online form' : ''}. Waiting for your review.`);
+  } else if (e.status === 'approved') {
+    const fee = e.fee_amount != null ? esc(fmtMoney(e.fee_amount)) : 'no fee set';
+    lines.push(`Approved ${esc(fmtDate(e.approved_date))}. Fee due: <strong>${fee}</strong>${e.fee_due_date ? ` by ${esc(fmtDate(e.fee_due_date))}` : ''}.`);
+    const feeCredit = ctx.credit?.byKey.fee || 0;
+    if (feeCredit > 0) lines.push(`Their credit for funds already received covers ${esc(fmtMoney(feeCredit))} of it${feeCredit >= Number(e.fee_amount) ? ': use <strong>Fee received</strong> to put them on the list' : `, so they're asked for ${esc(fmtMoney(Number(e.fee_amount) - feeCredit))}`}.`);
+    if (e.fee_due_date && e.fee_due_date < today) lines.push('<span class="badge badge-red">The pay-by date has passed</span>');
+    if (ctx.config.payment_instructions) lines.push(`<span class="faint">Your payment instructions: ${esc(ctx.config.payment_instructions)}</span>`);
+  } else if (e.status === 'active') {
+    const places = overallPositions(ctx.kennelEntries, ctx.kennel.id, ctx.programs, numbering());
+    const pos = places.get(e.id);
+    const total = places.size;
+    lines.push(`<strong style="font-size:1.3em;">#${esc(pos)}</strong> of ${esc(total)} on the list.`);
+    lines.push(`In line since ${esc(fmtDate(anchorDate(e)))}${isMovedByBreeder(e) ? ` <span class="badge badge-purple">Moved by you</span> <span class="faint">(fee received ${esc(fmtDate(e.fee_received_date))})</span>` : ''}.`);
+    const placesLine = prefPlacesText(e, pos);
+    if (placesLine) lines.push(placesLine);
+    lines.push(`Passes used: ${passesUsed(e, ctx.offers)} of ${esc(ctx.config.max_passes)}.`);
+    if (canUndoFeeReceived(e, ctx.offers, today, ctx.sales)) lines.push(`<span class="badge badge-amber">Fee marked received by mistake? You can undo it until ${esc(fmtDate(addDaysToYMD(String(e.fee_received_at).slice(0, 10), REMOVAL_UNDO_DAYS)))}, until they're offered a turn</span>`);
+    const flags = entryFlags(e, today, ctx.config);
+    const why = isReadyHeld(e, today, ctx.config)
+      ? `${esc(readyHoldText(e, today, ctx.config))} They aren't offered pups (or charged passes) until then, and keep their place.`
+      : isPaused(e, today) ? 'Paused families keep their place; they just aren\'t offered pups.'
+        : e.listen_mode === 'except' ? 'Not offered litters from the sires and dams they listed; they keep their place.'
+          : 'Only offered litters from the sires and dams they chose; they keep their place.';
+    if (flags) lines.push(`${flags} <span class="faint">${why}</span>`);
+  } else if (e.status === 'removed') {
+    lines.push(`Removed ${esc(fmtDate(e.removed_date))}${e.removed_reason ? ` — ${esc(descriptor(WAITLIST_REMOVED_REASON, e.removed_reason).label.toLowerCase())}` : ''}.`);
+    if (canUndoRemoval(e, today)) lines.push(`<span class="badge badge-amber">You can undo this until ${esc(fmtDate(addDaysToYMD(e.removed_date, REMOVAL_UNDO_DAYS)))}</span>`);
+  } else if (e.status === 'placed') {
+    const placedPup = ctx.sales.find((x) => x.id === e.placed_sale_id)?.dog_id;
+    lines.push(e.placed_sale_id ? `Placed${placedPup ? ` with ${esc(dogName(placedPup))}` : ''} — <a href="sale.html?id=${encodeURIComponent(e.placed_sale_id)}">open the sale →</a>` : 'Placed.');
+    // A family page only (E3): a status page, never a place.
+    if (isFamilyPageOnly(e)) lines.push('<span class="badge badge-blue">Family page only</span> <span class="faint">Their status page has their pickup times, extras, the puppy portal link and your messages. They aren\'t on the list: no number, and they show on no list or report.</span>');
+    // Pup selected (E1): they keep their place and number until the pup goes home.
+    if (holdsPlace(e, numbering())) {
+      const places = overallPositions(ctx.kennelEntries, ctx.kennel.id, ctx.programs, numbering());
+      lines.push(`<span class="badge badge-green">Pup selected</span> <strong>#${esc(places.get(e.id))}</strong> of ${esc(places.size)} on the list. <span class="faint">They keep this number until ${placedPup ? esc(dogName(placedPup)) : 'their pup'} goes home (the sale marked Delivered), so nobody behind them moves back if a pup is lost.</span>`);
+    }
+  } else if (e.status === 'withdrawn') {
+    const backedOut = isFamilyPageOnly(e) || e.back_out_request?.decided === 'approved';
+    const pupName = backedOut && e.placed_sale_id ? ctx.dogsById.get(ctx.sales.find((x) => x.id === e.placed_sale_id)?.dog_id)?.call_name : '';
+    lines.push(`${backedOut ? `Backed out${pupName ? ` of ${esc(pupName)}` : ''}` : 'Withdrew'}${e.withdrawn_date ? ` ${esc(fmtDate(e.withdrawn_date))}` : ''}${backedOut && !isFamilyPageOnly(e) ? '; what they paid was kept' : ''}.${isFamilyPageOnly(e) ? ' <span class="badge badge-blue">Family page only</span>' : ''}`);
+    if (canUndoWithdrawal(e, today)) lines.push(`<span class="badge badge-amber">You can undo this until ${esc(fmtDate(addDaysToYMD(e.withdrawn_date, REMOVAL_UNDO_DAYS)))}</span>`);
+  } else if (e.status === 'declined') {
+    lines.push(`Declined${e.declined_date ? ` ${esc(fmtDate(e.declined_date))}` : ''}.`);
+    if (canUndoDecline(e, today)) lines.push(`<span class="badge badge-amber">You can undo this until ${esc(fmtDate(addDaysToYMD(e.declined_date, REMOVAL_UNDO_DAYS)))}</span>`);
+  } else if (e.status === 'expired') {
+    lines.push('The fee wasn\'t received by the pay-by date.');
+    if (canUndoExpire(e, today)) lines.push(`<span class="badge badge-amber">You can undo this until ${esc(fmtDate(addDaysToYMD(e.expired_date, REMOVAL_UNDO_DAYS)))}</span>`);
+  }
+  const others = otherRecordsLine(e);
+  if (others) lines.push(others);
+  return lines;
+}
+
+// A family back on the list (a second pup) has a record per time on it. Each record
+// says the others exist and links them, so she always knows which one she's in.
+function recordLabel(x) {
+  const pup = x.placed_sale_id ? ctx.sales.find((s) => s.id === x.placed_sale_id)?.dog_id : null;
+  const status = x.status === 'placed' ? `Placed${pup ? ` with ${dogName(pup)}` : ''}` : descriptor(WAITLIST_ENTRY_STATUS, x.status).label;
+  return `${status}${x.applied_date ? ` (since ${fmtDate(x.applied_date)})` : ''}`;
+}
+function otherRecordsLine(e) {
+  if (!e.contact_id) return '';
+  const others = ctx.kennelEntries.filter((x) => x.id !== e.id && !x.is_archived && x.contact_id === e.contact_id)
+    .sort((a, b) => String(b.applied_date || b.created_at || '').localeCompare(String(a.applied_date || a.created_at || '')));
+  if (!others.length) return '';
+  return `<span class="badge badge-blue">${others.length + 1} records</span> This family has been on your list ${others.length + 1} times. You're viewing: <strong>${esc(recordLabel(e))}</strong>. Also: ${others.map((x) => `<a href="waitlist-entry.html?id=${encodeURIComponent(x.id)}">${esc(recordLabel(x))} →</a>`).join(' · ')}`;
+}
+
+// --- Communicate… (waitlistEmailUI.communicateDialog) ----------------------------------
+
+// What a message to this family would say now (Message via…), for her to edit: their turn (or the pup
+// they're holding), a fee that's due, or where they are on the list — plus their
+// status page link when the list is online.
+function suggestedText(e) {
+  const first = String(entryName(e, ctx.contact)).trim().split(/\s+/)[0] || 'there';
+  const kennel = ctx.kennel.kennel_name;
+  const link = statusLinkFor(e, ctx.kennel);
+  const linkLine = link ? `\n\nYour waitlist page: ${link}` : '';
+  const open = ctx.kennelOffers.filter((o) => o.entry_id === e.id && o.outcome === 'open' && !o.is_archived);
+  if (open.length) {
+    const by = turnRespondBy(open);
+    const picked = open.find((o) => o.chosen_dog_id);
+    if (picked) {
+      return `Hi ${first}, this is ${kennel}. We're holding ${dogName(picked.chosen_dog_id)} for you! Please send your deposit${by ? ` by ${fmtDate(by)}` : ''} to confirm.${ctx.config.payment_instructions ? `\n\n${ctx.config.payment_instructions}` : ''}${linkLine}`;
+    }
+    const names = open.map((o) => { const l = ctx.litters.find((x) => x.id === o.litter_id); return l ? litterLabel(l) : 'a litter'; }).join(', ');
+    return `Hi ${first}, this is ${kennel}. Good news: it's your turn on our waitlist! You can pick a pup from ${names}. Please let us know your pick and send your deposit${by ? ` by ${fmtDate(by)}` : ''}, or tell us if you'd like to pass this time.${linkLine}`;
+  }
+  if (e.status === 'approved') {
+    const fee = e.fee_amount != null ? fmtMoney(e.fee_amount) : '';
+    return `Hi ${first}, this is ${kennel}. You're approved for our waitlist!${fee ? ` Your application fee of ${fee} is due${e.fee_due_date ? ` by ${fmtDate(e.fee_due_date)}` : ''}, and you join the list as soon as it's received.` : ''}${ctx.config.payment_instructions ? `\n\n${ctx.config.payment_instructions}` : ''}${linkLine}`;
+  }
+  if (e.status === 'active') {
+    const pos = overallPositions(ctx.kennelEntries, ctx.kennel.id, ctx.programs, numbering()).get(e.id);
+    return `Hi ${first}, this is ${kennel} with a waitlist update: you're #${pos} on our list.${linkLine}`;
+  }
+  return `Hi ${first}, this is ${kennel}. ${linkLine}`.trim();
+}
+
+// The emails that fit this family right now (decided 2026-10-10): their status page
+// link and a note from her always; the fee request while approved; "on the list"
+// once on it; "It's your turn" again while they hold an open turn. Emails tied to a
+// moment (a pass, a decision, a closed turn) are offered right after that action,
+// and the reminders are KennelOS's own. [] where they can't be emailed.
+function emailChoices(e) {
+  if (!canEmail()) return [];
+  const out = [{ kind: 'status_link', label: 'Their status page link' }, { kind: 'note', label: 'A note from you' }];
+  if (e.status === 'approved') out.push({ kind: 'approved', label: 'Application approved (fee request)' });
+  if (e.status === 'active') out.push({ kind: 'on_list', label: 'You\'re on the list' });
+  // Getting their pup home (Family Requests plan §5.1): once they have an open sale.
+  if (familySale(e, ctx.sales, ctx.kennelOffers, ctx.kennelEntries)) out.push({ kind: 'transport_options', label: 'Transport options (getting their pup home)' });
+  const open = ctx.offers.filter((o) => o.outcome === 'open' && !o.is_archived && !o.chosen_dog_id);
+  if (open.length) {
+    out.push({ kind: 'offer', label: 'It\'s your turn (send again)', extra: { litterIds: open.map((o) => o.litter_id), respondBy: turnRespondBy(open) } });
+  }
+  return out;
+}
+
+async function onCommunicate() {
+  const e = ctx.entry;
+  const phone = ctx.contact?.phone || e.application?.phone || '';
+  if (await communicateDialog({ entryId: e.id, name: entryName(e, ctx.contact), phone, message: suggestedText(e), emails: emailChoices(e) })) await afterAction();
+}
+
+// Making a new status link (header ⋯ menu): the old one stops working, so it's
+// a safety step, not a way to reach them.
+async function onNewLink() {
+  if (!(await confirmModal({ title: 'Make a new link?', message: 'Their current link stops working as soon as the new one is published, and every browser signed in to their page is signed out. Send them the new link.', confirmLabel: 'Make a new link' }))) return;
+  const { replaceStatusToken } = await import('../data/cloud/cloudWaitlist.js');
+  await replaceStatusToken(ctx.entry.id);
+  await afterAction();
+  await copyLink(statusLinkFor(ctx.entry, ctx.kennel), null, { title: 'Their new status page link' });
+}
+
+// --- From their status page (W2 step 5) ------------------------------------------
+// What the family asked for on their status page (a pause, a narrower listen-only
+// choice, a change to a matching answer: each waits for her Approve / Decline,
+// the same buttons as on Today; a Companion link request waits for Mark sent) and their messages and activity, newest first.
+// Hidden for a family who never used it.
+
+function listenText(r) {
+  if (!isListenOnly(r)) return 'All litters';
+  const names = (list) => (list || []).map(dogName).join(', ');
+  const parents = [r.listen_sire_ids?.length ? `Sires: ${names(r.listen_sire_ids)}` : '', r.listen_dam_ids?.length ? `Dams: ${names(r.listen_dam_ids)}` : '']
+    .filter(Boolean).join(' · ') || 'no parents';
+  return r.listen_mode === 'except' ? `All except ${parents}` : parents;
+}
+
+function pendingRequests(e) {
+  const out = [];
+  if (actions.hasPendingRequest(e, 'pause_request')) {
+    const r = e.pause_request;
+    out.push({ kind: 'pause', text: `Asked ${esc(fmtDate(r.requested_date))} to pause their place until <strong>${esc(fmtDate(r.until))}</strong>.`, note: r.note,
+      hint: 'They keep their place and aren\'t offered pups until then. A pause never counts as a pass.' });
+  }
+  if (actions.hasPendingRequest(e, 'pref_change_request')) {
+    const r = e.pref_change_request;
+    out.push({ kind: 'pref', text: `Asked ${esc(fmtDate(r.requested_date))} to change: <strong>${esc(prefChangeSummary(e, r.changes)) || 'nothing that differs now'}</strong>.`, note: r.note,
+      hint: 'An open offer stays open either way.' });
+  }
+  if (actions.hasPendingRequest(e, 'listen_change_request')) {
+    const r = e.listen_change_request;
+    const except = r.listen_mode === 'except';
+    out.push({ kind: 'listen', text: `Asked ${esc(fmtDate(r.requested_date))} to ${except ? 'wait for' : 'wait only for'}: <strong>${esc(listenText(r))}</strong> <span class="faint">(now: ${esc(listenText(e))})</span>.`, note: '',
+      hint: `Narrower, so it needs you: they wouldn't be offered ${except ? 'those' : 'other'} litters. An open offer stays open.` });
+  }
+  if (actions.hasPendingRequest(e, 'companion_request')) {
+    const r = e.companion_request;
+    out.push({ kind: 'companion', text: `Asked ${esc(fmtDate(r.requested_date))} for <strong>their Companion link</strong>.`, note: r.note,
+      hint: 'Send it from the Companion page (Current families), then mark it sent so their status page says so.',
+      buttons: '<a class="btn btn-sm" href="companion.html?type=family">Open Companion</a><button class="btn btn-sm btn-primary" data-req="companion:sent">Mark sent</button><button class="btn btn-sm" data-req="companion:decline">Decline</button>' });
+  }
+  // Extras asked for or cancelled (Family Requests plan §3): Approve puts it on (or
+  // takes it off) their open sale.
+  const list = kennelChargeList(ctx.kennel);
+  for (const r of pendingExtraRequests(e)) {
+    const item = list.find((x) => x.id === r.list_id);
+    const price = item ? ` (${esc(fmtMoney(item.amount))}; ${esc(planText(chargeRules(item, kennelChargeGroups(ctx.kennel)).payment_plan).toLowerCase())})` : '';
+    out.push({ kind: `extra|${r.id}`, note: r.note,
+      text: r.kind === 'cancel'
+        ? `Asked ${esc(fmtDate(r.requested_date))} to cancel <strong>${esc(r.name)}</strong>.`
+        : `Asked ${esc(fmtDate(r.requested_date))} for <strong>${esc(r.name)}</strong>${price}.`,
+      hint: r.kind === 'cancel' ? 'Approve takes it off their sale.' : item ? 'Approve adds it to their sale at your price-list price, with its payment plan.' : 'It\'s no longer on your price list: add it to the sale by hand, or decline.' });
+  }
+  // Backing out (Family Requests plan §7): her policy's suggestion; she chooses, then
+  // ticks what comes off in the confirm.
+  if (actions.hasPendingRequest(e, 'back_out_request')) {
+    const r = e.back_out_request;
+    const sale = familySale(e, ctx.sales, ctx.kennelOffers, ctx.kennelEntries);
+    const pup = sale ? ctx.dogsById.get(sale.dog_id) : null;
+    const litter = pup ? ctx.litters.find((l) => l.id === pup.litter_id) : null;
+    const s = suggestOutcome(ctx.config, r.reason?.id, ageWeeks(pupBirthDate(pup, litter), r.requested_date));
+    ctx.backOut = { pupName: pup?.call_name || '' };
+    out.push({ kind: 'backout', note: r.note,
+      text: `Asked ${esc(fmtDate(r.requested_date))} to <strong>back out</strong>${ctx.backOut?.pupName ? ` of ${esc(ctx.backOut.pupName)}` : ''}. Their reason: ${esc(r.reason?.label || '')}${r.reason?.text ? `: "${esc(r.reason.text)}"` : ''}.`,
+      hint: s ? `Your policy suggests: ${BACK_OUT_OUTCOMES.find((o) => o.value === s.outcome).label.toLowerCase()}${s.row ? ` (${policyRowText(s.row, backOutReasons(ctx.config))})` : ' (no rule fits)'}.` : '',
+      buttons: `<button class="btn btn-sm${s?.outcome === 'keep' ? ' btn-primary' : ''}" data-req="backout:keep">Keep what they paid</button>
+        ${isFamilyPageOnly(e) ? '' : `<button class="btn btn-sm${s?.outcome === 'move' ? ' btn-primary' : ''}" data-req="backout:move">Put them back in line</button>`}
+        <button class="btn btn-sm" data-req="backout:decline">Decline</button>` });
+  }
+  // Pickup (Family Requests plan §4): a time, a cancel, or their own address.
+  const from = standardLocation(ctx.kennel)?.address || '';
+  for (const r of pendingPickupRequests(e)) {
+    const kind = `pickup|${r.id}`;
+    if (r.kind !== 'address') {
+      out.push({ kind, note: r.note, text: `Asked ${esc(fmtDate(r.requested_date))} ${esc(pickupRequestText(r))}.`,
+        hint: r.kind === 'cancel' ? 'Approve takes their pickup off the pup\'s calendar.' : 'Approve puts it on the pup\'s calendar as their pickup (any other one still to come is replaced).' });
+      continue;
+    }
+    const q = Number.isFinite(r.miles) ? transportQuote(r.miles, ctx.config) : null;
+    out.push({ kind, note: r.note,
+      text: `Asked ${esc(fmtDate(r.requested_date))} to meet at <strong>${esc(r.address)}</strong>${r.date ? ` on ${esc(fmtDate(r.date))}` : ''}${r.start_time ? `${r.date ? ' at' : ', at'} ${esc(timeRange({ start_time: r.start_time }))}` : ''}.`,
+      hint: q ? `${q.text}${q.far ? ' · Farther than your limit: they were told you\'ll be in touch.' : ''}` : 'Not measured yet.',
+      buttons: `<a class="btn btn-sm" href="${esc(mapsLink(from, r.address))}" target="_blank" rel="noopener noreferrer">Open in Maps</a>
+        <button class="btn btn-sm" data-req="${kind}:transport">Send transport options</button>
+        <button class="btn btn-sm" data-req="${kind}:addtransport">Add transport…</button>
+        <button class="btn btn-sm btn-primary" data-req="${kind}:approve">Approve…</button>
+        <button class="btn btn-sm" data-req="${kind}:decline">Decline</button>` });
+  }
+  return out;
+}
+
+// One email she sent them (W2 step 6), with how it went.
+function emailItemHtml(m) {
+  const state = m.status === 'sent' ? `<span class="badge badge-green">Sent</span>`
+    : isHeldEmail(m) ? `<span class="badge badge-amber">Waiting for you</span>`
+    : m.status === 'failed' ? `<span class="badge badge-red">Not sent</span>`
+    : `<span class="badge badge-neutral">Waiting to send</span>`;
+  return `<li style="padding:6px 0;border-top:1px solid var(--border);">
+      <div class="faint" style="font-size:0.85em;">${esc(fmtDate(String(m.sent_at || m.at).slice(0, 10)))} · ${m.via === 'own' ? 'Sent by you (your own email or messages)' : `Email from you ${state}`}</div>
+      <div><strong>${esc(m.subject)}</strong></div>
+      <details><summary class="faint">The message</summary><div>${multiline(m.body)}</div></details>
+      ${isHeldEmail(m) ? `<p class="field-hint" style="margin:2px 0;">${esc(emailErrorText(m.error))} <button class="btn btn-sm btn-primary" data-email-retry="${esc(m.id)}">Send as written</button> <button class="btn btn-sm" data-email-drop="${esc(m.id)}">Don't send</button></p>`
+        : m.status === 'failed' && m.error !== 'not_sent' ? `<p class="field-hint" style="margin:2px 0;">${esc(emailErrorText(m.error))} <button class="btn btn-sm" data-email-retry="${esc(m.id)}">Retry</button></p>`
+          : m.status === 'failed' ? `<p class="field-hint" style="margin:2px 0;">${esc(emailErrorText(m.error))}</p>` : ''}
+    </li>`;
+}
+
+// Their status-page requests (Interact, top): each waits for her Approve / Decline.
+// Where they live (Family Requests plan §4.1), when her distance rule is on or she
+// knows: the place, the miles, and her choice of whether they may suggest their own
+// meetup place.
+function homeHtml(e) {
+  if (!locationRuleOn(ctx.config) && !e.home_place && typeof e.own_place_override !== 'boolean') return '';
+  const where = e.home_place
+    ? `Lives in <strong>${esc(e.home_place)}</strong>${Number.isFinite(e.home_miles) ? `, about ${Math.round(e.home_miles)} miles from your standard location` : ' (distance not measured)'}.`
+    : 'Where they live isn\'t known yet; their status page asks once their pup is picked.';
+  // What her rule alone says for them, shown under "Use my distance rule".
+  const rule = ownPlaceAllowed({ ...e, own_place_override: null }, ctx.config);
+  const min = Number(ctx.config.transport_min_home_miles) || 0;
+  const ruleSays = !locationRuleOn(ctx.config) ? 'No distance set on Pickup & transport, so any family can suggest a place.'
+    : rule === true ? `They live at least ${min} miles away, so they can suggest a place.`
+      : rule === false ? `They live closer than ${min} miles, so they choose from your pickup times.`
+        : e.home_place ? 'The distance couldn\'t be measured, so for now they choose from your pickup times. Choose for them here if you like.'
+          : `Until you know where they live, they choose from your pickup times (your rule: at least ${min} miles away).`;
+  const current = typeof e.own_place_override === 'boolean' ? String(e.own_place_override) : '';
+  const opt = (value, label) => `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
+  return `<section class="card"><h2 style="margin-top:0;">Pickup</h2><p style="margin:0;">${where}</p>
+    <div class="field" style="margin-top:10px;">
+      <label for="own-place">Can they suggest their own meetup place?</label>
+      <select id="own-place">${opt('', 'Use my distance rule')}${opt('true', 'Let them suggest a place')}${opt('false', 'Only my pickup times')}</select>
+      <span class="field-hint">${current === 'true' ? 'Their status page lets them ask you to meet at an address of their own, whatever your rule says.'
+        : current === 'false' ? 'Their status page shows only your pickup times at your listed places, whatever your rule says.'
+          : ruleSays}</span>
+    </div></section>`;
+}
+
+function requestsHtml(e) {
+  const requests = pendingRequests(e);
+  if (!requests.length) return homeHtml(e);
+  return `${homeHtml(e)}<section class="card"><h2 style="margin-top:0;">Waiting for you <span class="badge badge-amber">${requests.length}</span></h2>
+    ${requests.map((r) => `<div class="row-between" style="gap:8px;flex-wrap:wrap;padding:8px 0;border-top:1px solid var(--border);">
+      <div><p style="margin:0;">${r.text}</p>${r.note ? `<p class="faint" style="margin:2px 0 0;">They said: "${esc(r.note)}"</p>` : ''}<p class="field-hint" style="margin:2px 0 0;">${esc(r.hint)}</p></div>
+      <span class="pill-row">${r.buttons || `<button class="btn btn-sm btn-primary" data-req="${r.kind}:approve">Approve</button><button class="btn btn-sm" data-req="${r.kind}:decline">Decline</button>`}</span>
+    </div>`).join('')}</section>`;
+}
+
+function wireRequests(root) {
+  const e = ctx.entry;
+  const run = (fn) => fn().then(afterAction).catch((err) => showError(err.message || String(err)));
+  // A decision on their request, then the email saying so (W2 step 6).
+  const decide = (field, fn, approved) => async () => {
+    const request = e[field];
+    await fn(e.id);
+    await afterAction();
+    await emailThem(approved ? 'request_approved' : 'request_declined', { request: { field, request } });
+  };
+  const handlers = {
+    'pause:approve': decide('pause_request', actions.approvePauseRequest, true), 'pause:decline': decide('pause_request', actions.declinePauseRequest, false),
+    'pref:approve': decide('pref_change_request', actions.approvePrefChange, true), 'pref:decline': decide('pref_change_request', actions.declinePrefChange, false),
+    'listen:approve': decide('listen_change_request', actions.approveListenChange, true), 'listen:decline': decide('listen_change_request', actions.declineListenChange, false),
+    'companion:sent': () => actions.markCompanionLinkSent(e.id), 'companion:decline': () => actions.declineCompanionRequest(e.id)
+  };
+  // An extras request (data-req "extra|<request id>:approve"), then the email saying so.
+  const extra = (requestId, approved) => async () => {
+    const request = (e.extra_requests || []).find((r) => r.id === requestId);
+    // A cancel takes the extra off: its training stay, if one is logged, is offered for removal.
+    const before = approved && request?.kind === 'cancel' ? await linkedStays(request.charge_id) : [];
+    const res = approved ? await actions.approveExtraRequest(e.id, requestId) : await actions.declineExtraRequest(e.id, requestId);
+    if (approved) await afterTrainingApproval(res, before);
+    await afterAction();
+    await emailThem(approved ? 'request_approved' : 'request_declined', { request: { field: 'extra_request', request } });
+  };
+  root.querySelector('#own-place')?.addEventListener('change', (ev) => {
+    const v = ev.target.value;
+    run(() => actions.setOwnPlaceOverride(e.id, v === '' ? null : v === 'true'));
+  });
+  // A pickup request (data-req "pickup|<request id>:approve|decline|transport").
+  const pickup = (requestId, decision) => async () => {
+    const request = (e.pickup_requests || []).find((r) => r.id === requestId);
+    if (decision === 'transport') return emailThem('transport_options', Number.isFinite(request?.miles) ? { distance: request.miles } : {});
+    if (decision === 'addtransport') return onAddCharges('transport', { miles: Number.isFinite(request?.miles) ? request.miles : null, to: request.address });
+    if (decision === 'decline') { await actions.declinePickupRequest(e.id, requestId); await afterAction(); return emailThem('request_declined', { request: { field: 'pickup_request', request } }); }
+    if (request.kind === 'address') { if (await approveAddress(request)) await emailThem('request_approved', { request: { field: 'pickup_request', request } }); return; }
+    const res = await actions.approvePickupRequest(e.id, requestId);
+    await afterPickupApproval(res);
+    await afterAction();
+    return emailThem('request_approved', { request: { field: 'pickup_request', request } });
+  };
+  root.querySelectorAll('[data-req]').forEach((btn) => btn.addEventListener('click', () => {
+    const [kind, decision] = btn.dataset.req.split(':');
+    if (kind.startsWith('extra|')) return run(extra(kind.slice(6), decision === 'approve'));
+    if (kind.startsWith('pickup|')) return run(pickup(kind.slice(7), decision));
+    if (kind === 'backout') return run(() => onBackOut(decision));
+    return run(handlers[btn.dataset.req]);
+  }));
+}
+
+// Backing out (Family Requests plan §7.2): Decline here; Keep or Put them back in line
+// open the one back-out confirm (waitlistUI.backOutDialog).
+async function onBackOut(decision) {
+  const e = ctx.entry;
+  const request = e.back_out_request;
+  if (decision === 'decline') {
+    if (!(await confirmModal({ title: 'Decline their request?', message: 'Nothing changes: their sale stays as it is. Let them know why.', confirmLabel: 'Decline' }))) return;
+    await actions.declineBackOut(e.id);
+    await afterAction();
+    return emailThem('request_declined', { request: { field: 'back_out_request', request } });
+  }
+  if (!['keep', 'move'].includes(decision)) return;
+  // The one back-out confirm (waitlistUI.backOutDialog), which offers its email too.
+  if (await backOutDialog({ entryId: e.id, outcome: decision })) await afterAction();
+}
+
+// After approving a time or a cancel: nothing she typed on the sale changes without
+// her say. Her own boarding charge was kept: replace it with standard boarding?
+// A transport fee is still on the sale: remove it?
+async function afterPickupApproval(res) {
+  const b = res.boardingKept;
+  if (b && await confirmModal({
+    title: 'Replace your boarding charge?',
+    message: `This pickup date has standard boarding: ${b.days} day${b.days === 1 ? '' : 's'} at ${fmtMoney(b.rate)} = ${fmtMoney(b.amount)}. The sale already has your own boarding charge (${boardingChargeText(res.sale, fmtMoney)}), so it was kept.`,
+    confirmLabel: 'Use standard boarding', cancelLabel: 'Keep mine'
+  })) await actions.applyPickupBoarding(res.sale.id, b, b.rate);
+  if (res.transportFeeLeft && await confirmModal({
+    title: 'Remove the transport fee?',
+    message: `Their sale still has a ${fmtMoney(res.transportFeeLeft)} transport fee from an earlier drop-off plan.`,
+    confirmLabel: 'Remove it', cancelLabel: 'Keep it'
+  })) await actions.clearTransportFee(res.sale.id);
+}
+
+// Approving a family's own address (Family Requests plan §4): the day, time, how
+// (Ground transport, Flight nanny…) and the transport fee, suggested from the miles
+// (Get driving miles when they weren't measured). → true once approved.
+async function approveAddress(request) {
+  const e = ctx.entry;
+  const from = standardLocation(ctx.kennel)?.address || '';
+  let miles = Number.isFinite(request.miles) ? request.miles : null;
+  const sales = e.contact_id ? await saleRepo.getByBuyer(e.contact_id) : [];
+  const sale = familySale(e, sales, ctx.kennelOffers, ctx.kennelEntries);
+  const quote = () => (miles != null ? transportQuote(miles, ctx.config) : null);
+  // A fee already on the sale starts in the box: replacing it is her choice.
+  const current = Number(sale?.transport_fee) > 0 ? Number(sale.transport_fee) : null;
+  return formModal({
+    title: 'Approve their meetup place',
+    confirmLabel: 'Approve',
+    bodyHtml: `<p style="margin-top:0;">${esc(request.address)} <a href="${esc(mapsLink(from, request.address))}" target="_blank" rel="noopener noreferrer">Open in Maps</a></p>
+      <div class="form-grid">
+        <div class="field"><label for="pa-date">Day</label><input id="pa-date" type="date" value="${esc(request.date || '')}"></div>
+        <div class="field"><label for="pa-time">Time</label><input id="pa-time" type="text" placeholder="e.g. 2:00 PM" value="${esc(request.start_time ? timeRange({ start_time: request.start_time }) : '')}"></div>
+        <div class="field"><label for="pa-method">How</label><select id="pa-method">${PLACEMENT_METHODS.map((m) => `<option${m === 'Ground transport' ? ' selected' : ''}>${esc(m)}</option>`).join('')}</select></div>
+        <div class="field"><label for="pa-miles">Miles, one way</label><span style="display:inline-flex; gap:6px; align-items:center;"><input id="pa-miles" type="number" min="0" step="0.1" value="${miles ?? ''}" style="width:7em;">${from ? '<button type="button" class="btn btn-sm" id="pa-measure">Get driving miles</button>' : ''}</span></div>
+        <div class="field"><label for="pa-fee">Transport fee</label>
+          <span style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"><input id="pa-fee" type="number" min="0" step="0.01" value="${current != null ? current : (quote()?.fee ?? '')}" style="width:9em;"><button type="button" class="btn btn-sm" id="pa-use"${quote()?.fee != null ? '' : ' hidden'}>Use ${esc(fmtMoney(quote()?.fee ?? 0))}</button></span>
+          ${current != null ? `<span class="field-hint">On the sale now: ${esc(fmtMoney(current))}. Approving saves what's in the box.</span>` : ''}
+          <span class="field-hint" id="pa-working">${esc(quote()?.text || '')}</span></div>
+      </div>
+      <p class="field-hint">Approving puts the drop-off on the pup's calendar (any other pickup still to come is replaced) and the fee on their sale.</p>`,
+    onConfirm: async (o) => {
+      await actions.approvePickupRequest(e.id, request.id, {
+        when: o.querySelector('#pa-date').value, time: o.querySelector('#pa-time').value.trim(),
+        method: o.querySelector('#pa-method').value, fee: o.querySelector('#pa-fee').value
+      });
+      await afterAction();
+    }
+  }, (o) => {
+    const use = o.querySelector('#pa-use');
+    const refresh = () => {
+      const v = o.querySelector('#pa-miles').value;
+      miles = v === '' ? null : Number(v);
+      const q = quote();
+      o.querySelector('#pa-working').textContent = q?.text || '';
+      use.hidden = q?.fee == null;
+      if (q?.fee != null) use.textContent = `Use ${fmtMoney(q.fee)}`;
+      // With nothing on the sale yet, the suggestion fills the box; otherwise she taps Use.
+      if (current == null && q?.fee != null) o.querySelector('#pa-fee').value = q.fee;
+    };
+    use.addEventListener('click', () => { const q = quote(); if (q?.fee != null) o.querySelector('#pa-fee').value = q.fee; });
+    o.querySelector('#pa-miles').addEventListener('change', refresh);
+    o.querySelector('#pa-measure')?.addEventListener('click', async (ev) => {
+      ev.target.disabled = true;
+      try {
+        const { drivingMiles } = await import('../data/cloud/cloudWaitlist.js');
+        const d = await drivingMiles(from, request.address);
+        o.querySelector('#pa-miles').value = d.miles;
+        refresh();
+      } catch (err) {
+        o.querySelector('#pa-working').textContent = `Couldn't measure. ${milesErrorText(err)} Use Open in Maps and type the miles.`;
+      }
+      ev.target.disabled = false;
+    });
+  });
+}
+
+// Add charges (owner, 2026-11-15): an extra (from her price list, or typed), the
+// transport fee or boarding on their open sale, with or without a request from them
+// (actions.addSaleCharge). Then the schedule question (afterAction) and, for a stay
+// extra or boarding, the stay and pickup (stayPickupUI). No email: their status page
+// shows it. `start`: the choice it opens on; `miles` / `to`: a place they asked for.
+async function onAddCharges(start = 'extra', { miles = null, to = '' } = {}) {
+  const e = ctx.entry;
+  const sales = e.contact_id ? await saleRepo.getByBuyer(e.contact_id) : [];
+  const sale = familySale(e, sales, ctx.kennelOffers, ctx.kennelEntries);
+  if (!sale) throw new Error('They have no open sale to add a charge to.');
+  const onSale = new Set(saleExtraCharges(sale).map((c) => c.list_id).filter(Boolean));
+  const list = kennelChargeList(ctx.kennel);
+  const from = standardLocation(ctx.kennel)?.address || '';
+  const dest = to || e.home_place || '';
+  let oneWay = Number.isFinite(miles) ? miles : Number.isFinite(e.home_miles) ? e.home_miles : null;
+  const quote = () => (oneWay != null ? transportQuote(oneWay, ctx.config) : null);
+  const curFee = Number(sale.transport_fee) > 0 ? Number(sale.transport_fee) : null;
+  const curRate = Number(sale.deferred_boarding_amount) > 0 ? Number(sale.deferred_boarding_amount) : null;
+  const rate = curRate ?? (Number(ctx.config.boarding_rate) > 0 ? Number(ctx.config.boarding_rate) : '');
+  const opt = (p) => `<option value="${esc(p.id)}"${onSale.has(p.id) ? ' disabled' : ''}>${esc(p.label)} (${esc(fmtMoney(p.amount))})${p.boarding_days ? ` · ${p.boarding_days}-day stay` : ''}${onSale.has(p.id) ? ' · on their sale' : ''}</option>`;
+  const extraOptions = groupedChargeList(list).map(({ group, items }) => (group ? `<optgroup label="${esc(group)}">${items.map(opt).join('')}</optgroup>` : items.map(opt).join(''))).join('');
+  const radio = (v, label) => `<label class="check-inline" style="gap:6px;"><input type="radio" name="ac-kind" value="${v}"${v === start ? ' checked' : ''}> ${label}</label>`;
+  let result = null;
+  const ok = await formModal({
+    title: 'Add a charge to their sale',
+    confirmLabel: 'Add to the sale',
+    bodyHtml: `<div role="radiogroup" aria-label="What to add" style="display:flex; gap:14px; flex-wrap:wrap; margin-bottom:10px;">${radio('extra', 'Extra')}${radio('transport', 'Transport')}${radio('boarding', 'Boarding')}</div>
+      <div data-ac="extra">
+        <div class="field"><label for="ac-extra">Extra</label><select id="ac-extra">${extraOptions}<option value="custom">Something else…</option></select></div>
+        <p class="field-hint" id="ac-extra-hint"></p>
+        <div class="form-grid" id="ac-custom" hidden>
+          <div class="field"><label for="ac-label">Name</label><input id="ac-label" type="text" maxlength="120" placeholder="e.g. Gold photo package"></div>
+          <div class="field"><label for="ac-amount">Amount</label><input id="ac-amount" type="number" min="0" step="0.01"></div>
+        </div>
+      </div>
+      <div data-ac="transport" hidden>
+        ${dest ? `<p style="margin-top:0;">To ${esc(dest)}${from ? ` <a href="${esc(mapsLink(from, dest))}" target="_blank" rel="noopener noreferrer">Open in Maps</a>` : ''}</p>` : ''}
+        <div class="form-grid">
+          <div class="field"><label for="ac-miles">Miles, one way</label><span style="display:inline-flex; gap:6px; align-items:center;"><input id="ac-miles" type="number" min="0" step="0.1" value="${oneWay ?? ''}" style="width:7em;">${from && dest ? '<button type="button" class="btn btn-sm" id="ac-measure">Get driving miles</button>' : ''}</span></div>
+          <div class="field"><label for="ac-fee">Transport fee</label><input id="ac-fee" type="number" min="0" step="0.01" value="${curFee ?? (quote()?.fee ?? '')}" style="width:9em;"></div>
+        </div>
+        <span class="field-hint" id="ac-working">${esc(quote()?.text || '')}</span>
+        ${curFee != null ? `<p class="field-hint">On the sale now: ${esc(fmtMoney(curFee))}. Saving replaces it ($0 takes it off).</p>` : ''}
+      </div>
+      <div data-ac="boarding" hidden>
+        <div class="form-grid">
+          <div class="field"><label for="ac-rate">Rate</label><input id="ac-rate" type="number" min="0" step="0.01" value="${esc(rate)}" style="width:8em;"></div>
+          <div class="field"><label for="ac-per">Per</label><select id="ac-per">${BOARDING_FREQUENCY_OPTIONS.map((f) => `<option${f === (sale.deferred_boarding_frequency || 'Day') ? ' selected' : ''}>${esc(f)}</option>`).join('')}</select></div>
+          <div class="field"><label for="ac-count">How many</label><input id="ac-count" type="number" min="1" step="1" value="${esc(sale.deferred_boarding_duration_days || '')}" style="width:6em;"></div>
+        </div>
+        <p class="field-hint">${curRate != null ? `On the sale now: ${esc(boardingChargeText(sale, fmtMoney))}. Saving replaces it.` : 'Your standard boarding rate (Pickup & transport) starts in the box.'}</p>
+      </div>
+      <p class="field-hint" style="margin-bottom:0;">It goes on their sale as if you'd added it on the Sale page, and their status page shows it. Nothing is emailed.</p>`,
+    onConfirm: async (o) => {
+      const kind = o.querySelector('input[name="ac-kind"]:checked').value;
+      const v = (id) => o.querySelector(id).value;
+      const pick = v('#ac-extra');
+      const add = kind === 'extra' ? (pick === 'custom' ? { kind, label: v('#ac-label'), amount: v('#ac-amount') } : { kind, listId: pick })
+        : kind === 'transport' ? { kind, fee: v('#ac-fee') }
+          : { kind, rate: v('#ac-rate'), per: v('#ac-per'), count: v('#ac-count') };
+      result = await actions.addSaleCharge(e.id, add);
+    }
+  }, (o) => {
+    const show = () => {
+      const kind = o.querySelector('input[name="ac-kind"]:checked').value;
+      o.querySelectorAll('[data-ac]').forEach((p) => { p.hidden = p.dataset.ac !== kind; });
+    };
+    o.querySelectorAll('input[name="ac-kind"]').forEach((r) => r.addEventListener('change', show));
+    const extra = o.querySelector('#ac-extra');
+    const first = [...extra.options].find((x) => !x.disabled);
+    if (first) extra.value = first.value;
+    const hint = () => {
+      const item = list.find((p) => p.id === extra.value);
+      o.querySelector('#ac-custom').hidden = extra.value !== 'custom';
+      const plan = item ? planText(chargeRules(item, kennelChargeGroups(ctx.kennel)).payment_plan) : '';
+      o.querySelector('#ac-extra-hint').textContent = item ? [plan ? `Paid ${plan}.` : 'Paid with the balance.', item.boarding_days ? `The pup stays ${item.boarding_days} days for it: you'll be offered the stay and the pickup next.` : ''].filter(Boolean).join(' ') : '';
+    };
+    extra.addEventListener('change', hint);
+    hint();
+    const refresh = () => {
+      const val = o.querySelector('#ac-miles').value;
+      oneWay = val === '' ? null : Number(val);
+      const q = quote();
+      o.querySelector('#ac-working').textContent = q?.text || '';
+      if (curFee == null && q?.fee != null) o.querySelector('#ac-fee').value = q.fee;
+    };
+    o.querySelector('#ac-miles').addEventListener('change', refresh);
+    o.querySelector('#ac-measure')?.addEventListener('click', async (ev) => {
+      ev.target.disabled = true;
+      try {
+        const { drivingMiles } = await import('../data/cloud/cloudWaitlist.js');
+        o.querySelector('#ac-miles').value = (await drivingMiles(from, dest)).miles;
+        refresh();
+      } catch (err) {
+        o.querySelector('#ac-working').textContent = `Couldn't measure. ${milesErrorText(err)} Use Open in Maps and type the miles.`;
+      }
+      ev.target.disabled = false;
+    });
+    show();
+  });
+  if (!ok || !result) return;
+  await afterAction();
+  const stays = addedStays(result.before, result.sale);
+  if (stays && await offerStayAndPickup({ sale: result.sale, ...stays })) { await reload(); renderAll(); }
+}
+
+// Training stays (Family Requests plan §6): a package the pup stays for is offered
+// as a boarding stay once it's approved; cancelling it offers to remove the stay.
+async function linkedStays(chargeId) {
+  if (!chargeId) return [];
+  const sales = ctx.entry.contact_id ? await saleRepo.getByBuyer(ctx.entry.contact_id) : [];
+  const sale = sales.find((x) => (x.extra_charges || []).some((c) => c.id === chargeId));
+  if (!sale?.dog_id) return [];
+  const charge = sale.extra_charges.find((c) => c.id === chargeId);
+  return trainingStaysFor(sale, charge, await eventRepo.getForSubject('dog', sale.dog_id));
+}
+
+async function afterTrainingApproval(res, staysBefore) {
+  if (res.kind === 'cancel') {
+    for (const stay of staysBefore) {
+      if (await confirmModal({ title: 'Remove the training stay?', message: `${stay.title || 'The stay'} (${fmtDate(stay.event_date)}${stay.event_end_date ? ` to ${fmtDate(stay.event_end_date)}` : ''}) is still on the pup's calendar.`, confirmLabel: 'Remove the stay', cancelLabel: 'Keep it' })) {
+        await eventRepo.archive(stay.id);
+      }
+    }
+    return;
+  }
+  // A stay extra: its stay and the pickup the day after, in one dialog (stayPickupUI).
+  if (!res.boardingDays || !res.sale?.dog_id || !res.charge) return;
+  await offerStayAndPickup({ sale: res.sale, chargeIds: [res.charge.id] });
+}
+
+// Their messages, their status-page activity and the emails she sent (History),
+// newest first.
+const unreadCount = (e) => (e.messages || []).filter((m) => m.from !== 'breeder' && !m.read).length;
+function messagesHtml(e) {
+  const messages = [...(e.messages || [])].reverse();
+  if (!messages.length) return '';
+  const unread = unreadCount(e);
+  const items = messages.slice(0, 50).map((m) => (m.from === 'breeder' ? emailItemHtml(m) : `<li style="padding:6px 0;border-top:1px solid var(--border);">
+      <div class="faint" style="font-size:0.85em;">${esc(fmtDate(String(m.at).slice(0, 10)))} · ${m.kind === 'message' ? 'Message' : m.from === 'server' ? 'KennelOS, while your phone was off' : 'On their status page'}${m.read ? '' : ' <span class="badge badge-blue">New</span>'}</div>
+      <div>${multiline(m.body)}</div></li>`)).join('');
+  return `<section class="card">
+    <div class="row-between" style="gap:8px;flex-wrap:wrap;"><h2 style="margin:0;">Messages and emails</h2>
+      ${unread ? '<button class="btn btn-sm" data-msgs="read">Mark read</button>' : ''}</div>
+    <ul style="list-style:none;margin:8px 0 0;padding:0;">${items}</ul>${messages.length > 50 ? `<p class="faint">Showing the newest 50 of ${messages.length}.</p>` : ''}
+    <p class="field-hint" style="margin-bottom:0;">${canEmail() ? 'Write to them with <strong>Communicate…</strong> on Interact; they answer on their status page.' : 'Reply by email, text or Messenger.'}</p>
+  </section>`;
+}
+
+function wireMessages(root) {
+  const e = ctx.entry;
+  const run = (fn) => fn().then(afterAction).catch((err) => showError(err.message || String(err)));
+  root.querySelector('[data-msgs="read"]')?.addEventListener('click', () => run(() => actions.markMessagesRead(e.id)));
+  root.querySelectorAll('[data-email-retry]').forEach((btn) => btn.addEventListener('click', () => run(async () => {
+    await retryEmail(e.id, btn.dataset.emailRetry);
+    syncSoon();
+  })));
+  root.querySelectorAll('[data-email-drop]').forEach((btn) => btn.addEventListener('click', () => run(() => dropEmail(e.id, btn.dataset.emailDrop))));
+}
+
+// Put them back in line after a lost pup (the same dialog the Sale page asks).
+async function onRestore() {
+  const sale = lostSale(ctx.entry);
+  if (!sale) return;
+  if (await restoreLostPupDialog({ saleId: sale.id })) await afterAction();
+}
+
+// End their sale here (the pup died, failed a health check, they backed out, …):
+// sets the sale's status as the Sale page would, then asks the same next steps.
+async function onEndSale() {
+  const found = endableSale(ctx.entry);
+  if (!found) return;
+  const ended = await endSaleDialog({
+    saleId: found.sale.id, name: entryName(ctx.entry, ctx.contact), pupName: dogName(found.sale.dog_id), placed: found.placed,
+    onError: showError
+  });
+  if (ended) await afterAction();
+}
+
+async function afterAction() {
+  clearError();
+  const before = ctx.payments?.sale || null;
+  await reload();
+  renderAll();
+  // A transport fee, boarding or an extra just added to their sale by what she did
+  // here (Payment Schedule plan D17): show the schedule and ask whether to adjust it.
+  const after = ctx.payments?.sale || null;
+  if (before && after && before.id === after.id
+    && await askAboutNewFees({ before, after, savedList: savedSchedules(ctx.kennel) })) {
+    await reload();
+    renderAll();
+  }
+}
+
+// Their sale's payments: the deposit, each due date, extras on their own dates and the
+// money received, with Record a payment and the schedule editor.
+function paymentsHtml() {
+  if (!ctx.payments) return '';
+  return `<section class="card" data-payments>${paymentsCardHtml(ctx.payments, {
+    accountsById: new Map(ctx.paymentAccounts.map((a) => [a.id, a])),
+    finalMethods: ctx.kennel?.final_payment_methods || ''
+  })}<p class="field-hint" style="margin:8px 0 0;"><a href="sale.html?id=${encodeURIComponent(ctx.payments.sale.id)}">Open the sale</a></p></section>`;
+}
+
+// --- Emails to families (W2 step 6) -------------------------------------------------
+// After an action a family should hear about, she sees the email (from her
+// templates) and sends, edits or skips it. Only where their list is online and
+// they have an address; elsewhere the actions say to tell them yourself.
+const canEmail = () => kennelEmailsOn(ctx.kennel) && Boolean(familyEmail(ctx.entry, ctx.contact));
+const emailHint = () => (canEmail() ? 'You\'ll see the email to them before it\'s sent.' : 'Nothing is sent to the family; let them know yourself.');
+
+async function emailFamilies(specs) {
+  if (await offerEmails(specs)) await afterAction();
+}
+
+const emailThem = (kind, extra = {}) => emailFamilies([{ entryId: ctx.entry.id, kind, extra }]);
+
+// Plain-text lines for the offers an action voided or made (describeOfferChanges),
+// read against the freshly reloaded context.
+const offerChangeLines = (res) => describeOfferChanges(res || {}, {
+  nameOf: (entryId) => familyNameById(entryId),
+  litterOf: (litterId) => { const l = ctx.litters.find((x) => x.id === litterId); return l ? litterLabel(l) : 'A litter'; },
+  fmtDate
+});
+
+// After the family leaves the list: say which of their offers closed and who the
+// turn moved to, so she knows who to contact. Silent when they held none.
+async function reportLeaving(res) {
+  const lines = offerChangeLines(res);
+  if (lines.length) await alertModal({ title: 'Offers updated', message: lines.join('\n\n') });
+}
+
+// The open offers this family holds, for the leave-the-list confirmations.
+function openOfferWarning() {
+  const open = ctx.offers.filter((o) => o.outcome === 'open' && !o.is_archived);
+  if (!open.length) return '';
+  const names = open.map((o) => { const l = ctx.litters.find((x) => x.id === o.litter_id); return l ? litterLabel(l) : 'a litter'; });
+  return ` Their open offer on ${names.join(', ')} will be voided (not a pass) and offered to the next family.`;
+}
+
+// After a family joins (or rejoins) the list: no offer is made for them
+// automatically (waitlistActions header), so say where they're next in line now.
+async function reportNextInLine() {
+  if (ctx.entry.status !== 'active') return;
+  const mine = litterChoices(ctx.entry).filter((c) => !c.blocked && c.next && c.next.entry.id === ctx.entry.id);
+  if (!mine.length) return;
+  const name = entryName(ctx.entry, ctx.contact);
+  const list = mine.map((c) => `${litterLabel(c.litter)} (${c.litter.picks_opened_date ? 'picks open' : 'picks not open yet'})`).join(', ');
+  await alertModal({ title: `${name} is next in line`, message: `${name} is next for ${list}. No offer has been made. Use "Offer pups…" on Interact when you're ready.` });
+}
+
+// --- Before she reviews: the do-not-sell list and a suggested program ------------
+
+// The do-not-sell warning for this family ('' when they don't match).
+const dnsMatches = (e) => entryDoNotSellMatches(e, ctx.doNotSell);
+
+function dnsWarningHtml(e) {
+  const m = dnsMatches(e);
+  if (!m.length) return '';
+  return `<section class="card dns-alert" role="alert">
+      <p style="margin:0;"><span class="badge badge-red">Do not sell</span> ${esc(doNotSellWarning(m))}</p>
+      <p class="field-hint" style="margin:6px 0 0;">Only a warning: nothing is declined for you. <a href="do-not-sell.html">Your do-not-sell list →</a></p>
+    </section>`;
+}
+
+// "This may be the same family as …": another open application or family on this
+// list that shares their email, phone or name (applicationDuplicates.js). Only a
+// suggestion: Same family… opens the merge (she confirms and picks which to keep);
+// Not the same is remembered on this device.
+function duplicateMatches(e) {
+  const contactsById = new Map(ctx.contacts.map((c) => [c.id, c]));
+  return applicationMatches(e, ctx.kennelEntries, { contactsById, dismissed: isPairDismissed }).slice(0, 3);
+}
+
+function duplicatesHtml(e) {
+  const contactsById = new Map(ctx.contacts.map((c) => [c.id, c]));
+  return duplicateMatches(e).map((m) => {
+    const o = m.entry;
+    const status = descriptor(WAITLIST_ENTRY_STATUS, o.status).label.toLowerCase();
+    return `<section class="card dup-alert">
+      <p style="margin:0;"><span class="badge badge-amber">${m.strength === 'certain' ? 'Likely a duplicate' : 'Maybe a duplicate'}</span>
+        This may be the same family as <a href="waitlist-entry.html?id=${encodeURIComponent(o.id)}">${esc(entryName(o, contactsById.get(o.contact_id)))}</a> (applied ${esc(fmtDate(o.applied_date))}, ${esc(status)}): ${esc(matchReasonText(m))}.</p>
+      <div class="pill-row" style="margin-top:8px;">
+        <button class="btn btn-sm" data-dup-same="${esc(o.id)}">Same family…</button>
+        <button class="btn btn-sm" data-dup-not="${esc(o.id)}">Not the same</button>
+      </div>
+    </section>`;
+  }).join('');
+}
+
+function wireDuplicates(root) {
+  const fail = (err) => showError(err.message || String(err));
+  root.querySelectorAll('[data-dup-same]').forEach((b) => b.addEventListener('click', () => onSameFamily(b.dataset.dupSame).catch(fail)));
+  root.querySelectorAll('[data-dup-not]').forEach((b) => b.addEventListener('click', () => {
+    markNotSame(ctx.entry.id, b.dataset.dupNot);
+    renderAll();
+  }));
+}
+
+// Merge a duplicate application (picked, or `otherId` suggested). When this page's
+// entry is the one deleted, the kept one's page opens.
+async function onPortalEarly() {
+  const { startPortalEarly } = await import('../assets/portalEarlyUI.js');
+  const sale = ctx.portalEarly?.sale;
+  if (!sale) return;
+  if (await startPortalEarly(sale, { buyer: ctx.contact?.name || '', pup: ctx.dogsById.get(sale.dog_id)?.call_name || '' })) {
+    await reload();
+    renderAll();
+  }
+}
+
+async function onSameFamily(otherId = null) {
+  const res = await sameFamilyDialog({ entryId: ctx.entry.id, otherId });
+  if (!res) return;
+  await alertModal({ title: 'Merged', message: mergedMessage(res) });
+  if (res.droppedId === ctx.entry.id) {
+    location.href = `waitlist-entry.html?id=${encodeURIComponent(res.keptId)}`;
+    return;
+  }
+  await afterAction();
+}
+
+// "Add to [program]?" as a Yes / No dropdown, one per program their answers suggest
+// (programSuggest.js): open applications and approved ones still waiting for the fee.
+const suggestions = (e) => programSuggestions(e, ctx.form, ctx.programs);
+
+function suggestionSelect(s, attr = 'data-suggest') {
+  return `<select ${attr}="${esc(s.program.id)}" aria-label="Add to ${esc(s.program.name)}?">
+      <option value="">Choose…</option><option value="yes">Yes</option><option value="no">No</option></select>`;
+}
+
+function suggestionsHtml(e) {
+  const list = suggestions(e);
+  if (!list.length) return '';
+  const current = ctx.programs.get(e.waitlist_program_id) || null;
+  return list.map((s) => `<section class="card program-suggest">
+      <label class="program-suggest-row"><span>${programIconHtml(s.program) ? `${programIconHtml(s.program)} ` : ''}<strong>Add to ${esc(s.program.name)}?</strong></span>
+        ${suggestionSelect(s)}</label>
+      <p class="field-hint" style="margin:4px 0 0;">${esc(suggestionWhy(s, current))}${e.status === 'approved' ? ' Asked until their fee is received.' : ''}</p>
+    </section>`).join('');
+}
+
+function wireSuggestions(root) {
+  root.querySelectorAll('[data-suggest]').forEach((sel) => sel.addEventListener('change', () => {
+    const answer = sel.value;
+    if (!answer) return;
+    const programId = sel.dataset.suggest;
+    sel.disabled = true;
+    (answer === 'yes' ? onAddSuggested(programId) : actions.declineSuggestedProgram(ctx.entry.id, programId).then(afterAction))
+      .catch((err) => { sel.disabled = false; sel.value = ''; showError(err.message || String(err)); });
+  }));
+}
+
+async function onAddSuggested(programId) {
+  const name = entryName(ctx.entry, ctx.contact);
+  const program = ctx.programs.get(programId);
+  const res = await actions.addSuggestedProgram(ctx.entry.id, programId);
+  await afterAction();
+  if (res.onList) {
+    await alertModal({ title: `${name} is on the list`, message: `${program.name} waives the application fee, so they're on the list from today.` });
+    await emailThem('on_list');
+    await reportNextInLine();
+  } else if (res.feeBefore !== res.feeAfter && ctx.entry.status === 'approved') {
+    await alertModal({ title: `Added to ${program.name}`, message: `Their fee is now ${fmtMoney(res.feeAfter)} (it was ${fmtMoney(res.feeBefore)}). If you already asked them for the fee, let them know.` });
+  }
+}
+
+async function onAddDoNotSell() {
+  const e = ctx.entry;
+  const name = entryName(e, ctx.contact);
+  await formModal({
+    title: `Add ${name} to your do-not-sell list?`,
+    confirmLabel: 'Add to the list',
+    danger: true,
+    bodyHtml: `<p style="margin-top:0;">New applications with the same name, email or phone are flagged so you know before you review them.${e.contact_id ? ' Their contact leaves your Contacts list while they\'re on it.' : ''}</p>
+      <div class="field field-wide"><label>Reason <span class="faint">(only you see it)</span></label><textarea id="dns-reason"></textarea></div>
+      <p class="field-hint">This doesn't change their application: close it or take them off the list yourself if you want to.</p>`,
+    onConfirm: async (o) => { await doNotSellRepo.addApplicant(e, { reason: o.querySelector('#dns-reason').value }); }
+  }) && await afterAction();
+}
+
+async function onApprove() {
+  const e = ctx.entry;
+  const matches = e.contact_id ? [] : contactMatches(e.application || {}, ctx.contacts);
+  const contactChoices = e.contact_id
+    ? `<p class="muted">Linked to <strong>${esc(ctx.contact?.name || '')}</strong>.</p>`
+    : `<div class="field field-wide"><label>Contact</label>
+        ${matches.map((m, i) => `<label class="check-inline" style="display:block;"><input type="radio" name="ap-contact" value="${esc(m.contact.id)}"${i === 0 && m.strength === 'certain' ? ' checked' : ''}> Use existing: <strong>${esc(m.contact.name)}</strong> <span class="faint">(${esc(contactMatchReason(m).toLowerCase())}${m.contact.email ? `, ${esc(m.contact.email)}` : ''})</span></label>`).join('')}
+        <label class="check-inline" style="display:block;"><input type="radio" name="ap-contact" value=""${matches.length && matches[0].strength === 'certain' ? '' : ' checked'}> Create a new contact for ${esc(entryName(e, null))}</label>
+        ${matches.length ? '<span class="field-hint">A match is only a suggestion. Pick it if it\'s the same family.</span>' : ''}
+      </div>`;
+  // Their request on the application to list privately (Spec §15.3): she answers it here.
+  // `full` is the name the public list is built from (publicSourceName, K7-8).
+  const full = publicSourceName(e, ctx.contact);
+  const dns = dnsMatches(e);
+  const dnsLine = dns.length ? `<p class="dns-alert-line"><span class="badge badge-red">Do not sell</span> ${esc(doNotSellWarning(dns))}</p>` : '';
+  const suggested = suggestions(e);
+  const suggestLines = suggested.map((s) => `<div class="field field-wide"><label>Add to ${esc(s.program.name)}?</label>${suggestionSelect(s, 'data-ap-suggest')}
+      <span class="field-hint">${esc(suggestionWhy(s))} Left on Choose…, it's asked again until their fee is received.</span></div>`).join('');
+  const asksPrivate = actions.hasPendingRequest(e, 'private_request');
+  const privateAsk = asksPrivate ? `<div class="card" style="margin:10px 0 0;padding:10px 12px;">
+      <strong>Applicant requests to not display their full name on the waitlist</strong>
+      <p style="margin:6px 0;">On your public list, approve shows them as <strong>${esc(privateName(full))}</strong> and decline as <strong>${esc(publicName(full))}</strong> (their place in line is the same either way)</p>
+      <label class="check-inline" style="display:block;"><input type="radio" name="ap-private" value="yes"> Approve</label>
+      <label class="check-inline" style="display:block;"><input type="radio" name="ap-private" value="no"> Decline</label>
+    </div>` : `<p class="field-hint" style="margin:10px 0 0;">On your public list they show as <strong>${esc(listedName(e, full))}</strong>.</p>`;
+  await formModal({
+    title: `Approve ${entryName(e, ctx.contact)}?`,
+    confirmLabel: 'Approve',
+    bodyHtml: `${dnsLine}<div class="form-grid">
+        <div class="field"><label>Approval date</label><input id="ap-date" type="date" value="${esc(kennelToday(ctx.kennel))}"></div>
+        ${suggestLines}
+        <div class="field"><label>Program</label><select id="ap-program">${programOptions(e.waitlist_program_id)}</select></div>
+        ${contactChoices}
+      </div>${privateAsk}
+      <p class="field-hint">A program that waives the fee puts them straight on the list. Otherwise they owe ${esc(fmtMoney(ctx.config.fee_amount) || 'the fee')} and join the list when you mark it received. ${emailHint()}</p>`,
+    onConfirm: async (o) => {
+      const picked = o.querySelector('input[name="ap-contact"]:checked');
+      const privateChoice = o.querySelector('input[name="ap-private"]:checked');
+      if (asksPrivate && !privateChoice) throw new Error('Please approve or decline their request to not display their full name.');
+      for (const sel of o.querySelectorAll('[data-ap-suggest]')) {
+        if (sel.value === 'no') await actions.declineSuggestedProgram(e.id, sel.dataset.apSuggest);
+      }
+      await actions.approve(e.id, {
+        ...(asksPrivate ? { privateListing: privateChoice.value === 'yes' } : {}),
+        date: o.querySelector('#ap-date').value || kennelToday(ctx.kennel),
+        programId: o.querySelector('#ap-program').value || null,
+        contactId: picked ? picked.value || null : null
+      });
+    }
+  }, (o) => {
+    // Yes fills in the program (and No clears it, if it was that one), so the
+    // Program dropdown always shows what Approve will do.
+    const prog = o.querySelector('#ap-program');
+    o.querySelectorAll('[data-ap-suggest]').forEach((sel) => sel.addEventListener('change', () => {
+      if (sel.value === 'yes') {
+        prog.value = sel.dataset.apSuggest;
+        o.querySelectorAll('[data-ap-suggest]').forEach((other) => { if (other !== sel && other.value === 'yes') other.value = ''; });
+      } else if (prog.value === sel.dataset.apSuggest) prog.value = e.waitlist_program_id || '';
+    }));
+  }) && (await afterAction(), await emailThem(ctx.entry.status === 'active' ? 'on_list' : 'approved'), await reportNextInLine());
+}
+
+// The one way off the list (Details, decided 2026-10-10), by status: for a family
+// on the list, they withdrew (their choice) or she removes them (hers); before
+// they're on it, she declines the application, they withdrew, or the fee never
+// came. Each is recorded apart, so the funnel report still tells them apart.
+const LEAVE_CHOICES = {
+  active: [
+    { value: 'withdraw', label: 'They withdrew', hint: 'Their choice. You can undo it for 7 days; after that, coming back means a new application, a new fee and a new place.' },
+    { value: 'remove', label: 'Remove them from the list', hint: 'Your decision. You can undo it for 7 days; after that, to come back they would re-apply, with a new fee and a new place.' }
+  ],
+  applied: [
+    { value: 'decline', label: 'Decline the application', hint: 'The application closes. No contact is created. You can undo it for 7 days.' },
+    { value: 'withdraw', label: 'They withdrew', hint: 'They told you they no longer want to apply. You can undo it for 7 days.' }
+  ],
+  approved: [
+    { value: 'expire', label: 'The fee wasn\'t received in time', hint: 'Their application closes. You can undo it for 7 days; after that they can re-apply.' },
+    { value: 'withdraw', label: 'They withdrew', hint: 'They told you they no longer want a place. You can undo it for 7 days.' }
+  ]
+};
+const leaveLabel = (e) => (e.status === 'active' ? 'Remove from list…' : 'Close application…');
+
+async function onLeave() {
+  const e = ctx.entry;
+  const name = entryName(e, ctx.contact);
+  const choices = LEAVE_CHOICES[e.status] || [];
+  let res = null;
+  let did = null;
+  const ok = await formModal({
+    title: e.status === 'active' ? `${name} is leaving the list?` : `Close ${name}'s application?`,
+    confirmLabel: e.status === 'active' ? 'Take them off the list' : 'Close it',
+    danger: true,
+    bodyHtml: `${choices.map((c) => `<label class="check-inline" style="display:block;margin:8px 0;"><input type="radio" name="lv" value="${c.value}"> <strong>${esc(c.label)}</strong>
+        <div class="faint" style="margin-left:22px;">${esc(c.hint)}</div></label>`).join('')}
+      ${openOfferWarning() ? `<p class="field-hint">${esc(openOfferWarning().trim())}</p>` : ''}
+      <p class="field-hint">${emailHint()}</p>`,
+    onConfirm: async (o) => {
+      did = o.querySelector('input[name="lv"]:checked')?.value;
+      if (!did) throw new Error('Pick one.');
+      if (did === 'withdraw') res = await actions.withdraw(e.id, { byBreeder: true });
+      else if (did === 'remove') res = await actions.removeByBreeder(e.id);
+      else if (did === 'decline') await actions.decline(e.id);
+      else if (did === 'expire') await actions.markFeeExpired(e.id);
+    }
+  });
+  if (!ok) return;
+  ctx.tab = 'details';
+  await afterAction();
+  if (did === 'decline') await emailThem('declined');
+  if (res) { await reportLeaving(res); await emailFamilies(offerSpecs(res)); }
+}
+
+async function onUndo() {
+  const e = ctx.entry;
+  if (e.status === 'declined') {
+    if (!(await confirmModal({ title: 'Undo the decline?', message: 'Their application is open again, waiting for you to approve or decline it. If they were emailed that it was declined, let them know.', confirmLabel: 'Undo decline' }))) return;
+    await actions.undoDecline(e.id);
+  } else if (e.status === 'expired') {
+    if (!(await confirmModal({ title: 'Reopen their application?', message: 'They\'re approved again, waiting for their fee. The pay-by date has passed, so mark the fee received or give them a new date on Edit.', confirmLabel: 'Reopen' }))) return;
+    await actions.undoExpire(e.id);
+  } else if (e.status === 'withdrawn') await actions.undoWithdrawal(e.id);
+  else await actions.undoRemoval(e.id);
+  await afterAction();
+  await reportNextInLine();
+}
+
+async function onUndoFee() {
+  const e = ctx.entry;
+  if (!(await confirmModal({ title: 'Mark the fee not received?', message: 'They go back to approved, waiting for their fee, and lose this place in line until it\'s received. If they were emailed that they\'re on the list, let them know.', confirmLabel: 'Fee not received', danger: true }))) return;
+  await actions.undoFeeReceived(e.id);
+  await afterAction();
+}
+
+// "Keep off the list (family page only)" (E3): one tap, undoable.
+async function onFamilyPageOnly(on) {
+  const name = entryName(ctx.entry, ctx.contact);
+  const ok = await confirmModal(on
+    ? { title: `Keep ${name} off the list?`, message: `They keep their status page (pickup times, extras, the puppy portal link and your messages) but leave the list: no number and no "Pup selected" row, so the families behind them move up one. You can put them back while their sale is open.`, confirmLabel: 'Keep off the list' }
+    : { title: `Put ${name} back on the list?`, message: 'They take back the place they held, with a "Pup selected" row until their pup goes home, so the families behind them move down one.', confirmLabel: 'Put back' });
+  if (!ok) return;
+  await actions.setFamilyPageOnly(ctx.entry.id, on);
+  await afterAction();
+}
+
+async function onReapply() {
+  if (isFamilyPageOnly(ctx.entry) && !(await confirmModal({ title: 'Apply to the list?', message: 'This starts an ordinary application for them, to review and approve like any other. Their family page stays as it is.', confirmLabel: 'Start the application' }))) return;
+  const created = await actions.reapply(ctx.entry.id);
+  location.href = `waitlist-entry.html?id=${encodeURIComponent(created.id)}`;
+}
+
+async function onFeeReceived() {
+  const e = ctx.entry;
+  const noFee = e.fee_amount == null;
+  const methodOpts = `<option value="">—</option>` + PAYMENT_METHODS.map((m) => `<option>${esc(m)}</option>`).join('');
+  // Their credit for funds already received pays this much of the fee; covering it
+  // all, the credit's date is the day it came in.
+  const creditPart = noFee ? 0 : ctx.credit?.byKey.fee || 0;
+  const covered = creditPart > 0 && creditPart >= Number(e.fee_amount);
+  const creditDate = creditsOf(e)[0]?.date || todayYMD();
+  const creditHint = creditPart > 0
+    ? `<p class="field-hint">${esc(fmtMoney(creditPart))} of the fee is paid by their credit for funds already received${covered ? `, all of it (received ${esc(fmtDate(creditDate))})` : `; the other ${esc(fmtMoney(Number(e.fee_amount) - creditPart))} is what they send`}. Enter the whole fee.</p>` : '';
+  await formModal({
+    title: noFee ? `Add ${entryName(e, ctx.contact)} to the list?` : 'Fee received',
+    confirmLabel: noFee ? 'Add to the list' : 'Fee received',
+    bodyHtml: `<div class="form-grid">
+        <div class="field"><label>${noFee ? 'Date' : 'Date received'}</label><input id="fr-date" type="date" value="${esc(covered ? creditDate : todayYMD())}"></div>
+        ${noFee ? '' : `
+        <div class="field"><label>Amount</label><input id="fr-amount" type="number" min="0" step="0.01" value="${esc(e.fee_amount)}"></div>
+        <div class="field"><label>Method</label><select id="fr-method">${methodOpts}</select></div>
+        <div class="field"><label>Reference</label><input id="fr-ref" type="text"></div>`}
+      </div>
+      ${creditHint}
+      <p class="field-hint">This date sets their place in line. ${emailHint()}</p>`,
+    onConfirm: async (o) => {
+      await actions.feeReceived(e.id, noFee
+        ? { date: o.querySelector('#fr-date').value || todayYMD() }
+        : {
+            date: o.querySelector('#fr-date').value || todayYMD(),
+            amount: o.querySelector('#fr-amount').value,
+            method: o.querySelector('#fr-method').value,
+            reference: o.querySelector('#fr-ref').value.trim(),
+            creditAmount: creditPart
+          });
+    }
+  }) && (await afterAction(), await emailThem('on_list'), await reportNextInLine());
+}
+
+async function onMove() {
+  const e = ctx.entry;
+  const others = rankedList(ctx.kennelEntries, ctx.kennel.id, ctx.programs).filter((x) => x.id !== e.id);
+  const contactsById = new Map(ctx.contacts.map((c) => [c.id, c]));
+  const positions = overallPositions(ctx.kennelEntries, ctx.kennel.id, ctx.programs, numbering());
+  const otherOpts = others.map((x) => `<option value="${esc(x.id)}">#${esc(positions.get(x.id))} ${esc(entryName(x, contactsById.get(x.contact_id)))}</option>`).join('');
+  await formModal({
+    title: 'Move their place',
+    confirmLabel: 'Move',
+    bodyHtml: `
+      <label class="check-inline" style="display:block;"><input type="radio" name="mv" value="date" checked> Place them as if they paid on
+        <input id="mv-date" type="date" value="${esc(e.position_anchor_date || anchorDate(e))}"></label>
+      ${others.length ? `<label class="check-inline" style="display:block;margin-top:8px;"><input type="radio" name="mv" value="after"> Place them with <select id="mv-after">${otherOpts}</select></label>
+      <p class="field-hint">Places are kept by date, so this gives them that family's date. Families on the same date are ordered by when their fee was recorded, so they may land just before or after.</p>` : ''}
+      ${e.position_anchor_date ? '<label class="check-inline" style="display:block;margin-top:8px;"><input type="radio" name="mv" value="clear"> Undo the move (back to their fee date)</label>' : ''}
+      <p class="field-hint">Programs that put families ahead still come first. The real fee date is kept.</p>`,
+    onConfirm: async (o) => {
+      const how = o.querySelector('input[name="mv"]:checked').value;
+      if (how === 'clear') await actions.setPositionAnchor(e.id, { date: null });
+      else if (how === 'after') await actions.setPositionAnchor(e.id, { afterEntryId: o.querySelector('#mv-after').value });
+      else {
+        const date = o.querySelector('#mv-date').value;
+        if (!date) throw new Error('Pick a date.');
+        await actions.setPositionAnchor(e.id, { date });
+      }
+    }
+  }) && afterAction();
+}
+
+// --- Details: view ----------------------------------------------------------------
+
+// The litters the family was last told "almost your turn" about (Spec §15.5).
+function soonLitters(e) {
+  return (e.soon_notified_litter_ids || []).map((id) => ctx.litters.find((l) => l.id === id)).filter(Boolean).map(litterLabel).join(', ');
+}
+
+// Listen-only families pick parent dogs; the litters and upcoming pairings that
+// covers are derived (a litter/pairing by one of their sires OR out of one of
+// their dams — waitlistRules.isListeningFor reads only sire_id/dam_id, which
+// pairings carry too).
+function listenSummary(e) {
+  if (!isListenOnly(e)) return esc('All litters');
+  const except = e.listen_mode === 'except';
+  const names = (ids) => (ids || []).map(dogName).join(', ');
+  const parts = [];
+  if ((e.listen_sire_ids || []).length) parts.push(`Sires: ${names(e.listen_sire_ids)}`);
+  if ((e.listen_dam_ids || []).length) parts.push(`Dams: ${names(e.listen_dam_ids)}`);
+  if (!parts.length) return esc('Only: no sires or dams chosen yet, so no litter is offered to them');
+  if (except) {
+    const skipped = [
+      ...waitlistLitters(ctx.kennel, ctx.litters).filter((l) => !isListeningFor(e, l)).map(litterLabel),
+      ...ctx.pairings.filter((p) => !p.is_archived && LISTEN_LIVE_PAIRING.includes(p.status) && !isListeningFor(e, p)
+        && !ctx.litters.some((l) => l.pairing_id === p.id)).map((p) => `${pairingLabel(p)} (pairing)`)
+    ];
+    return `${esc(`All except: ${parts.join(' · ')}`)}<br><span class="faint">${esc(skipped.length ? `Right now that skips: ${skipped.join(', ')}` : 'No current litter or upcoming pairing has these parents.')}</span>`;
+  }
+  const covers = [
+    ...waitlistLitters(ctx.kennel, ctx.litters).filter((l) => isListeningFor(e, l)).map(litterLabel),
+    ...ctx.pairings.filter((p) => !p.is_archived && LISTEN_LIVE_PAIRING.includes(p.status) && isListeningFor(e, p)
+      && !ctx.litters.some((l) => l.pairing_id === p.id)).map((p) => `${pairingLabel(p)} (pairing)`)
+  ];
+  return `${esc(`Only: ${parts.join(' · ')}`)}<br><span class="faint">${esc(covers.length ? `Right now that's: ${covers.join(', ')}` : 'No current litter or upcoming pairing from these parents.')}</span>`;
+}
+
+// Their readiness answer, plus the hold it puts on them (Spec §15.8). Escaped HTML.
+function readySummary(e) {
+  if (!e.ready_timing) return '<span class="badge badge-amber" title="A required question. Edit to fill it in.">Not answered</span>';
+  const t = descriptor(WAITLIST_READY_TIMING, e.ready_timing);
+  const from = readyFromDate(e);
+  if (!from) return esc(t.label);
+  const base = e.fee_received_date ? 'the fee date' : 'approval';
+  const today = kennelToday(ctx.kennel);
+  const held = today < from;
+  const base0 = `${esc(t.label)} <span class="faint">— ${held ? 'no offers until' : 'hold ended'} ${esc(fmtDate(from))} (${esc(t.hold_months)} month${t.hold_months === 1 ? '' : 's'} from ${base})</span>`;
+  // "Ready now?" (Spec §16.7): their answer, or a button for when they told her.
+  const rc = e.status === 'active' ? readyCheck(e, today, ctx.config) : null;
+  if (!rc) return base0;
+  if (rc.answer === 'yes') return `${base0}<br><span class="faint">Ready now? Yes, ${esc(fmtDate(e.ready_check.answered_date))}${e.ready_check.by === 'breeder' ? ' (you recorded it)' : ''}.</span>`;
+  if (rc.answer === 'no') return `${base0}<br><span class="faint">Ready now? Not yet: until ${esc(fmtDate(e.ready_check.until))}. "${esc(e.ready_check.reason)}"</span>`;
+  return `${base0}<br><span class="badge badge-amber">Ready now? No answer yet</span> <span class="faint">${esc(readyHoldText(e, today, ctx.config))}</span>
+    <button class="btn btn-sm" data-ready="yes" style="margin-top:4px;">They told me they're ready</button>`;
+}
+
+// "Not this litter" (Spec §16.2): litters the family passed on ahead of time on
+// their status page, with their reason. Nothing counts until their turn comes.
+const reasonText = (r) => (r ? `${r.label}${r.text ? `: "${r.text}"` : ''}` : '');
+function notThisLitterHtml(e) {
+  return (e.prepasses || []).map((p) => {
+    const l = p.litter_id ? ctx.litters.find((x) => x.id === p.litter_id) : null;
+    const name = l ? litterLabel(l) : p.pairing_id ? 'an upcoming pairing' : 'a litter';
+    return `${esc(name)}${p.reason ? ` <span class="faint">— ${esc(reasonText(p.reason))}${p.date ? `, ${esc(fmtDate(p.date))}` : ''}</span>` : ''}`;
+  }).join('<br>') + ((e.prepasses || []).length ? '<br><span class="faint">Left out of their turn when it comes, and it counts as a pass only then.</span>' : '');
+}
+
+// How their name shows on the public list (Spec §15.3), and what came of their
+// request to list privately.
+function publicListNameHtml(e) {
+  const req = e.private_request;
+  const asked = req && req.requested_date
+    ? (req.decided ? ` <span class="faint">— they asked to list privately; you ${req.decided === 'approved' ? 'approved' : 'declined'} it ${esc(fmtDate(req.decided_date))}</span>`
+      : ' <span class="badge badge-blue">Asked to list privately — you decide when you approve</span>')
+    : '';
+  return `${esc(listedName(e, publicSourceName(e, ctx.contact)))}${e.private_listing ? ' <span class="faint">(private)</span>' : ''}${asked}`;
+}
+
+// Credits for funds already received (receivedCredits.js): each one, what it can pay
+// toward, and how much of it is used; Add / Edit / Remove.
+function creditsHtml(e) {
+  const list = creditsOf(e);
+  const a = ctx.credit;
+  const usesText = (c) => (c.applies_to.length === CREDIT_USES.length ? 'Anything they owe'
+    : CREDIT_USES.filter((u) => c.applies_to.includes(u.value)).map((u) => u.label).join(', '));
+  const usedOn = a ? CREDIT_USES.map((u) => [u, Object.entries(a.byKey).filter(([k]) => ({ fee: 'fee', deposit: 'deposit', balance: 'price' }[k] || 'extras') === u.value).reduce((t, [, v]) => t + v, 0)])
+    .filter(([, v]) => v > 0).map(([u, v]) => `${esc(u.label.toLowerCase())} ${esc(fmtMoney(v))}`) : [];
+  const rows = list.map((c) => `<li class="row-between" style="padding:8px 0; border-top:1px solid var(--border); align-items:flex-start;">
+      <div><strong>${esc(fmtMoney(c.amount))}</strong> received ${esc(fmtDate(c.date))}${c.method ? ` <span class="faint">${esc(c.method)}</span>` : ''}
+        ${c.note ? `<div class="muted" style="font-size:13px;">${esc(c.note)}</div>` : ''}
+        <div class="faint" style="font-size:13px;">Pays toward: ${esc(usesText(c))} · used ${esc(fmtMoney(a?.perCredit[c.id] || 0))}</div></div>
+      <div class="pill-row"><button class="btn btn-sm" data-credit-edit="${esc(c.id)}">Edit</button><button class="btn btn-sm" data-credit-remove="${esc(c.id)}">Remove</button></div>
+    </li>`).join('');
+  return `<section class="card">
+      <div class="row-between"><h2 style="margin:0;">Credits</h2><button class="btn btn-sm" data-act="credit-add">+ Add a credit</button></div>
+      ${list.length ? `<p style="margin:8px 0 4px;"><strong>${esc(fmtMoney(a?.remaining ?? 0))}</strong> credit remaining of ${esc(fmtMoney(a?.total ?? 0))}.${usedOn.length ? ` <span class="faint">Used on: ${usedOn.join(', ')}.</span>` : ''}</p>
+        <ul style="margin:0; padding:0; list-style:none;">${rows}</ul>`
+        : '<p class="muted" style="margin:8px 0 0;">Money you\'ve already received from them, like a deposit collected before the litter was born. It comes off what they\'re asked to pay.</p>'}
+    </section>`;
+}
+
+async function onAddCredit(credit = null) {
+  const saved = await creditDialog({ entry: ctx.entry, name: entryName(ctx.entry, ctx.contact), credit });
+  if (saved) await afterAction();
+}
+
+async function onRemoveCredit(id) {
+  const c = creditsOf(ctx.entry).find((x) => x.id === id);
+  if (!c || !(await confirmModal({ title: `Remove the ${fmtMoney(c.amount)} credit?`, message: 'It no longer comes off what they\'re asked to pay. Anything already marked paid stays as it is.', confirmLabel: 'Remove', danger: true }))) return;
+  await actions.removeCredit(ctx.entry.id, id);
+  await afterAction();
+}
+
+// Their program: its icon, name, and whether the icon shows by their number on the
+// public list (Waitlist settings "Show program icons on the public list").
+function programRowHtml(program) {
+  const icon = programIconHtml(program);
+  const shown = icon && ctx.config.public_show_programs && String(program.public_description || '').trim();
+  const note = !icon ? '' : shown
+    ? ' <span class="faint">— this icon shows by their number on your public list</span>'
+    : ` <span class="faint">— not shown on your public list (${ctx.config.public_show_programs ? 'the program needs a description for families' : 'program icons are off in Waitlist settings'})</span>`;
+  return `${icon ? `${icon} ` : ''}${esc(program.name)}${program.is_archived ? ' <span class="badge badge-gray">archived</span>' : ''}${note}`;
+}
+
+// Who they are and what they asked for (Details tab).
+function detailsDlHtml() {
+  const e = ctx.entry;
+  const app = e.application || {};
+  const program = ctx.programs.get(e.waitlist_program_id);
+  const contactHtml = ctx.contact
+    ? `<a href="contact.html?id=${encodeURIComponent(ctx.contact.id)}">${esc(ctx.contact.name)}</a>${ctx.contact.email ? ` <span class="faint">${esc(ctx.contact.email)}</span>` : ''}`
+    : '<span class="faint">Not linked yet — approving links or creates one</span>';
+  return `
+    <dl class="dl-meta" style="margin-top:14px;">
+      ${row('Contact', contactHtml)}
+      ${row('Program', program ? programRowHtml(program) : '')}
+      ${row('Wants', prefsSummary(e) + (e.pref_breed && resolveBreed(e.pref_breed, ctx.breeds) === null ? ` <span class="badge badge-red" title="No pup will match this breed. Edit to pick one of your breeds.">Unknown breed</span>` : ''))}
+      ${row('Ready to buy', readySummary(e))}
+      ${row('Listening for', LISTEN_STATUSES.includes(e.status) || isListenOnly(e) ? listenSummary(e) : '')}
+      ${row('Not this litter', notThisLitterHtml(e))}
+      ${isFamilyPageOnly(e) ? '' : row('On the public list', publicListNameHtml(e))}
+      ${row('Paused until', e.paused_until ? esc(fmtDate(e.paused_until)) + (e.pause_reason ? ` <span class="faint">— ${esc(e.pause_reason)}</span>` : '') : '')}
+      ${row('Fee', e.fee_amount != null ? esc(fmtMoney(e.fee_amount)) : '')}
+      ${row('Fee policy', e.fee_credit_policy ? esc(descriptor(FEE_CREDIT_POLICY, e.fee_credit_policy).label) : '')}
+      ${row('Fee received', e.fee_received_date ? esc(fmtDate(e.fee_received_date)) + [e.fee_payment_method, e.fee_payment_reference].filter(Boolean).map((s) => ` <span class="faint">${esc(s)}</span>`).join('') : '')}
+      ${row('Pay by', e.fee_due_date ? esc(fmtDate(e.fee_due_date)) : '')}
+      ${row('Told "almost your turn"', e.soon_notified_date ? esc(fmtDate(e.soon_notified_date)) + (soonLitters(e) ? ` <span class="faint">— ${esc(soonLitters(e))}</span>` : '') : '')}
+      ${row('Notes', multiline(e.notes))}
+    </dl>
+    <h3 style="margin:18px 0 6px;">Application</h3>
+    <dl class="dl-meta">
+      ${row('Applied', e.applied_date ? esc(fmtDate(e.applied_date)) : '')}
+      ${entryQuestions(e, ctx.form).map((q) => row(q.label, multiline(answerText(q, app[q.id])))).join('')}
+    </dl>`;
+}
+
+// --- Details: edit / new ------------------------------------------------------------
+
+function checkList(items, selected, attr) {
+  if (!items.length) return '<span class="faint">None yet.</span>';
+  return items.map(({ id, label }) => `<label class="check-inline"><input type="checkbox" ${attr}="${esc(id)}"${selected.includes(id) ? ' checked' : ''}> ${esc(label)}</label>`).join('');
+}
+
+// Her application's fields, shared with Kels (assets/waitlistApplicationForm.js).
+const prefField = (key, e, label) => prefFieldHtml(key, e, { label, breeds: ctx.breeds, config: ctx.config });
+
+// The questions a draft's answers are read from: her form for a new application,
+// else the entry's own questions (its saved wording plus anything added since).
+const draftQuestions = () => (ctx.mode === 'new' ? ctx.form.filter(isAnswerQuestion) : entryQuestions(ctx.draft, ctx.form));
+
+function renderEdit() {
+  const e = ctx.draft;
+  const app = e.application || {};
+  const selSires = e.listen_sire_ids || [];
+  const selDams = e.listen_dam_ids || [];
+  const canListen = LISTEN_STATUSES.includes(e.status);
+  // The parents a family can pick: this kennel's active breeding dogs, plus any dog
+  // that's a parent of one of its live litters or upcoming pairings (an outside
+  // stud included), plus anything already chosen (so a retired dog a family picked
+  // never silently drops off their list).
+  // (waitlistRules.listenParentChoices; the status page offers the same ones.)
+  const choices = listenParentChoices(ctx.kennel, {
+    dogs: [...ctx.dogsById.values()], litters: ctx.litters, pairings: ctx.pairings, selectedSires: selSires, selectedDams: selDams
+  });
+  const asOption = (d) => ({ id: d.id, label: `${d.call_name || '(unnamed)'}${d.is_archived ? ' (archived)' : ''}` });
+  const sires = choices.sires.map(asOption);
+  const dams = choices.dams.map(asOption);
+  const isNew = ctx.mode === 'new';
+  const programField = `<div class="field"><label>Program</label><select id="f-program">${programOptions(e.waitlist_program_id)}</select>
+    <span class="field-hint">Only you assign programs. Families never pick one.</span></div>`;
+
+  // A new application follows her form, in her order and wording, so typing one in
+  // matches what families will see online (waitlistApplicationForm.applicationFields).
+  const newForm = () => applicationFields({ form: ctx.form, config: ctx.config, breeds: ctx.breeds, entry: e });
+
+  // Her FAQ heads the application, as families will see it online (Spec §15.8).
+  const faq = formFaq(ctx.config);
+  const faqHtml = faq.length ? `<div class="field field-wide"><div class="card" style="margin:0;padding:10px 12px;">
+      <strong>Before you apply</strong>
+      ${faq.map((x) => `<details style="margin-top:6px;"><summary>${esc(x.question || 'Question')}</summary><p style="margin:6px 0 0;white-space:pre-line;">${esc(x.answer)}</p></details>`).join('')}
+      <span class="field-hint">Your FAQ, from the Application form page. Every applicant sees it first.</span></div></div>` : '';
+
+  els.body.innerHTML = isNew ? `
+    <div class="form-grid" style="margin-top:14px;">
+      ${faqHtml}
+      ${newForm()}
+      <div class="field field-wide"><h3 style="margin:8px 0 0;">For you</h3></div>
+      ${programField}
+      <div class="field"><label>Applied</label><input id="f-applied_date" type="date" value="${esc(e.applied_date || todayYMD())}"></div>
+      <div class="field field-wide"><label>Your notes</label><textarea id="f-notes">${esc(e.notes || '')}</textarea></div>
+      <div class="field field-wide"><span class="field-hint">Change these questions on the <a href="waitlist-form.html?kennel=${encodeURIComponent(ctx.kennel.id)}">Application form</a> page.</span></div>
+    </div>` : `
+    <div class="form-grid" style="margin-top:14px;">
+      <div class="field field-wide"><h3 style="margin:0;">Preferences</h3></div>
+      ${['pref_sex', 'pref_breed', 'pref_purposes', 'pref_colors', 'ready_timing'].map((k) => prefField(k, e, k === 'ready_timing' ? ctx.form.find((q) => q.key === 'ready_timing')?.label : undefined)).join('')}
+      ${programField}
+
+      ${canListen ? `<div class="field field-wide"><h3 style="margin:8px 0 0;">Which litters</h3></div>
+      <div class="field"><label>Listening for</label><select id="f-listen_mode">${options(WAITLIST_LISTEN_MODE, e.listen_mode || 'all')}</select>
+        <span class="field-hint">Listen-only families are only offered litters by a sire or out of a dam they picked (or, with "All except", every litter but those). That never costs them their place or counts as a pass.</span></div>
+      <div class="field field-wide" id="listen-picks"${(e.listen_mode || 'all') !== 'all' ? '' : ' hidden'}>
+        <label>Sires</label><div class="check-group">${checkList(sires, selSires, 'data-sire')}</div>
+        <label style="margin-top:8px;">Dams</label><div class="check-group">${checkList(dams, selDams, 'data-dam')}</div>
+        <span class="field-hint">Any litter or pairing with one of these parents counts (or is skipped, with "All except"): picking a sire and a dam means either one, not only the two together.</span>
+      </div>` : e.status === 'approved' ? `<div class="field field-wide"><span class="field-hint">Listening for certain sires and dams opens once they're on the list (fee received).</span></div>` : ''}
+      <div class="field"><label>Paused until</label><input id="f-paused_until" type="date" value="${esc(e.paused_until || '')}">
+        <span class="field-hint">Not offered pups until after this date. They keep their place, but don't appear on the public list while paused.</span></div>
+      <div class="field"><label>Pause reason</label><input id="f-pause_reason" type="text" value="${esc(e.pause_reason || '')}"></div>
+      ${privateField(e)}
+
+      <div class="field field-wide"><h3 style="margin:8px 0 0;">Fee</h3></div>
+      <div class="field"><label>Fee amount</label><input id="f-fee_amount" type="number" min="0" step="0.01" value="${esc(e.fee_amount ?? '')}"></div>
+      <div class="field"><label>Pay by</label><input id="f-fee_due_date" type="date" value="${esc(e.fee_due_date || '')}"></div>
+      <div class="field"><label>Fee policy</label><select id="f-fee_credit_policy">${options(FEE_CREDIT_POLICY, e.fee_credit_policy || '', '—')}</select></div>
+      ${e.fee_received_date ? `<div class="field"><label>Fee received</label><input id="f-fee_received_date" type="date" value="${esc(e.fee_received_date)}">
+        <span class="field-hint">${isMovedByBreeder(e)
+          ? 'You moved this family yourself, so their place stays where you put it. This date still sets when a readiness hold ends and the day the fee counts as income.'
+          : 'This date is their place in line: changing it can move them up or down the list. It also sets when a readiness hold ends and the day the fee counts as income.'}</span></div>` : ''}
+
+      <div class="field field-wide"><h3 style="margin:8px 0 0;">Application</h3>${e.contact_id ? '<span class="field-hint">Name, email and phone are what they applied with. The contact record holds the current ones.</span>' : ''}</div>
+      <div class="field"><label>Applied</label><input id="f-applied_date" type="date" value="${esc(e.applied_date || '')}"></div>
+      ${draftQuestions().map((q) => answerField(q, app[q.id])).join('')}
+      <div class="field field-wide"><label>Your notes</label><textarea id="f-notes">${esc(e.notes || '')}</textarea></div>
+    </div>`;
+
+  const modeSel = document.getElementById('f-listen_mode');
+  if (modeSel) modeSel.addEventListener('change', () => { document.getElementById('listen-picks').hidden = modeSel.value === 'all'; });
+}
+
+function readForm() {
+  const val = (id) => document.getElementById(id)?.value ?? '';
+  const has = (id) => Boolean(document.getElementById(id));
+  const questions = draftQuestions();
+  const application = readAnswers(els.body, questions, ctx.draft.application || {});
+  const out = {
+    ...readPrefs(els.body),
+    waitlist_program_id: val('f-program') || null,
+    application,
+    application_questions: snapshotQuestions(questions),
+    notes: val('f-notes')
+  };
+  if (has('f-applied_date')) out.applied_date = val('f-applied_date') || ctx.draft.applied_date || todayYMD();
+  // The fee date is the position anchor (waitlistRules.anchorDate), so it can be
+  // corrected but never blanked here: a cleared box keeps the date it had.
+  if (has('f-fee_received_date') && val('f-fee_received_date')) out.fee_received_date = val('f-fee_received_date');
+  if (has('f-paused_until')) {
+    Object.assign(out, {
+      paused_until: val('f-paused_until') || null,
+      pause_reason: val('f-pause_reason').trim(),
+      fee_amount: val('f-fee_amount') === '' ? null : Number(val('f-fee_amount')),
+      fee_due_date: val('f-fee_due_date') || null,
+      fee_credit_policy: val('f-fee_credit_policy') || null
+    });
+  }
+  if (has('f-listen_mode')) {
+    Object.assign(out, {
+      listen_mode: val('f-listen_mode') || 'all',
+      listen_sire_ids: [...document.querySelectorAll('[data-sire]:checked')].map((el) => el.dataset.sire),
+      listen_dam_ids: [...document.querySelectorAll('[data-dam]:checked')].map((el) => el.dataset.dam)
+    });
+  }
+  const missing = ctx.draft.contact_id ? [] : missingRequired(questions, application);
+  // Readiness is mandatory on a new application (it decides the hold). An older
+  // entry without one can still be edited; its page flags it as not answered.
+  if (ctx.mode === 'new' && !out.ready_timing) missing.push(ctx.form.find((q) => q.key === 'ready_timing')?.label || 'Ready to buy');
+  if (missing.length) throw new Error(`Please fill in: ${missing.map((m) => m.replace(/[?.!:]+$/, '')).join(', ')}.`);
+  return out;
+}
+
+// --- Offers: make one from here, record how it ended (Spec §15.2) --------------------
+
+const pupLabel = (d) => `${d.call_name}${d.sex ? ` (${SEX.find((s) => s.value === d.sex)?.label || d.sex})` : ''}`;
+const kennelLitterPups = (litter) => [...ctx.dogsById.values()].filter((d) => d.litter_id === litter.id);
+const familyNameById = (entryId) => {
+  const x = ctx.kennelEntries.find((k) => k.id === entryId);
+  return x ? entryName(x, ctx.contacts.find((c) => c.id === x.contact_id)) : 'another family';
+};
+
+// Every live litter of this kennel, with whether this family can be offered a turn
+// starting from it now and, if not, why (the engine's offerBlocker, which offerTo
+// also asks: K6-7). `next` is who the turn really goes to if it's offered from that
+// litter (the kennel-wide rule, nextOfferedTurn: K6-6; null = nobody). One family
+// holds a turn at a time across the kennel (Spec §16.1), so while anyone holds one,
+// nothing can be offered.
+function litterChoices(e) {
+  const today = kennelToday(ctx.kennel);
+  const opts = { today, config: ctx.config, programsById: ctx.programs };
+  const pups = [...ctx.dogsById.values()];
+  return ctx.litters
+    .filter((l) => isWaitlistLitter(l, ctx.kennel))
+    .map((l) => {
+      const eligible = eligiblePupsFor(e, l, kennelLitterPups(l), ctx.sales, opts);
+      const blocked = offerBlocker(e, l, {
+        offers: ctx.kennelOffers, pups: kennelLitterPups(l), sales: ctx.sales, today, config: ctx.config,
+        nameOf: familyNameById, readyText: (x) => readyHoldText(x, today, ctx.config)
+      });
+      const next = blocked ? null
+        : nextOfferedTurn(ctx.kennelEntries, ctx.kennelOffers, ctx.litters, pups, ctx.sales, { ...opts, kennelId: ctx.kennel.id, opening: l });
+      return { litter: l, eligible, blocked, next };
+    });
+}
+
+async function onOfferLitter() {
+  const e = ctx.entry;
+  let turn = null;
+  const choices = litterChoices(e);
+  const offerable = choices.filter((c) => !c.blocked);
+  const rowHtml = (c, i) => {
+    const l = c.litter;
+    const picks = l.picks_opened_date ? 'Picks open' : 'Picks not open yet (offering opens them)';
+    const order = c.blocked ? '' : (!c.next || c.next.entry.id === e.id
+      ? '<span class="badge badge-green">They\'re next</span>'
+      : `<span class="badge badge-amber">Next in line is ${esc(familyNameById(c.next.entry.id))}</span>`);
+    return `<label class="check-inline" style="display:block;margin:8px 0;${c.blocked ? 'opacity:.6;' : ''}">
+        <input type="radio" name="ol" value="${esc(l.id)}"${c.blocked ? ' disabled' : ''}${!c.blocked && i === choices.indexOf(offerable[0]) ? ' checked' : ''}>
+        <strong>${esc(litterLabel(l))}</strong> ${order}
+        <div class="faint" style="margin-left:22px;">${c.blocked ? esc(c.blocked) : `${esc(picks)} · pups for them: ${esc(c.eligible.map(pupLabel).join(', '))}`}</div>
+      </label>`;
+  };
+  const days = ctx.programs.get(e.waitlist_program_id)?.respond_days_override || ctx.config.respond_days;
+  await formModal({
+    title: `Offer ${entryName(e, ctx.contact)} their turn`,
+    confirmLabel: 'Offer the turn',
+    bodyHtml: choices.length
+      ? `${choices.map(rowHtml).join('')}
+         <p class="field-hint">Their turn covers this litter and every other open litter they match; they pick one pup from any of them, or pass on all of them. They get ${esc(days)} days to pick a pup and send the deposit. Offering someone who isn't next doesn't change anyone's place; the next family ${ctx.config.auto_offer_on.length ? 'is up (offered automatically if you chose that in Waitlist settings)' : 'is up'} once this one is settled. ${emailHint()}</p>`
+      : '<p class="muted">No upcoming or current litters on this kennel yet.</p>',
+    onConfirm: async (o) => {
+      const picked = o.querySelector('input[name="ol"]:checked');
+      if (!picked) throw new Error('Pick a litter.');
+      const c = choices.find((x) => x.litter.id === picked.value);
+      let note = '';
+      if (c.next && c.next.entry.id !== e.id) {
+        if (!(await confirmModal({ title: 'Offer out of turn?', message: `${familyNameById(c.next.entry.id)} is next in line for a turn. Offer it to ${entryName(e, ctx.contact)} anyway? Nobody's place changes, and ${familyNameById(c.next.entry.id)} still gets their turn afterwards.`, confirmLabel: 'Offer anyway' }))) {
+          throw new Error('Not offered. Pick another litter, or cancel.');
+        }
+        note = `Offered out of turn by you; ${familyNameById(c.next.entry.id)} was next in line.`;
+      }
+      turn = await actions.offerTo(c.litter.id, e.id, { note, outOfOrder: Boolean(note) });
+    }
+  }) && (await afterAction(), await emailFamilies(offerSpecs({ next: turn })));
+}
+
+// The turn-moves-on sentence for an outcome prompt: with automatic offers off for
+// that moment (the default) nobody is offered; she's told who's next.
+const turnNote = (outcome) => (autoOffers(ctx.config, outcome)
+  ? 'The turn moves to the next eligible family.'
+  : 'Nobody is offered automatically; you\'ll see who\'s next.');
+
+async function onOfferOutcome(offer, outcome) {
+  const e = ctx.entry;
+  const name = entryName(e, ctx.contact);
+  const litter = ctx.litters.find((l) => l.id === offer.litter_id);
+  const pups = litter ? kennelLitterPups(litter) : [];
+
+  if (outcome === 'pick') {
+    const live = litter ? eligiblePupsFor(e, litter, pups, ctx.sales, { today: kennelToday(ctx.kennel), config: ctx.config }) : [];
+    if (!live.length) { await alertModal({ title: 'No pups available', message: 'None of the pups offered to them is still available.' }); return; }
+    const carriedAtPick = carriedCreditsOf(e).length > 0;
+    const out = await pickDialog({ offer, name, pups: live, pupLabel });
+    if (!out) return;
+    await afterAction();
+    if (out.depositDone) await emailFamilies(offerSpecs(out.res));
+    const saleId = out.res.sale.id;
+    const message = out.depositDone
+      ? [`${name} is placed.`, ...offerChangeLines(out.res)].join('\n\n')
+      : `${dogName(out.res.offer.chosen_dog_id)} is held for ${name} until ${fmtDate(offer.respond_by_date)}. Send them the deposit details (the sale's invoice is under Documents on this page). Record "Deposit received" when it arrives.`;
+    // A carried-over deposit placed them at the pick: what's left to send them is
+    // the contract and the invoice (showing the deposit paid).
+    if (out.depositDone && carriedAtPick && canPickToSend()) {
+      if (await confirmModal({ title: `${name} is placed`, message: `${message}\n\nThe money they carried over from the pup they lost covers their deposit, so it's recorded as received. Send them the contract and invoice now?`, confirmLabel: 'Send contract & invoice', cancelLabel: 'Later' })) {
+        await onOfferOutcome(out.res.offer, 'send');
+      }
+      return;
+    }
+    if (!out.depositDone && canPickToSend()) {
+      if (await confirmModal({ title: 'Pick recorded', message: `${dogName(out.res.offer.chosen_dog_id)} is held for ${name} until ${fmtDate(offer.respond_by_date)}.\n\nReview the sale and send them the deposit request (with the invoice and contract) now?`, confirmLabel: 'Review sale & send', cancelLabel: 'Later' })) {
+        await onOfferOutcome(out.res.offer, 'send');
+      }
+      return;
+    }
+    if (await confirmModal({ title: out.depositDone ? 'Deposit received' : 'Pick recorded', message: `${message}\n\nOpen the sale?`, confirmLabel: 'Open the sale', cancelLabel: 'Stay here' })) {
+      location.href = `sale.html?id=${encodeURIComponent(saleId)}`;
+    }
+    return;
+  }
+  if (outcome === 'send') {
+    const { openPickToSend } = await import('../assets/pickToSend.js');
+    let fresh = (await waitlistOfferRepo.getById(offer.id)) || offer;
+    // A pick still waiting on a deposit that money they carried from a pup they lost
+    // already covers (their credit leaves nothing of it to send): record it first, so
+    // the message and invoice don't ask for it again. Received today, never on the
+    // credit's date (plan §3.2a).
+    const carried = carriedCreditsOf(e);
+    const owed = carried.length && isAwaitingDeposit(fresh) && fresh.sale_id ? (await getSaleStatement(fresh.sale_id))?.statement?.deposit : null;
+    if (owed && owed.amount > 0 && owed.owed <= 0 && await confirmModal({
+      title: 'Their deposit is already in',
+      message: `${name} is carrying ${fmtMoney(carried.reduce((t, c) => t + c.amount, 0))} they paid on a pup they lost, which covers the deposit on ${dogName(fresh.chosen_dog_id)}. Mark the deposit received now?\n\nThat places them and moves the turn on. The message then thanks them for the deposit instead of asking for it.`,
+      confirmLabel: 'Mark deposit received', cancelLabel: 'Not now'
+    })) {
+      const res = await actions.confirmDeposit(fresh.id, {});
+      await afterAction();
+      await emailFamilies(offerSpecs(res));
+      fresh = res.offer;
+    }
+    const litterFor = ctx.litters.find((l) => l.id === fresh.litter_id);
+    if (await openPickToSend({
+      offer: fresh, entry: ctx.entry, contact: ctx.contact,
+      litterLabel: litterFor ? litterLabel(litterFor) : '',
+      paymentText: ctx.config.payment_instructions || '',
+      kennelName: ctx.kennel?.kennel_name || ''
+    })) await afterAction();
+    return;
+  }
+  if (outcome === 'deposit') {
+    const res = await depositDialog({ offer, name, pupName: dogName(offer.chosen_dog_id), sale: ctx.sales.find((x) => x.id === offer.sale_id) || null });
+    if (!res) return;
+    await afterAction();
+    await alertModal({ title: `${name} is placed`, message: [`Deposit recorded for ${dogName(offer.chosen_dog_id)}.`, ...offerChangeLines(res)].join('\n\n') });
+    await emailFamilies(offerSpecs(res));
+    return;
+  }
+  if (outcome === 'change') {
+    const options = litter ? switchablePups(e, litter, pups, ctx.sales, { currentDogId: offer.chosen_dog_id, config: ctx.config }) : [];
+    if (await changePickDialog({ offer, name, currentName: dogName(offer.chosen_dog_id), pups: options, pupLabel })) await afterAction();
+    return;
+  }
+  if (outcome === 'unprepass') {
+    const lname = litter ? litterLabel(litter) : 'this litter';
+    if (!(await confirmModal({
+      title: `Open ${lname} to ${name} again?`,
+      message: `They said "Not this litter" to ${lname}, and it was recorded when their turn came. Taking it back makes ${lname} open to them again; it was never a pass. ${holdsTurn(ctx.kennelOffers, e.id) ? 'It joins the turn they hold now, if a pup in it still matches them.' : 'Nothing is offered now: they\'re in line for it by their place, or you can offer it from here.'}`,
+      confirmLabel: 'Open it to them again'
+    }))) return;
+    const res = await actions.undoPrepass(offer.id);
+    await afterAction();
+    if (res.joined) {
+      await alertModal({ title: 'Added to their turn', message: `${lname} is in ${name}'s turn now, with the same deadline (${fmtDate(res.joined.respond_by_date)}).${canEmail() ? '' : ' Let them know; nothing is sent automatically.'}` });
+      await emailFamilies([{ entryId: e.id, kind: 'offer', extra: { litterIds: res.joined.litter_ids, respondBy: res.joined.respond_by_date } }]);
+    }
+    return;
+  }
+  if (outcome === 'undo') {
+    const holder = openTurns(ctx.kennelOffers, ctx.kennel.id).find((t) => t.id !== turnIdOf(offer));
+    const res = await undoPassDialog({ offer, name, holderName: holder ? familyNameById(holder.entry_id) : null, removed: e.status === 'removed' });
+    if (!res) return;
+    await afterAction();
+    const back = res.offers.map((x) => ctx.litters.find((l) => l.id === x.litter_id)).filter(Boolean).map(litterLabel).join(', ');
+    await alertModal({ title: 'Their turn is back', message: [`${name}'s turn is back (${back || 'this litter'}), with until ${fmtDate(res.offer.respond_by_date)} to pick and pay the deposit.${canEmail() ? '' : ' Let them know; nothing is sent automatically.'}`, ...offerChangeLines(res)].join('\n\n') });
+    await emailFamilies([{ entryId: e.id, kind: 'offer', extra: { litterIds: res.offers.map((x) => x.litter_id), respondBy: res.offer.respond_by_date } }, ...offerSpecs(res)]);
+    return;
+  }
+
+  const lapse = offer.chosen_dog_id ? ` Their pick lapses: the sale is cancelled and ${dogName(offer.chosen_dog_id)} is available again.` : '';
+  // A turn covers every open litter they matched (Spec §16.1): outcomes close all of it.
+  const also = turnOffers(ctx.kennelOffers, turnIdOf(offer)).filter((o) => o.outcome === 'open' && o.id !== offer.id)
+    .map((o) => ctx.litters.find((l) => l.id === o.litter_id)).filter(Boolean).map(litterLabel);
+  const whole = also.length ? ` This closes their whole turn, including ${also.join(', ')}, and counts once.` : '';
+  const prompts = {
+    passed: { title: also.length ? `${name} passed on their whole turn?` : `${name} passed on this litter?`, message: `${turnNote('passed')}${whole}${lapse}`, confirmLabel: 'Record it' },
+    no_response: offer.chosen_dog_id
+      ? { title: `No deposit from ${name}?`, message: `Record that the deposit didn't arrive in time. It counts like no response. ${turnNote(closingTrigger(offer, 'no_response'))}${lapse}`, confirmLabel: 'Record it' }
+      : { title: `${name} didn't respond in time?`, message: `${turnNote('no_response')}${whole}`, confirmLabel: 'Record it' },
+    voided: { title: 'Void this turn?', message: `Use this if the offer was a mistake or the litter fell through. It never counts as a pass for ${name}, and the turn isn't moved on automatically.${also.length ? ` It voids their whole turn, including ${also.join(', ')}.` : ''}${lapse}`, confirmLabel: 'Void it' }
+  };
+  if (!(await confirmModal(prompts[outcome]))) return;
+  const turnLitterIds = turnOffers(ctx.kennelOffers, turnIdOf(offer)).filter((o) => o.outcome === 'open').map((o) => o.litter_id);
+  const res = await actions.recordOutcome(offer.id, outcome);
+  await afterAction();
+  if (res.passes) {
+    const msg = !res.passes.counted ? 'This doesn\'t count as a pass.'
+      : res.removed ? `That was pass ${res.passes.used} of ${res.passes.max}, so they've been removed from the list. You can undo this for ${REMOVAL_UNDO_DAYS} days.`
+      : `This counts as pass ${res.passes.used} of ${res.passes.max}. They keep their place.`;
+    const changes = offerChangeLines(res);
+    await alertModal({ title: 'Recorded', message: [msg, ...changes].join('\n\n') });
+  }
+  // Their turn closed (not a void: she voided it for her own reason), and maybe the
+  // next family's turn began.
+  const closed = { passed: 'pass_recorded', no_response: 'deadline_passed' }[outcome];
+  await emailFamilies([
+    ...(closed ? [{ entryId: e.id, kind: closed, extra: { litterIds: turnLitterIds.length ? turnLitterIds : [offer.litter_id], respondBy: offer.respond_by_date } }] : []),
+    ...offerSpecs(res)
+  ]);
+}
+
+// "Review sale & send" (Integrations plan §2.6) needs contracts and invoices.
+const canPickToSend = () => editionFlags.contracts && editionFlags.invoicing;
+
+// A placed family's pick whose contract and invoice haven't gone out from here yet
+// (the deposit came in at the pick, as a carried-over one does): she can still
+// send them, while the sale is at deposit paid.
+function canSendPlaced(o) {
+  if (!canPickToSend() || o.outcome !== 'accepted' || !o.sale_id || o.deposit_request_sent_date) return false;
+  if (ctx.entry.placed_sale_id !== o.sale_id) return false;
+  return ctx.sales.find((x) => x.id === o.sale_id)?.status === 'deposit_paid';
+}
+
+// The buttons under one offer: what she can do with it now.
+function offerButtons(o, today) {
+  const btn = (oc, label, primary = false, title = '') => `<button class="btn ${primary ? 'btn-primary ' : ''}btn-sm" data-oc="${oc}" data-offer="${esc(o.id)}"${title ? ` title="${esc(title)}"` : ''}>${esc(label)}</button>`;
+  let list = [];
+  if (isAwaitingDeposit(o)) {
+    const send = canPickToSend() && o.sale_id;
+    list = [
+      ...(send ? [btn('send', o.deposit_request_sent_date ? 'Review sale & send again…' : 'Review sale & send…', true)] : []),
+      btn('deposit', 'Deposit received…', !send), btn('change', 'Change pup…'), btn('passed', 'Passed'), btn('no_response', 'No deposit'), btn('voided', 'Void')
+    ];
+  } else if (o.outcome === 'open') {
+    list = [btn('pick', 'Picked a pup…', true), btn('passed', 'Passed'), btn('no_response', 'No response'), btn('voided', 'Void')];
+  } else if (o.outcome === 'accepted' && (canSwitchAcceptedPick(o, ctx.kennelOffers) || canSendPlaced(o))) {
+    list = [
+      ...(canSendPlaced(o) ? [btn('send', 'Send contract & invoice…', true, 'Their deposit is in; the message thanks them for it')] : []),
+      ...(canSwitchAcceptedPick(o, ctx.kennelOffers) ? [btn('change', 'Change pup…', false, 'Allowed until the next family is offered a turn')] : [])
+    ];
+  } else if (isPrepassedRow(o)) {
+    // Closed by their own "Not this litter": only they can take it back.
+    if (ctx.entry.status === 'active' && !ctx.entry.is_archived) list = [btn('unprepass', 'Changed their mind…', false, 'They want this litter after all')];
+  } else if (!undoPassBlocker(o, ctx.entry, today)) {
+    list = [btn('undo', 'Undo…', false, 'Erase this and give them their turn back')];
+  }
+  return list.length ? `<div class="pill-row" style="margin-top:6px;">${list.join('')}</div>` : '';
+}
+
+// One offer's litter and how it stands, for the turn card and the record.
+function offerStatusHtml(o) {
+  const sale = o.sale_id && isAwaitingDeposit(o) ? ` · <a href="sale.html?id=${encodeURIComponent(o.sale_id)}">sale</a>` : '';
+  return isAwaitingDeposit(o)
+    ? `<span class="badge badge-purple">Picked ${esc(dogName(o.chosen_dog_id))}</span> <span class="faint">deposit pending${sale}</span>${o.deposit_request_sent_date ? ` <span class="badge badge-blue">Deposit request sent ${esc(fmtDate(o.deposit_request_sent_date))}</span>` : ''}`
+    : `${badge(WAITLIST_OFFER_OUTCOME, o.outcome)}${o.chosen_dog_id ? ` ${esc(dogName(o.chosen_dog_id))}` : ''}${o.pass_reason ? ` <span class="faint">${esc(reasonText(o.pass_reason))}</span>` : ''}${o.restored_date ? ` <span class="faint">${o.lost_accepted_date ? 'had' : 'picked'} ${esc(o.lost_dog_id ? dogName(o.lost_dog_id) : 'a pup')}; back in line ${esc(fmtDate(o.restored_date))}</span>` : ''}`;
+}
+const litterLink = (id) => {
+  const l = ctx.litters.find((x) => x.id === id);
+  return l ? `<a href="litter.html?id=${encodeURIComponent(l.id)}">${esc(litterLabel(l))}</a>` : none;
+};
+
+// Offers she can still act on (Interact): an open turn, a pick awaiting its
+// deposit, a pick she can still switch, a pass she can still undo.
+function liveOffersHtml() {
+  const today = kennelToday(ctx.kennel);
+  const live = [...ctx.offers].filter((o) => !o.is_archived && offerButtons(o, today))
+    .sort((a, b) => (b.offered_date || '').localeCompare(a.offered_date || ''));
+  if (!live.length) return '';
+  const open = live.some((o) => o.outcome === 'open');
+  return `<section class="card"><h2 style="margin-top:0;">${open ? 'Their turn' : 'Recent offers'}</h2>
+    ${live.map((o, i) => {
+      const overdue = o.outcome === 'open' && isTurnOverdue(o, today);
+      return `<div style="padding:8px 0;${i ? 'border-top:1px solid var(--border);' : ''}">
+        <div><strong>${litterLink(o.litter_id)}</strong> · ${offerStatusHtml(o)}</div>
+        <div class="faint">Offered ${esc(fmtDate(o.offered_date))}${o.respond_by_date ? ` · respond by ${esc(fmtDate(o.respond_by_date))}` : ''}${overdue ? ' <span class="badge badge-red">Deadline passed</span>' : ''}</div>
+        ${offerButtons(o, today)}
+      </div>`;
+    }).join('')}
+    ${open ? '<p class="field-hint" style="margin-bottom:0;">An offer is theirs to accept AND pay: a picked pup is held for them, but it\'s only theirs once the deposit arrives by the respond-by date.</p>' : ''}
+  </section>`;
+}
+
+function wireOffers(root) {
+  root.querySelectorAll('[data-oc]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const offer = ctx.offers.find((o) => o.id === btn.dataset.offer);
+      onOfferOutcome(offer, btn.dataset.oc).catch((err) => showError(err.message || String(err)));
+    });
+  });
+}
+
+// Every offer they've had (History), newest first.
+function offersHistoryHtml() {
+  if (!ctx.offers.length) return '';
+  const offers = [...ctx.offers].sort((a, b) => (b.offered_date || '').localeCompare(a.offered_date || ''));
+  return `<section class="card"><h2 style="margin-top:0;">Offers</h2>
+      <div style="overflow-x:auto;"><table class="data"><thead><tr><th>Litter</th><th>Offered</th><th>Respond by</th><th>Outcome</th><th>Pass?</th></tr></thead><tbody>${
+        offers.map((o) => `<tr><td>${litterLink(o.litter_id)}</td>
+            <td>${esc(fmtDate(o.offered_date))}</td><td>${o.respond_by_date ? esc(fmtDate(o.respond_by_date)) : none}</td>
+            <td>${offerStatusHtml(o)}</td>
+            <td>${o.counts_as_pass ? '<span class="badge badge-amber">Counts</span>' : none}${o.notes ? ` <span class="faint" title="${esc(o.notes)}">ⓘ</span>` : ''}</td></tr>`).join('')
+      }</tbody></table></div></section>`;
+}
+
+// The timeline's offer lines: each offer, its pick, the deposit request, how it
+// ended, and a back-out from it. A placement with no offer on this device shows
+// from its sale.
+function offerTimeline(e) {
+  const litter = (id) => { const l = ctx.litters.find((x) => x.id === id); return l ? litterLabel(l) : 'a litter'; };
+  const out = [];
+  for (const o of [...ctx.offers].sort((a, b) => (a.offered_date || '').localeCompare(b.offered_date || ''))) {
+    const from = litter(o.litter_id);
+    out.push([o.offered_date, `Offered ${from}`]);
+    if (o.picked_date && o.chosen_dog_id) out.push([o.picked_date, `Picked ${dogName(o.chosen_dog_id)} from ${from}`]);
+    // A lost pup (restoreAfterLostSale): the pick and acceptance it cleared, then back in line.
+    const lostPup = o.lost_dog_id ? dogName(o.lost_dog_id) : 'their pup';
+    if (o.restored_date && o.lost_picked_date) out.push([o.lost_picked_date, `Picked ${lostPup} from ${from}`]);
+    if (o.deposit_request_sent_date) out.push([o.deposit_request_sent_date, 'Deposit request sent']);
+    if (o.restored_date && o.lost_accepted_date) out.push([o.lost_accepted_date, `Accepted ${lostPup} (deposit received)`]);
+    const ended = {
+      accepted: `Accepted ${o.chosen_dog_id ? dogName(o.chosen_dog_id) : 'a pup'} (deposit received)`,
+      passed: `Passed on ${from}${o.counts_as_pass ? ' (counted as a pass)' : ''}`,
+      no_response: `No response to the ${from} offer${o.counts_as_pass ? ' (counted as a pass)' : ''}`,
+      voided: `The ${from} offer was closed`
+    }[o.outcome];
+    if (o.restored_date) {
+      out.push([o.restored_date, o.lost_accepted_date ? `Back in line in their original place after losing ${lostPup}` : `Their pick of ${lostPup} was cleared after losing ${lostPup}; time to pick another`]);
+      if (o.outcome === 'voided' && o.outcome_date && o.outcome_date !== o.restored_date) out.push([o.outcome_date, ended]);
+      else if (o.outcome !== 'voided' && ended && o.outcome_date) out.push([o.outcome_date, ended]);
+    } else if (ended && o.outcome_date) out.push([o.outcome_date, ended]);
+    if (o.backed_out_date) out.push([o.backed_out_date, `Backed out of ${o.chosen_dog_id ? dogName(o.chosen_dog_id) : 'their pup'}`]);
+  }
+  const sale = e.placed_sale_id ? ctx.sales.find((x) => x.id === e.placed_sale_id) : null;
+  if (sale && !ctx.offers.some((o) => o.outcome === 'accepted' && o.sale_id === sale.id)) {
+    out.push([sale.deposit_date || sale.sale_date || null, `Placed with ${sale.dog_id ? dogName(sale.dog_id) : 'a pup'}`]);
+  }
+  return out;
+}
+
+// The timeline's request lines: what they asked for on their status page, and what
+// she decided. A one-at-a-time request (pause, litters, Companion link, backing out)
+// keeps only its latest; extras and pickups keep each one.
+function requestTimeline(e) {
+  const out = [];
+  const decision = (r, what) => {
+    if (!r.decided || !r.decided_date) return;
+    const outcome = r.outcome === 'move' ? (Number(r.credit) > 0 ? ` (back in line with a ${fmtMoney(Number(r.credit))} credit)` : r.credit === 0 ? ' (back in line, no credit)' : ' (moved the deposit)')
+      : { keep: ' (kept what they paid)', refund: ' (refunded)' }[r.outcome] || '';
+    out.push([r.decided_date, r.decided === 'sent' ? `You sent ${what}` : `You ${r.decided === 'declined' ? 'declined' : 'approved'} ${what}${outcome}`]);
+  };
+  const one = (r, asked, what) => { if (!r?.requested_date) return; out.push([r.requested_date, asked]); decision(r, what); };
+  one(e.pause_request, e.pause_request?.until ? `Asked to pause until ${fmtDate(e.pause_request.until)}` : 'Asked to pause', 'their pause');
+  one(e.listen_change_request, 'Asked to change which litters they wait for', 'their litters change');
+  one(e.companion_request, 'Asked for their Companion link', 'their Companion link');
+  if (e.pref_change_request?.requested_date) out.push([e.pref_change_request.requested_date, 'Asked to change their answers']);
+  one(e.back_out_request, `Asked to back out${e.back_out_request?.reason?.label ? ` (${e.back_out_request.reason.label})` : ''}`, 'backing out');
+  for (const r of e.extra_requests || []) {
+    if (!r?.requested_date) continue;
+    out.push([r.requested_date, r.kind === 'cancel' ? `Asked to cancel ${r.name}` : `Asked for ${r.name}`]);
+    decision(r, r.kind === 'cancel' ? `cancelling ${r.name}` : r.name);
+  }
+  for (const r of e.pickup_requests || []) {
+    if (!r?.requested_date) continue;
+    const when = r.date ? `${fmtDate(r.date)}${r.start_time ? `, ${timeRange({ start_time: r.start_time, end_time: r.end_time || '' })}` : ''}` : '';
+    out.push([r.requested_date, r.kind === 'cancel' ? 'Asked to cancel their pickup time'
+      : r.kind === 'address' ? `Asked to meet at ${r.address}${when ? ` on ${when}` : r.start_time ? `, ${timeRange({ start_time: r.start_time })}` : ''}`
+        : `Asked for a pickup on ${when}${r.place ? ` at ${r.place}` : ''}`]);
+    decision(r, r.kind === 'cancel' ? 'cancelling their pickup' : r.kind === 'address' ? 'their meetup place' : 'their pickup time');
+  }
+  return out;
+}
+
+// Key dates and her changes to their answers (History): the running log of what
+// happened to this family, newest first.
+function timelineHtml() {
+  const e = ctx.entry;
+  const items = [
+    [e.applied_date, `Applied${e.source === 'online_form' ? ' through your online form' : ''}`],
+    [e.approved_date, 'Approved'],
+    [e.fee_received_date, Number(e.fee_amount) > 0 ? `Fee received (${fmtMoney(e.fee_amount)})` : 'Joined the list'],
+    [e.soon_notified_date, 'Told "almost your turn"'],
+    [e.declined_date, 'Application declined'],
+    [e.withdrawn_date, 'Withdrew'],
+    [e.removed_date, `Removed${e.removed_reason ? ` (${descriptor(WAITLIST_REMOVED_REASON, e.removed_reason).label.toLowerCase()})` : ''}`],
+    ...offerTimeline(e),
+    ...requestTimeline(e),
+    ...(e.merged_applications || []).map((x) => [x.date, `Merged a duplicate application${x.name ? ` from ${x.name}` : ''}${x.applied_date ? ` (applied ${fmtDate(x.applied_date)})` : ''}; it was deleted${x.fee_credit ? `, and its ${fmtMoney(x.fee_credit)} fee became a credit` : ''}`]),
+    ...(e.pref_change_log || []).map((x) => [x.date, `${PREF_FIELD_LABEL[x.field] || x.field}: ${prefValueText(x.field, x.from)} → ${prefValueText(x.field, x.to)}${x.declined ? ' (they asked; you declined)' : x.by === 'request' ? ' (they asked)' : ''}`])
+  ].filter(([d]) => d)
+    // Newest first, and within a day the later step first (items are listed in order).
+    .map((x, i) => [...x, i]).sort((a, b) => String(b[0]).localeCompare(String(a[0])) || b[2] - a[2]);
+  if (!items.length) return '';
+  return `<section class="card"><h2 style="margin-top:0;">Timeline</h2>
+    <ul style="list-style:none;margin:0;padding:0;">${items.map(([d, t], i) => `<li style="padding:5px 0;${i ? 'border-top:1px solid var(--border);' : ''}"><span class="faint">${esc(fmtDate(d))}</span> · ${esc(t)}</li>`).join('')}</ul>
+  </section>`;
+}
+
+// --- Documents: one invoice and one receipt per charge (Payment Schedule plan §6.2) ----
+
+// The application fee's, the deposit's, a receipt for each payment and an invoice for
+// the next payment (familyMoney.familyDocs), each a pick the document reads live.
+function familyDocList() {
+  return ctx.family ? familyDocs(ctx.family.account, { money: fmtMoney, date: fmtDate }) : [];
+}
+
+const docHref = (d) => `invoice.html?source=family&entry=${encodeURIComponent(ctx.entry.id)}&doc=${d.doc}&cfg=${encodeURIComponent(JSON.stringify({ v: 2, pick: d.pick }))}`;
+
+function docsHtml() {
+  const docs = familyDocList();
+  if (!docs.length) return '';
+  return `<section class="card">
+      <h2 style="margin-top:0;">Documents</h2>
+      ${docs.map((d, i) => `<div class="row-between" style="padding:6px 0;border-top:${i ? '1px solid var(--border)' : '0'};gap:8px;flex-wrap:wrap;">
+          <span>${esc(d.label)}</span>
+          <span class="pill-row"><a class="btn btn-sm" href="${esc(docHref(d))}">View</a><button class="btn btn-sm btn-primary" data-pdf="${i}">Download PDF</button></span>
+        </div>`).join('')}
+      <div class="pill-row" style="margin-top:8px;"><button class="btn btn-sm" data-act="combined-doc">Make a combined invoice or receipt</button></div>
+    </section>`;
+}
+
+function wireDocs(root) {
+  const docs = familyDocList();
+  root.querySelectorAll('[data-pdf]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        const { downloadInvoicePdf } = await import('../assets/invoicePdf.js');
+        const d = docs[Number(btn.dataset.pdf)];
+        await downloadInvoicePdf({ source: 'family', entry: ctx.entry.id, doc: d.doc, cfg: { v: 2, pick: d.pick } });
+      } catch (err) {
+        showError(err.message || String(err));
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
+  root.querySelector('[data-act="combined-doc"]')?.addEventListener('click', async () => {
+    try {
+      const { openInvoiceGenerator } = await import('../assets/invoiceGenerator.js');
+      await openInvoiceGenerator({ preselect: { source: 'entry', id: ctx.entry.id }, onClose: () => afterAction() });
+    } catch (err) { showError(err.message || String(err)); }
+  });
+}
+
+// --- Edit lifecycle -----------------------------------------------------------------
+
+function startEdit() {
+  clearError();
+  ctx.mode = 'edit';
+  ctx.draft = structuredClone(ctx.entry);
+  renderAll();
+}
+
+// Save / Cancel while editing or entering a new application (Edit itself is on
+// the Details tab).
+function renderProfileActions() {
+  els.profileActions.innerHTML = `<button class="btn btn-primary btn-sm" id="btn-save">${ctx.mode === 'new' ? 'Save application' : 'Save'}</button><button class="btn btn-sm" id="btn-cancel">Cancel</button>`;
+  document.getElementById('btn-save').onclick = save;
+  document.getElementById('btn-cancel').onclick = () => {
+    clearError();
+    if (ctx.mode === 'new') { location.href = `waitlist.html?kennel=${encodeURIComponent(ctx.kennel.id)}`; return; }
+    ctx.mode = 'view';
+    renderAll();
+  };
+}
+
+// Narrowing an answer while the family has an open offer, or is next for a litter,
+// is what a family could use to dodge a pass (Spec §15.9), so she confirms it.
+// Widening, or narrowing with nothing at stake, saves without asking.
+async function confirmNarrowing(changes) {
+  const e = ctx.entry;
+  const fx = prefChangeEffect(e, changes, {
+    litters: waitlistLitters(ctx.kennel, ctx.litters),
+    entries: ctx.kennelEntries, offers: ctx.kennelOffers, pups: [...ctx.dogsById.values()], sales: ctx.sales,
+    today: kennelToday(ctx.kennel), config: ctx.config, programsById: ctx.programs
+  });
+  if (!fx.openOffers.length && !fx.skippedLitters.length) return true;
+  const lines = [`Narrower: ${fx.narrowed.map((f) => PREF_FIELD_LABEL[f]).join(', ')}.`];
+  for (const l of fx.skippedLitters) lines.push(`They're next for ${litterLabel(l)}. This skips them there, with no pass counted.`);
+  for (const o of fx.openOffers) {
+    const l = ctx.litters.find((x) => x.id === o.litter_id);
+    lines.push(`Their open offer on ${l ? litterLabel(l) : 'a litter'}${o.respond_by_date ? ` (until ${fmtDate(o.respond_by_date)})` : ''} stays open. Passing on it still counts as a pass.`);
+  }
+  lines.push('Make sure this is a real change and not a way around a pass. It goes in their answer history.');
+  return confirmModal({ title: `Narrow what ${entryName(e, ctx.contact)} asked for?`, message: lines.join('\n\n'), confirmLabel: 'Save anyway' });
+}
+
+async function save() {
+  const btn = document.getElementById('btn-save');
+  if (btn?.disabled) return;
+  if (btn) btn.disabled = true;
+  clearError();
+  try {
+    const changes = readForm();
+    if (ctx.mode === 'new') {
+      const saved = await waitlistEntryRepo.create({ ...changes, kennel_id: ctx.kennel.id, status: 'applied' });
+      location.href = `waitlist-entry.html?id=${encodeURIComponent(saved.id)}`;
+      return;
+    }
+    if (!(await confirmNarrowing(changes))) return;
+    await waitlistEntryRepo.update(ctx.entry.id, changes);
+    ctx.mode = 'view';
+    await reload();
+    renderAll();
+  } catch (e) {
+    showError(e.message || String(e));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// A new Reservation contract for this family (contract.html), their contact and
+// preferences already picked; she checks the litter and deposit there. '' without
+// contracts in this edition or a contact on the entry.
+function reservationHref(e) {
+  if (!editionFlags.contracts || !e.contact_id) return '';
+  const colors = (Array.isArray(e.pref_colors) ? e.pref_colors : [e.pref_colors]).filter(Boolean).join(', ');
+  const q = new URLSearchParams({ new: '1', type: 'reservation', contact: e.contact_id, sex: e.pref_sex || 'any' });
+  if (colors) q.set('color', colors);
+  return `contract.html?${q}`;
+}
+
+// Archive, Delete and New status link: rare, so behind one ⋯ menu (decided 2026-10-10).
+async function renderHeaderActions() {
+  els.headerActions.innerHTML = '';
+  if (ctx.mode === 'new') return;
+  const e = ctx.entry;
+  const blockers = await waitlistEntryRepo.getDeleteBlockers(e.id);
+  const delTitle = blockers.length
+    ? 'Referenced as ' + blockers.map((b) => `${b.label} (${b.count})`).join(', ') + ' — archive instead.'
+    : 'Permanently delete this entry (for a mistake).';
+  const link = statusLinkFor(e, ctx.kennel);
+  els.headerActions.innerHTML = `
+    <div class="action-menu" id="entry-manage">
+      <button class="btn btn-sm" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More">⋯</button>
+      <div class="action-menu-list" role="menu" hidden>
+        ${reservationHref(e) ? `<a role="menuitem" href="${esc(reservationHref(e))}" title="A reservation agreement for this family, with their preferences picked">Reservation agreement…</a><hr>` : ''}
+        ${link ? '<button type="button" role="menuitem" id="btn-newlink" title="Make a new link; the old one stops working">New status link…</button><hr>' : ''}
+        ${isLiveEntry(e) ? '<button type="button" role="menuitem" id="btn-samefamily" title="They applied twice: merge the two and delete one">Same family as another application…</button><hr>' : ''}
+        <button type="button" role="menuitem" id="btn-archive">${e.is_archived ? 'Unarchive' : 'Archive'}</button>
+        <button type="button" role="menuitem" id="btn-delete"${blockers.length ? ' disabled' : ''} title="${esc(delTitle)}">Delete…</button>
+      </div>
+    </div>`;
+  wireActionMenu(document.getElementById('entry-manage'));
+  document.getElementById('btn-newlink')?.addEventListener('click', () => onNewLink().catch((err) => showError(err.message || String(err))));
+  document.getElementById('btn-samefamily')?.addEventListener('click', () => onSameFamily().catch((err) => showError(err.message || String(err))));
+  document.getElementById('btn-archive').onclick = async () => {
+    const verb = e.is_archived ? 'Unarchive' : 'Archive';
+    if (!(await confirmModal({ title: `${verb} this entry?`, message: e.is_archived ? '' : `Archived entries are hidden from the waitlist and drop off the list.${openOfferWarning()}`, confirmLabel: verb }))) return;
+    try {
+      if (e.is_archived) {
+        await waitlistEntryRepo.unarchive(e.id);
+        await afterAction();
+      } else {
+        const res = await actions.archiveEntry(e.id);
+        await afterAction();
+        await reportLeaving(res);
+      }
+    } catch (err) { showError(err.message || String(err)); }
+  };
+  if (!blockers.length) {
+    document.getElementById('btn-delete').onclick = async () => {
+      if (!(await confirmModal({ title: 'Delete this entry?', message: 'This cannot be undone.', confirmLabel: 'Delete', danger: true }))) return;
+      try {
+        await waitlistEntryRepo.hardDelete(e.id);
+        // An online application also leaves the server, so a new device can't bring it back.
+        if (e.source === 'online_form') await import('../data/cloud/cloudWaitlist.js').then((m) => m.forgetApplication(e)).catch(() => {});
+        location.href = `waitlist.html?kennel=${encodeURIComponent(e.kennel_id)}`;
+      } catch (err) {
+        if (err instanceof ReferenceBlockedError) renderHeaderActions();
+        showError(err.message || String(err));
+      }
+    };
+  }
+}
+
+function renderTitle() {
+  if (ctx.mode === 'new') {
+    els.title.textContent = 'New application';
+    els.subtitle.textContent = `For ${ctx.kennel.kennel_name}'s waitlist. Type in what the family told you; you'll review and approve it next.`;
+    return;
+  }
+  const e = ctx.entry;
+  els.title.innerHTML = esc(entryName(e, ctx.contact)) + (e.is_archived ? ' <span class="badge badge-gray">Archived</span>' : '');
+  // Short, so the ⋯ menu keeps its place on a phone; Details' "Family page only"
+  // badge says they aren't on the list.
+  els.subtitle.textContent = isFamilyPageOnly(e) ? `${ctx.kennel.kennel_name} family page` : `${ctx.kennel.kennel_name} waitlist`;
+}
+
+// --- The three tabs (decided 2026-10-10) ---------------------------------------------
+
+const TABS = [
+  { id: 'details', label: 'Details' },
+  { id: 'interact', label: 'Interact' },
+  { id: 'history', label: 'History' }
+];
+
+// How many things wait on her in Interact: their requests, an open turn, a lost pup.
+function interactCount(e) {
+  return pendingRequests(e).length
+    + (holdsTurn(ctx.offers, e.id) ? 1 : 0)
+    + (lostSale(e) ? 1 : 0)
+    + suggestions(e).length;
+}
+
+// The tab a family's page opens on: Interact when something waits on her there,
+// History when only an unread message does, else Details. #details / #interact /
+// #history in the address wins (so a reload stays put).
+function defaultTab(e) {
+  const hash = location.hash.slice(1);
+  if (TABS.some((t) => t.id === hash)) return hash;
+  if (interactCount(e)) return 'interact';
+  if (unreadCount(e)) return 'history';
+  return 'details';
+}
+
+function renderTabs() {
+  const e = ctx.entry;
+  const counts = { interact: interactCount(e), history: unreadCount(e) };
+  els.tabs.innerHTML = TABS.map((t) => `<button type="button" class="seg-tab${t.id === ctx.tab ? ' active' : ''}" role="tab" aria-selected="${t.id === ctx.tab}" data-tab="${t.id}">${esc(t.label)}${counts[t.id] ? ` <span class="badge badge-amber">${counts[t.id]}</span>` : ''}</button>`).join('');
+  els.tabs.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => {
+    ctx.tab = b.dataset.tab;
+    history.replaceState(null, '', `#${ctx.tab}`);
+    renderAll();
+  }));
+  for (const t of TABS) els.panes[t.id].hidden = t.id !== ctx.tab;
+}
+
+// Details: where they stand, Edit, their answers and application, and the one way
+// off the list for their status.
+function renderDetails() {
+  const e = ctx.entry;
+  const listed = dnsMatches(e).some((m) => m.strength === 'certain');
+  const dnsBtn = listed ? '' : '<button class="btn btn-sm" data-act="dns">Add to do-not-sell list…</button>';
+  const leave = LEAVE_CHOICES[e.status] || dnsBtn ? `<div class="pill-row" style="margin-top:12px;">${LEAVE_CHOICES[e.status] ? `<button class="btn btn-danger btn-sm" data-act="leave">${esc(leaveLabel(e))}</button>` : ''}${dnsBtn}</div>` : '';
+  const pane = els.panes.details;
+  pane.innerHTML = `
+    ${dnsWarningHtml(e)}
+    ${duplicatesHtml(e)}
+    ${suggestionsHtml(e)}
+    <section class="card">
+      <h2 style="margin:0 0 6px;">${badge(WAITLIST_ENTRY_STATUS, e.status)}</h2>
+      ${statusLines(e).map((l) => `<p style="margin:4px 0;">${l}</p>`).join('')}
+    </section>
+    ${paymentsHtml()}
+    ${creditsHtml(e)}
+    <section class="card">
+      <div class="row-between"><h2 style="margin:0;">Their details</h2><button class="btn btn-sm" data-act="edit">Edit</button></div>
+      ${detailsDlHtml()}
+      ${leave}
+    </section>`;
+  pane.querySelector('[data-act="edit"]').addEventListener('click', startEdit);
+  const fail = (err) => showError(err.message || String(err));
+  const payCard = pane.querySelector('[data-payments]');
+  if (payCard) wirePaymentsCard(payCard, { loaded: ctx.payments, accounts: ctx.paymentAccounts, savedList: savedSchedules(ctx.kennel), onChanged: () => afterAction() });
+  pane.querySelector('[data-act="credit-add"]').addEventListener('click', () => onAddCredit().catch(fail));
+  pane.querySelectorAll('[data-credit-edit]').forEach((b) => b.addEventListener('click', () => onAddCredit(creditsOf(ctx.entry).find((c) => c.id === b.dataset.creditEdit)).catch(fail)));
+  pane.querySelectorAll('[data-credit-remove]').forEach((b) => b.addEventListener('click', () => onRemoveCredit(b.dataset.creditRemove).catch(fail)));
+  pane.querySelector('[data-act="leave"]')?.addEventListener('click', () => onLeave().catch((err) => showError(err.message || String(err))));
+  pane.querySelector('[data-act="dns"]')?.addEventListener('click', () => onAddDoNotSell().catch(fail));
+  wireSuggestions(pane);
+  wireDuplicates(pane);
+  // "Ready now?" answered for them (they told her by phone or message).
+  pane.querySelector('[data-ready="yes"]')?.addEventListener('click', () => actions.recordReadyAnswer(e.id, { answer: 'yes', by: 'breeder' })
+    .then(afterAction).catch((err) => showError(err.message || String(err))));
+}
+
+// --- Side sale (Side Sale Spec) ----------------------------------------------------
+// Their pending side sale: a sale she made outside the turn order. To them it looks
+// like a turn pick; here it says what it is, with its deposit and cancel.
+function sideSaleHtml(e) {
+  const sale = sideSaleOf(e, ctx.sales);
+  if (!sale) return '';
+  const today = kennelToday(ctx.kennel);
+  const overdue = sale.side_deposit_due && sale.side_deposit_due < today;
+  const claims = pupClaims(sale.dog_id, { sales: ctx.sales, offers: ctx.kennelOffers });
+  const dog = ctx.dogsById.get(sale.dog_id);
+  const litter = dog ? ctx.litters.find((l) => l.id === dog.litter_id) : null;
+  const send = canPickToSend();
+  return `<section class="card"><h2 style="margin-top:0;">Side sale</h2>
+    <div><strong>${litter ? litterLink(litter.id) : none}</strong> · <span class="badge badge-purple">Picked ${esc(dogName(sale.dog_id))}</span> <span class="faint">deposit pending · <a href="sale.html?id=${encodeURIComponent(sale.id)}">sale</a></span>${sale.side_request_sent_date ? ` <span class="badge badge-blue">Deposit request sent ${esc(fmtDate(sale.side_request_sent_date))}</span>` : ''}${claims.length > 1 ? ' <span class="badge badge-red">Two sales on this pup</span>' : ''}</div>
+    <div class="faint">Recorded ${esc(fmtDate(sale.sale_date))} · deposit due ${esc(fmtDate(sale.side_deposit_due))}${overdue ? ' <span class="badge badge-red">Deposit overdue</span>' : ''}${sale.side_holds_pup ? ` · ${esc(dogName(sale.dog_id))} is held for them` : ` · ${esc(dogName(sale.dog_id))} is still offered to other families until the deposit`}</div>
+    <div class="pill-row" style="margin-top:6px;">
+      ${send ? `<button class="btn btn-primary btn-sm" data-side="send">${sale.side_request_sent_date ? 'Review sale & send again…' : 'Review sale & send…'}</button>` : ''}
+      <button class="btn btn-sm${send ? '' : ' btn-primary'}" data-side="deposit">Deposit received…</button>
+      <button class="btn btn-sm" data-side="cancel">Cancel side sale…</button>
+    </div>
+    <p class="field-hint" style="margin-bottom:0;">Outside the turn order: no turn moves on for it and it never counts as a pass. Their status page shows it like a pick on their turn.</p>
+  </section>`;
+}
+
+// The shape openPickToSend reads, for a side sale.
+const sideSaleOffer = (sale) => ({ side: true, id: sale.id, sale_id: sale.id, respond_by_date: sale.side_deposit_due, deposit_request_sent_date: sale.side_request_sent_date || null });
+
+function wireSideSale(root) {
+  const fail = (err) => showError(err.message || String(err));
+  const sale = sideSaleOf(ctx.entry, ctx.sales);
+  if (!sale) return;
+  const name = entryName(ctx.entry, ctx.contact);
+  const pupName = dogName(sale.dog_id);
+  root.querySelector('[data-side="send"]')?.addEventListener('click', async () => {
+    try {
+      const { openPickToSend } = await import('../assets/pickToSend.js');
+      const dog = ctx.dogsById.get(sale.dog_id);
+      const litter = dog ? ctx.litters.find((l) => l.id === dog.litter_id) : null;
+      if (await openPickToSend({ offer: sideSaleOffer(sale), entry: ctx.entry, contact: ctx.contact, litterLabel: litter ? litterLabel(litter) : '', paymentText: ctx.config.payment_instructions || '', kennelName: ctx.kennel?.kennel_name || '' })) await afterAction();
+    } catch (err) { fail(err); }
+  });
+  root.querySelector('[data-side="deposit"]')?.addEventListener('click', async () => {
+    try {
+      const res = await sideDepositDialog({ sale, name, pupName });
+      if (!res) return;
+      await afterAction();
+      await alertModal({ title: `${name} is placed`, message: [`Deposit recorded for ${pupName}.`, ...offerChangeLines(res)].join('\n\n') });
+    } catch (err) { fail(err); }
+  });
+  root.querySelector('[data-side="cancel"]')?.addEventListener('click', async () => {
+    try {
+      const res = await cancelSideSaleDialog({ sale, name, pupName });
+      if (!res) return;
+      await afterAction();
+      await alertModal({ title: 'Side sale cancelled', message: `${name} keeps their place on the list.${res.restored ? ` ${pupName} is back to ${res.restored.replace('_', ' ')}.` : ''} Let them know.` });
+    } catch (err) { fail(err); }
+  });
+}
+
+async function onSideSale() {
+  const res = await sideSaleDialog({ kennelId: ctx.entry.kennel_id, entryId: ctx.entry.id });
+  if (!res) return;
+  await afterAction();
+  const name = entryName(ctx.entry, ctx.contact);
+  if (res.depositDone) {
+    await alertModal({ title: `${name} is placed`, message: `Their deposit carried over from the pup they lost is recorded as paid for ${res.dog.call_name}.` });
+    return;
+  }
+  const held = `${res.dog.call_name} is ${res.sale.side_holds_pup ? 'held for' : 'set aside for'} ${name} until ${fmtDate(res.sale.side_deposit_due)}${res.sale.side_holds_pup ? '' : ' (still offered to other families until the deposit)'}.`;
+  if (canPickToSend()) {
+    if (await confirmModal({ title: 'Side sale recorded', message: `${held}\n\nReview the sale and send them the deposit request (with the invoice and contract) now?`, confirmLabel: 'Review sale & send', cancelLabel: 'Later' })) {
+      const fresh = await saleRepo.getById(res.sale.id);
+      const { openPickToSend } = await import('../assets/pickToSend.js');
+      const litter = ctx.litters.find((l) => l.id === res.dog.litter_id);
+      if (await openPickToSend({ offer: sideSaleOffer(fresh), entry: ctx.entry, contact: ctx.contact, litterLabel: litter ? litterLabel(litter) : '', paymentText: ctx.config.payment_instructions || '', kennelName: ctx.kennel?.kennel_name || '' })) await afterAction();
+    }
+    return;
+  }
+  if (await confirmModal({ title: 'Side sale recorded', message: `${held} Send them the deposit details, and record "Deposit received" when it arrives.\n\nOpen the sale?`, confirmLabel: 'Open the sale', cancelLabel: 'Stay here' })) {
+    location.href = `sale.html?id=${encodeURIComponent(res.sale.id)}`;
+  }
+}
+
+// Interact: what waits on her first, then what she can start for their status.
+function interactButtons(e) {
+  const b = (act, label, cls = '') => `<button class="btn ${cls}" data-act="${act}">${esc(label)}</button>`;
+  const lost = lostSale(e) ? b('restore', e.status === 'placed' ? 'Put back in line…' : 'Give their turn back…', 'btn-primary') : '';
+  let main = '';
+  switch (e.status) {
+    case 'applied': main = b('approve', 'Approve…', 'btn-primary'); break;
+    case 'approved': main = b('fee', e.fee_amount == null ? 'Add to the list…' : 'Fee received…', 'btn-primary'); break;
+    case 'active': main = b('offer', 'Offer pups…', lost ? '' : 'btn-primary')
+      // A side sale (Side Sale Spec): outside the turn order; not while they hold the turn or already buy one.
+      + (!holdsTurn(ctx.offers, e.id) && !sideSaleOf(e, ctx.sales) ? b('side', 'Record a side sale…') : '')
+      + b('move', 'Move place…') + (canUndoFeeReceived(e, ctx.offers, kennelToday(ctx.kennel), ctx.sales) ? b('undofee', 'Undo fee received…') : ''); break;
+    case 'declined': main = (canUndoDecline(e, kennelToday(ctx.kennel)) ? b('undo', 'Undo decline', 'btn-primary') : '') + b('reapply', 'Re-apply'); break;
+    case 'expired': main = (canUndoExpire(e, kennelToday(ctx.kennel)) ? b('undo', 'Reopen application', 'btn-primary') : '') + b('reapply', 'Re-apply'); break;
+    case 'removed': main = (canUndoRemoval(e, kennelToday(ctx.kennel)) ? b('undo', 'Undo removal', 'btn-primary') : '') + b('reapply', 'Re-apply'); break;
+    case 'withdrawn': main = isFamilyPageOnly(e) ? b('reapply', 'Apply to the list…')
+      : (canUndoWithdrawal(e, kennelToday(ctx.kennel)) ? b('undo', 'Undo withdrawal', 'btn-primary') : '') + b('reapply', 'Re-apply'); break;
+    default: main = isFamilyPageOnly(e) ? b('reapply', 'Apply to the list…') : b('reapply', 'Re-apply');
+  }
+  // E3: a placed family with an open sale can be kept off the list (a family page
+  // only); one that was on the list can go back to the place it held.
+  if (e.status === 'placed' && endableSale(e)) {
+    if (!isFamilyPageOnly(e)) main += b('offlist', 'Keep off the list (family page only)…');
+    else if (e.fee_received_date) main += b('onlist', 'Put back on the list…');
+  }
+  const end = !lost && endableSale(e) ? b('endsale', 'End the sale…') : '';
+  // Add charges (owner, 2026-11-15): an extra, transport or boarding on their open sale.
+  const charges = !lost && endableSale(e) ? b('charges', 'Add charges…') : '';
+  // Their live status page, as they see it signed in (only once it's online).
+  const page = statusLinkFor(e, ctx.kennel) ? b('viewpage', 'View their page ↗') : '';
+  // Their puppy portal before the contract is signed (assets/portalEarlyUI.js).
+  const early = ctx.portalEarly?.state === 'offer' ? b('portalearly', 'Start puppy portal now…') : '';
+  return lost + main + charges + end + early + b('communicate', 'Communicate…') + page;
+}
+
+function renderInteract() {
+  const e = ctx.entry;
+  const lost = lostLine(e);
+  const pane = els.panes.interact;
+  pane.innerHTML = `
+    ${dnsWarningHtml(e)}
+    ${duplicatesHtml(e)}
+    ${['applied', 'approved'].includes(e.status) ? suggestionsHtml(e) : ''}
+    ${requestsHtml(e)}
+    ${lost ? `<section class="card"><p style="margin:0;">${lost}</p><p class="field-hint" style="margin-bottom:0;">Their place in line can come back for a pup lost through no fault of theirs.</p></section>` : ''}
+    ${sideSaleHtml(e)}
+    ${liveOffersHtml()}
+    <section class="card">
+      <h2 style="margin-top:0;">Do something</h2>
+      <div class="pill-row">${interactButtons(e)}</div>
+      ${ctx.portalEarly?.state === 'started' ? `<p class="field-hint">Their puppy portal was started early, on ${esc(fmtDate(ctx.portalEarly.sale.portal_early_on))}. The contract's signed date fills in once it's signed.</p>` : ''}
+      ${statusLinkFor(e, ctx.kennel) ? '<p class="field-hint" style="margin-bottom:0;"><strong>View their page</strong> publishes your latest changes, then opens their status page as they see it signed in. Its buttons work there, but nothing is sent.</p>' : ''}
+    </section>`;
+  wireRequests(pane);
+  wireOffers(pane);
+  wireSideSale(pane);
+  wireSuggestions(pane);
+  wireDuplicates(pane);
+  const handlers = { offlist: () => onFamilyPageOnly(true), onlist: () => onFamilyPageOnly(false), side: onSideSale, offer: onOfferLitter, approve: onApprove, fee: onFeeReceived, move: onMove, undo: onUndo, undofee: onUndoFee, reapply: onReapply, restore: onRestore, endsale: onEndSale, charges: () => onAddCharges(), communicate: onCommunicate, viewpage: () => openStatusPage(ctx.entry, ctx.kennel), portalearly: onPortalEarly };
+  pane.querySelectorAll('[data-act]').forEach((btn) => {
+    btn.addEventListener('click', () => handlers[btn.dataset.act]().catch((err) => showError(err.message || String(err))));
+  });
+}
+
+// History: the running log — messages and emails, every offer, key dates and
+// answer changes, documents.
+function renderHistory() {
+  const pane = els.panes.history;
+  const parts = [messagesHtml(ctx.entry), offersHistoryHtml(), timelineHtml(), docsHtml()].filter(Boolean);
+  pane.innerHTML = parts.length ? parts.join('') : '<section class="card"><p class="muted" style="margin:0;">Nothing here yet.</p></section>';
+  wireMessages(pane);
+  wireDocs(pane);
+}
+
+function renderAll() {
+  els.back.href = `waitlist.html?kennel=${encodeURIComponent(ctx.kennel.id)}`;
+  renderTitle();
+  renderHeaderActions();
+  const viewing = ctx.mode === 'view';
+  els.tabs.hidden = !viewing;
+  els.edit.hidden = viewing;
+  if (viewing) {
+    if (!ctx.tab) ctx.tab = defaultTab(ctx.entry);
+    renderTabs();
+    renderDetails();
+    renderInteract();
+    renderHistory();
+  } else {
+    for (const t of TABS) els.panes[t.id].hidden = true;
+    els.editTitle.textContent = ctx.mode === 'new' ? 'Application' : 'Edit details';
+    renderProfileActions();
+    renderEdit();
+  }
+}
+
+// --- Kept current, and opened from an alert (review K12-4) ------------------------
+// What families do arrives by the waitlist scheduler a moment after the page draws
+// (cloudWaitlist.js), and an alert is tapped exactly then. The page redraws when the
+// records change, but never under her hands: while she edits, a dialog is open or a
+// field has focus, it waits.
+const fromAlert = () => param('from') === 'alert';
+const TAKE_IN_WAIT_MS = 5000;
+const REDRAW_DELAY_MS = 600;
+
+const busy = () => ctx.mode !== 'view' || Boolean(document.querySelector('.modal-overlay'))
+  || ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
+
+function keepCurrent() {
+  let timer = null;
+  const redraw = async () => {
+    timer = null;
+    if (busy()) { timer = setTimeout(redraw, 3000); return; }
+    const fresh = await waitlistEntryRepo.getById(ctx.entry.id);
+    if (!fresh) return; // deleted elsewhere: leave the page as it is
+    await reload();
+    if (!busy()) renderAll();
+  };
+  window.addEventListener(CLOUD_DATA_CHANGED_EVENT, () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(redraw, REDRAW_DELAY_MS);
+  });
+}
+
+const signedInToCloud = () => isCloudAvailable() && Boolean(sessionToken());
+
+// Opened from an alert: take in what the family did before drawing (at most 5 s).
+async function takeInFirst() {
+  if (!fromAlert() || !signedInToCloud()) return;
+  els.note.innerHTML = '<p class="field-hint">Checking for anything new…</p>';
+  try {
+    const { syncWaitlistOnline } = await import('../data/cloud/cloudWaitlist.js');
+    await Promise.race([syncWaitlistOnline({ asked: true }).catch(() => {}), new Promise((r) => setTimeout(r, TAKE_IN_WAIT_MS))]);
+  } catch { /* drawn from what's here */ }
+  els.note.innerHTML = '';
+}
+
+// Opened from an alert on a device that doesn't take family events in: say where
+// they land, so a missing message isn't a mystery. → whether it said so.
+async function sayWhereEventsLand() {
+  if (!fromAlert() || !signedInToCloud()) return false;
+  try {
+    const { takeInHere, takeInHereText } = await import('../data/cloud/cloudNotify.js');
+    const text = takeInHereText(await takeInHere());
+    if (text) els.note.innerHTML = `<div class="inline-notice">${esc(text)}</div>`;
+    return Boolean(text);
+  } catch { return false; }
+}
+
+async function main() {
+  if (param('new')) {
+    const { kennel } = await resolveWaitlistKennel(param('kennel'));
+    if (!kennel) { showError('Set up your kennel first.'); return; }
+    await loadKennelContext(kennel.id);
+    ctx.mode = 'new';
+    ctx.draft = { pref_sex: 'any', listen_mode: 'all', application: {}, applied_date: todayYMD() };
+    renderAll();
+    return;
+  }
+  const id = param('id');
+  if (!id) { showError('No waitlist entry id provided.'); return; }
+  await takeInFirst();
+  const entry = await waitlistEntryRepo.getById(id);
+  if (!entry) {
+    // From an alert, the family may be on another device's records only.
+    showError(fromAlert() && signedInToCloud() ? 'This family isn’t on this device yet.' : 'Waitlist entry not found.');
+    await sayWhereEventsLand();
+    return;
+  }
+  ctx.entry = entry;
+  await reload();
+  ctx.mode = 'view';
+  renderAll();
+  keepCurrent();
+  sayWhereEventsLand();
+  // A tab in the address (#interact…), from a link or Back, switches to it.
+  window.addEventListener('hashchange', () => {
+    const tab = location.hash.slice(1);
+    if (ctx.mode !== 'view' || !TABS.some((t) => t.id === tab) || tab === ctx.tab) return;
+    ctx.tab = tab;
+    renderAll();
+  });
+}
+
+main().catch((e) => showError(e.message || String(e)));

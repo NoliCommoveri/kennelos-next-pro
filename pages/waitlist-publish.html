@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Publish your list — KennelOS</title>
+  <link rel="stylesheet" href="../assets/app.css">
+  <link rel="manifest" href="../manifest.json">
+  <link rel="icon" href="../assets/icons/favicon-32.png" sizes="32x32">
+  <link rel="apple-touch-icon" href="../assets/icons/apple-touch-icon.png">
+  <meta name="theme-color" content="#122138">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="KennelOS">
+</head>
+<body>
+  <div id="app-nav"></div>
+  <main>
+    <div class="page-header">
+      <div>
+        <a class="muted" id="back-link" href="waitlist.html">← Waitlist</a>
+        <h1 id="pub-title">Publish your list</h1>
+        <p class="page-subtitle">Share your waitlist with families: online, or as text to paste on Facebook or your website.</p>
+      </div>
+    </div>
+    <div id="page-error"></div>
+    <div id="pub-kennel-picker"></div>
+    <section class="card" id="pub-online" hidden></section>
+    <section class="card" id="pub-intro" hidden></section>
+    <section class="card" id="pub-text"></section>
+  </main>
+
+  <script type="module" src="../app.js"></script>
+  <script type="module" src="./waitlist-publish.js"></script>
+</body>
+</html>

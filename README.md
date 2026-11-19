@@ -1,1 +1,0 @@
-# kennelos-next-pro

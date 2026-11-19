@@ -1,0 +1,1510 @@
+// nudges.js — the derived-nudge engine (Data Integrity Brief §2). Computes a
+// prompt from current record state ONLY — the dismissal ledger is a separate
+// concern (data/nudgeState.js) that today.js applies when it renders: filter
+// out isDismissed(key), render the rest, wire each action button, and add a
+// generic "Dismiss" affordance next to each nudge's own action(s). Dismiss is
+// NOT part of a nudge's `actions` here — it's the same mechanism for every
+// nudge, so the renderer owns it, not each rule. The one exception is the
+// stud→pairing rule's auto-dismiss (§4.7): that's derived from `pairing_id`
+// being set, not the ledger, so it belongs here, not in the renderer.
+//
+// Nothing here mutates a record on its own; every action is a user-confirmed
+// button click.
+//
+// Fourteen rules (End-State guide §19), each producing zero or more nudges:
+// stud-service status (§4.2), promote-lifecycle (§4.3), heat→pairing (§4.5),
+// stud→pairing (§4.7), due-soon and overdue pairing rules (an Expected litter
+// on file turns them into "record the birth"), an Expected litter past its date
+// that no pairing covers (litteroverdue), four linked-status rules
+// (litter whelped → pairing, pairing ended → expected litter, pairing whelped →
+// no litter, a Deceased dog's open sales and pairings), three litter-lifecycle
+// rules (litter→sold / reopen / close) grouped over each litter's roster below,
+// and the Pro-only show-track-complete → "log the title?" rule (Show Tracking
+// Spec §5.4, gated on editionFlags.shows). Plus the Pro-only waitlist rules
+// (Waitlist Spec §6.5, gated on editionFlags.waitlist): new applications, an
+// offer past its deadline, a fee past its pay-by date, and the 7-day undo on a
+// second-pass removal — each a one-tap suggestion, never an automatic write;
+// and, from W2 step 5, what families asked for or said on their status page (a
+// pause, a listen-only narrowing, an answer change: Approve / Decline; messages
+// and activity: Mark read). And (Pro) what a connected vendor reported that her
+// device didn't apply by itself (Integrations plan §0): Done.
+//   { key, title, detail, subjectHref, actions: [{ label, run: async () => {}, confirm?, ask? }] }
+// An action with `confirm: true` must be confirmed first — the renderer shows
+// `ask` (confirmModal options) and runs it only on yes (Lite's permanent departure).
+// `run` may resolve to { title, message }, which Today shows once it's done.
+import { studServiceRepo } from './studServiceRepo.js';
+import { dogRepo } from './dogRepo.js';
+import { kennelRepo } from './kennelRepo.js';
+import { pairingRepo } from './pairingRepo.js';
+import { litterSoldDue, litterReopenDue, litterCloseDue } from './litterCheckin.js';
+import { goHomeIssue, GO_HOME_SALE_STATUSES, defaultStart, boardingEnd, boardingChargeText, PICKUP_TITLE, DROPOFF_TITLE, BOARDING_TITLE, readyDateOf, trainingStaysFor, trainingStayEvent, orphanTrainingStays, stayPickupPlan, afterStays, pickupEvent } from './goHome.js';
+import { litterRepo } from './litterRepo.js';
+import { saleRepo } from './saleRepo.js';
+import { eventRepo } from './eventRepo.js';
+import { dogsInScope, inScopeOnly, subjectInScope, getActiveKennelId } from './kennelScope.js';
+import { hasPolicies } from './waitlistForm.js';
+import { isWaitlistOnlineOffered } from './cloud/cloudConfig.js';
+import { todayYMD, kennelToday, monthsBetween, addDaysToYMD } from './dateUtils.js';
+
+// A heat with no end date logged is taken as over this many days after it started
+// (a typical heat runs about three weeks), for the "record a pairing?" nudge.
+export const HEAT_OPEN_DAYS = 21;
+import { descriptor, PAIRING_STATUS, LITTER_STATUS, SALE_STATUS, isOpenSale, PAIRING_ENDED_STATUSES, WHELPED_OR_LATER } from './vocab.js';
+import { editionFlags } from './editionConfig.js';
+import { showRecordFrom } from './showPoints.js';
+import { waitlistEntryRepo } from './waitlistEntryRepo.js';
+import { waitlistOfferRepo } from './waitlistOfferRepo.js';
+import { duplicateApplicationPairs, duplicateDismissKeys, matchReasonText } from './applicationDuplicates.js';
+import { isDismissed } from './nudgeState.js';
+import { contactRepo } from './contactRepo.js';
+import { accountRepo } from './accountRepo.js';
+import { goHomeDate, daysBetween, followUpMessage, sharedReferrals, FOLLOW_UP_DAYS, FOLLOW_UP_WINDOW_DAYS } from './referralShare.js';
+import { saleExtraCharges, stepDueDate, stepLabel } from './extraCharges.js';
+import { hasSchedule } from './paymentSchedule.js';
+import { getSaleStatements } from './incomeView.js';
+import { waitlistProgramRepo } from './waitlistProgramRepo.js';
+import {
+  overdueTurns, overdueFees, canUndoRemoval, entryName, describeOfferChanges, waitlistConfig, businessDays, autoOffers, closingTrigger,
+  prefChangeSummary, prefChangeEffect, PREF_FIELD_LABEL, depositsDueLitters,
+  readyCheck, readyCheckOverdue, isSideSalePending, pupClaims, waitlistLitters
+} from './waitlistRules.js';
+import {
+  recordOutcome, markFeeExpired, recordReadyAnswer, undoRemoval, cancelSideSale, hasPendingRequest, markMessagesRead,
+  approvePauseRequest, declinePauseRequest, approvePrefChange, declinePrefChange, approveListenChange, declineListenChange,
+  markCompanionLinkSent, declineCompanionRequest, approveExtraRequest, declineExtraRequest, approvePickupRequest, declinePickupRequest,
+  pickupWishesFor
+} from './waitlistActions.js';
+import { pendingExtraRequests } from './familyExtras.js';
+import { pendingPickupRequests, requestText as pickupRequestText } from './familyPickup.js';
+import { offerSpecs, isHeldEmail, retryEmail, dropEmail } from './waitlistOutbox.js';
+import { outcomeReport } from './waitlistReview.js';
+import { contractRepo } from './contractRepo.js';
+import { ourStudPairingIds, studParents, pickDue, serviceDate, boardingEndedUpdate } from './studRules.js';
+import { reviewTitle } from './integrationEvents.js';
+import { heatForecast, heatBasisText, preventativeGaps, monthOf, monthName } from './dogCare.js';
+
+const TERMINAL_PAIRING_STATUSES = ['cancelled', 'failed'];
+
+// Pre-whelp: still expecting a litter, not yet resolved one way or the other.
+const PRE_WHELP_STATUSES = ['planned', 'bred', 'confirmed_pregnant'];
+
+// How many days before a pairing's expected due date the "due soon — create the
+// litter?" nudge starts.
+const DUE_SOON_DAYS = 3;
+
+// How far back the "pairing whelped, no litter" rule looks (see that rule).
+const LITTER_RECORD_WINDOW_DAYS = 180;
+
+// Shared dedup (§4.5/§4.7): is there already a live pairing for this dam,
+// opened on/after `sinceYMD`? "Opened" prefers planned_date, falling back to
+// created_at for a pairing entered without one — either way, a pairing that
+// predates the window in question doesn't count as "already handled."
+function pairingExistsForDam(pairings, damId, sinceYMD) {
+  return pairings.some((p) => {
+    if (p.dam_id !== damId || TERMINAL_PAIRING_STATUSES.includes(p.status)) return false;
+    if (!sinceYMD) return true;
+    const openedOn = p.planned_date || (p.created_at || '').slice(0, 10);
+    return !openedOn || openedOn >= sinceYMD;
+  });
+}
+
+function studPartnerLabel(s, dogsById) {
+  return `${dogsById.get(s.our_dog_id)?.call_name || 'Our dog'} × ${dogsById.get(s.partner_dog_id)?.call_name || 'partner'}`;
+}
+
+function pairingLabel(p, dogsById) {
+  return `${dogsById.get(p.dam_id)?.call_name || 'Dam'} × ${dogsById.get(p.sire_id)?.call_name || 'Sire'}`;
+}
+
+// Litter display label — mirrors the litter page's title logic: the nickname
+// leads when present, otherwise dam × sire.
+function litterLabel(l, dogsById) {
+  return l.nickname || `${dogsById.get(l.dam_id)?.call_name || 'Dam'} × ${dogsById.get(l.sire_id)?.call_name || 'Sire'}`;
+}
+
+// §4.2 — stud-service status nudges. Never both at once for the same record:
+// if the return date has already passed, prefer the "completed" nudge over
+// "in progress" (checked first in the caller's loop).
+function studCompletedNudge(s, dogsById) {
+  return {
+    key: `studstatus:${s.id}:completed`,
+    title: 'Mark this stud service completed?',
+    detail: `${studPartnerLabel(s, dogsById)} — returned ${s.returned_date}.`,
+    subjectHref: `stud-service.html?id=${encodeURIComponent(s.id)}`,
+    actions: [
+      { label: 'Mark completed', run: async () => { await studServiceRepo.update(s.id, { status: 'completed' }); } }
+    ]
+  };
+}
+
+function studInProgressNudge(s, dogsById) {
+  return {
+    key: `studstatus:${s.id}:in_progress`,
+    title: 'Mark this stud service in progress?',
+    detail: `${studPartnerLabel(s, dogsById)} — sent ${s.sent_date}.`,
+    subjectHref: `stud-service.html?id=${encodeURIComponent(s.id)}`,
+    actions: [
+      { label: 'Mark in progress', run: async () => { await studServiceRepo.update(s.id, { status: 'in_progress' }); } }
+    ]
+  };
+}
+
+// A puppy that died is archived, so it leaves the Dogs list but stays on its
+// litter's roster with its history (archive is a soft delete). Pro archives it
+// outright; Lite has no free Archive, only the permanent "remove from program"
+// departure (cap spec §5), so there the action carries `confirm: true` and the
+// caller asks `ask` first. `ask` is also the question for a caller that offers it
+// on its own (salePrompts, when a sale ends because the pup died).
+export function deceasedArchiveAction(dog) {
+  const name = dog.call_name || dog.registered_name || 'this dog';
+  const run = async () => { await dogRepo.archive(dog.id); };
+  if (editionFlags.manualDogArchive) {
+    return {
+      label: 'Archive', run,
+      ask: {
+        title: `Archive ${name} too?`,
+        message: `${name} leaves your Dogs list but stays on the litter, with all its history.`,
+        confirmLabel: 'Archive', cancelLabel: 'Keep on list'
+      }
+    };
+  }
+  return {
+    label: 'Remove from program', run, confirm: true,
+    ask: {
+      title: `Remove “${name}” from your program?`,
+      message: `This can't be undone here — ${name} leaves your roster and you won't be able to edit it or bring it back. It stays in your dogs' pedigrees for lineage.`,
+      confirmLabel: 'Remove permanently', cancelLabel: 'Keep on roster', danger: true
+    }
+  };
+}
+
+// Today offers the archive for a dog that died young (before its first
+// birthday, by date of birth, else its litter's whelp date) in the last
+// DECEASED_ARCHIVE_WINDOW_DAYS — a pup, not a breeding dog that died (those stay
+// listed under Not breeding → Deceased unless she archives them herself), and
+// not every pup that died years ago.
+const DECEASED_ARCHIVE_WINDOW_DAYS = 90;
+const PUPPY_MAX_MONTHS = 12;
+function diedAsPuppyRecently(d, littersById, today) {
+  const died = d.date_of_death || d.status_date;
+  if (!died || died < addDaysToYMD(today, -DECEASED_ARCHIVE_WINDOW_DAYS)) return false;
+  const born = d.date_of_birth || littersById?.get(d.litter_id)?.whelp_date;
+  return !!born && born <= died && monthsBetween(born, died) < PUPPY_MAX_MONTHS;
+}
+
+// What a Deceased dog leaves open: its open sales (End the sale on the sale's own
+// page, which settles the family — a waitlist family gets offered back into line)
+// and its unfinished pairings — as the dam, any still expecting a litter (Planned
+// → Cancel, Bred / Confirmed pregnant → Failed); as the sire, a Planned one only
+// (a bred pairing stands without him), and never a frozen-semen AI. Shared by
+// computeNudges (the Today backstop) and the dog page's prompt when she marks a
+// dog Deceased, so the two always list the same things.
+//
+// Last, for a puppy, archiving it (deceasedArchiveAction): on Today when it died
+// young and recently (diedAsPuppyRecently); on the dog page whenever she has just
+// moved it from Puppy to Deceased (`wasPuppy`).
+export function deceasedDogNudges(dogs, { pairings, sales, dogsById, littersById = null, wasPuppy = false, today = todayYMD() }) {
+  const out = [];
+  for (const d of dogs) {
+    // An archived one still counts for its sales and pairings: archiving a pup
+    // that died doesn't end its sale.
+    if (d.status !== 'deceased') continue;
+    const name = d.call_name || d.registered_name || 'This dog';
+    for (const s of sales) {
+      if (s.dog_id !== d.id || s.is_archived || !isOpenSale(s)) continue;
+      out.push({
+        key: `deceased-sale:${s.id}`,
+        title: `${name} is marked Deceased but still has an open sale — end it?`,
+        detail: `The sale is "${descriptor(SALE_STATUS, s.status).label}".`,
+        subjectHref: `sale.html?id=${encodeURIComponent(s.id)}`,
+        actions: [
+          { label: 'Open the sale', run: async () => { location.href = `sale.html?id=${encodeURIComponent(s.id)}`; } }
+        ]
+      });
+    }
+    for (const p of pairings) {
+      if (p.is_archived || !PRE_WHELP_STATUSES.includes(p.status)) continue;
+      const asDam = p.dam_id === d.id;
+      const asSire = p.sire_id === d.id && p.status === 'planned' && p.method !== 'ai_frozen';
+      if (!asDam && !asSire) continue;
+      const next = p.status === 'planned' ? 'cancelled' : 'failed';
+      out.push({
+        key: `deceased-pairing:${p.id}:${d.id}`,
+        title: `${name} is marked Deceased — ${next === 'cancelled' ? 'cancel' : 'close out'} ${pairingLabel(p, dogsById)}?`,
+        detail: `The pairing is still "${descriptor(PAIRING_STATUS, p.status).label}".`,
+        subjectHref: `pairing.html?id=${encodeURIComponent(p.id)}`,
+        actions: [
+          { label: next === 'cancelled' ? 'Cancel pairing' : 'Mark failed', run: async () => { await pairingRepo.update(p.id, { status: next }); } }
+        ]
+      });
+    }
+    if (!d.is_archived && (wasPuppy || diedAsPuppyRecently(d, littersById, today))) {
+      const action = deceasedArchiveAction(d);
+      out.push({
+        key: `deceased-archive:${d.id}`,
+        title: editionFlags.manualDogArchive
+          ? `${name} is marked Deceased — archive ${name}?`
+          : `${name} is marked Deceased — remove ${name} from your program?`,
+        detail: editionFlags.manualDogArchive
+          ? 'Takes the record off your Dogs list. It stays on the litter, with its history.'
+          : 'Takes the record off your roster. It stays in your dogs\' pedigrees.',
+        subjectHref: `dog.html?id=${encodeURIComponent(d.id)}`,
+        actions: [action]
+      });
+    }
+  }
+  return out;
+}
+
+export async function computeNudges() {
+  const today = todayYMD();
+  const [studServices, dogs, kennels, pairings, events, litters, sales] = await Promise.all([
+    studServiceRepo.getAll(),
+    dogRepo.getAll(),
+    kennelRepo.getAll(),
+    pairingRepo.getAll(),
+    eventRepo.getAll(),
+    litterRepo.getAll({ includeArchived: true }),
+    saleRepo.getAll()
+  ]);
+  const dogsById = new Map(dogs.map((d) => [d.id, d]));
+  const kennelsById = new Map(kennels.map((k) => [k.id, k]));
+
+  // Active-kennel scope (Multi-Kennel Scope Spec §7). A nudge is a prompt to act
+  // on one record, so each rule iterates the SCOPED set of whatever it nudges
+  // about — you should not be prompted about the kennel you aren't looking at.
+  //
+  // The unscoped originals stay in play for every LOOKUP and every "has this
+  // already been handled?" test below (`pairingExistsForDam`, `pairingIdsWithLitter`,
+  // `pupsByLitter`, `salesByDog`). That asymmetry is the point: scoping a dedup
+  // check would resurrect a nudge whose answer already exists one kennel over —
+  // "record the pairing for this stud service" when the pairing is sitting in
+  // kennel B. All four are pass-throughs when unscoped (Lite, "All kennels").
+  const scopedStudServices = inScopeOnly(studServices);
+  const scopedPairings = inScopeOnly(pairings);
+  const scopedLitters = inScopeOnly(litters);
+  const scopedDogs = dogsInScope(dogs);
+  // Pairings that already have a litter recorded against them — precomputed once
+  // so the overdue-pairing rule below is a Set lookup, not a per-pairing query
+  // (getForPairing counts archived litters too, matching includeArchived above).
+  // A live litter still Expected doesn't count: the pups haven't come, so the
+  // due-date nudges keep running and ask her to record the birth (review K09-1).
+  const liveExpectedLitter = (l) => l.status === 'expected' && !l.is_archived;
+  const pairingIdsWithLitter = new Set(litters.filter((l) => !liveExpectedLitter(l)).map((l) => l.pairing_id).filter(Boolean));
+  const expectedLitterByPairing = new Map(litters.filter((l) => liveExpectedLitter(l) && l.pairing_id).map((l) => [l.pairing_id, l]));
+  const recordBirth = (l) => ({ label: 'Record the birth', run: async () => { location.href = `kels.html?task=record-litter&litter=${encodeURIComponent(l.id)}`; } });
+  const littersByIdAll = new Map(litters.map((l) => [l.id, l]));
+  // Breedings of our stud to somebody else's dam (linked to an outgoing stud
+  // service): the litter is the dam's owner's, so no rule asks her to record it.
+  const outgoingPairings = ourStudPairingIds(studServices, dogsById);
+
+  const nudges = [];
+
+  // A stud service's trip boarded and the boarding has ended, but the service
+  // doesn't say so yet (studRules.boardingEndedUpdate): offer to bring its dates
+  // and status in line. It stands in for the status nudge below on that service.
+  const boardingUpdated = new Set();
+  for (const s of scopedStudServices) {
+    const u = boardingEndedUpdate(s, events, today);
+    if (!u) continue;
+    boardingUpdated.add(s.id);
+    const who = dogsById.get(u.boarding.subject_id)?.call_name || 'The dog';
+    const said = [
+      u.changes.returned_date || u.changes.sent_date ? `dates ${u.boarding.event_date} to ${u.boarding.event_end_date}` : '',
+      u.changes.status ? 'mark it completed' : ''
+    ].filter(Boolean).join(', ');
+    nudges.push({
+      key: `studboard:${s.id}:${u.boarding.event_end_date}`,
+      title: `${who}'s stud-service stay ended ${u.boarding.event_end_date} — update the stud service?`,
+      detail: `${studPartnerLabel(s, dogsById)}: ${said}.`,
+      subjectHref: `stud-service.html?id=${encodeURIComponent(s.id)}`,
+      actions: [
+        { label: 'Update it', run: async () => { await studServiceRepo.update(s.id, u.changes); } }
+      ]
+    });
+  }
+
+  // §4.2 — stud-service status nudges.
+  for (const s of scopedStudServices) {
+    if (boardingUpdated.has(s.id)) continue;
+    let n = null;
+    if (s.returned_date && s.returned_date < today && ['arranged', 'in_progress'].includes(s.status)) {
+      n = studCompletedNudge(s, dogsById);
+    } else if (s.sent_date && s.sent_date <= today && s.status === 'arranged') {
+      n = studInProgressNudge(s, dogsById);
+    }
+    if (n) nudges.push(n);
+  }
+
+  // §4.3 — promote-lifecycle nudge: opt-in per kennel, decide-not-auto-promote.
+  for (const d of scopedDogs) {
+    // Born: her date of birth, else her litter's whelp date (review K09-10).
+    const born = d.date_of_birth || (d.litter_id ? littersByIdAll.get(d.litter_id)?.whelp_date : null);
+    if (d.status !== 'puppy' || d.disposition !== 'keeping' || !born) continue;
+    const kennel = d.kennel_id ? kennelsById.get(d.kennel_id) : null;
+    if (!kennel || kennel.promote_nudge_enabled !== true) continue;
+    const threshold = d.sex === 'male' ? kennel.promote_age_male_months
+      : d.sex === 'female' ? kennel.promote_age_female_months : null;
+    if (threshold == null) continue;
+    const ageMonths = monthsBetween(born, today);
+    if (ageMonths < threshold) continue;
+    const key = `promote:${d.id}`;
+    nudges.push({
+      key,
+      title: `${d.call_name} is old enough — promote to active breeding?`,
+      detail: `${ageMonths} months old, kept for breeding (threshold: ${threshold}).`,
+      subjectHref: `dog.html?id=${encodeURIComponent(d.id)}`,
+      actions: [
+        { label: 'Promote', run: async () => { await dogRepo.update(d.id, { status: 'active_breeding', status_date: today }); } }
+      ]
+    });
+  }
+
+  // §4.7 — stud service completed/overdue with no linked pairing yet.
+  // Auto-dismiss: once pairing_id is set the rule produces nothing at all —
+  // no ledger entry needed, the link itself is the done-signal.
+  for (const s of scopedStudServices) {
+    if (s.pairing_id) continue;
+    const isDone = s.status === 'completed' || (s.returned_date && s.returned_date < today);
+    if (!isDone) continue;
+    const key = `studpair:${s.id}`;
+    const damId = studParents(s, dogsById)?.damId;
+    if (damId && pairingExistsForDam(pairings, damId, s.sent_date)) continue;
+    nudges.push({
+      key,
+      title: 'Record the pairing for this stud service?',
+      detail: studPartnerLabel(s, dogsById),
+      subjectHref: `stud-service.html?id=${encodeURIComponent(s.id)}`,
+      actions: [
+        { label: 'Create pairing', run: async () => { location.href = `pairing.html?new=1&stud_service=${encodeURIComponent(s.id)}`; } }
+      ]
+    });
+  }
+
+  // §4.5 — concluded heat cycle with no matching pairing since it started. A
+  // heat logged with no end date (the default in Log heat and Kels's check-in)
+  // counts as over HEAT_OPEN_DAYS after it started.
+  const heatEnd = (e) => e.event_end_date || addDaysToYMD(e.event_date, HEAT_OPEN_DAYS);
+  const concludedHeats = events.filter((e) =>
+    e.event_type === 'heat_cycle' && e.subject_type === 'dog' && e.event_date && heatEnd(e) < today
+    // Scoped through the dam the heat was logged on (an Event carries no kennel
+    // of its own — §4.1); an external dam stays scope-transparent.
+    && subjectInScope('dog', e.subject_id, { dog: dogsById })
+  );
+  for (const ev of concludedHeats) {
+    const key = `heatpair:${ev.id}`;
+    const damId = ev.subject_id;
+    if (pairingExistsForDam(pairings, damId, ev.event_date)) continue;
+    const dam = dogsById.get(damId);
+    nudges.push({
+      key,
+      title: `${dam?.call_name || 'This dam'} finished a heat — record a pairing?`,
+      detail: ev.event_end_date ? `Heat concluded ${ev.event_end_date}.` : `Heat started ${ev.event_date}, with no end date logged.`,
+      subjectHref: `dog.html?id=${encodeURIComponent(damId)}`,
+      actions: [
+        { label: 'Create pairing', run: async () => { location.href = `pairing.html?new=1&dam=${encodeURIComponent(damId)}`; } }
+      ]
+    });
+  }
+
+  // A heat coming (dogCare.heatForecast): each active breeding female with a heat
+  // on record, from HEAT_NOTICE_DAYS before her predicted next heat (one heat: 6
+  // months after it; more: her average interval). Past the date it asks whether it
+  // happened. Logging a heat (a future date too) moves the prediction, so the key
+  // changes and this one goes; each wording has its own key, so dismissing "soon"
+  // still asks later.
+  for (const h of heatForecast(scopedDogs, events, today, { pairings, litters })) {
+    if (h.state === 'later') continue;
+    const name = h.dog.call_name || 'She';
+    const overdue = h.state === 'overdue';
+    nudges.push({
+      key: `heatwatch:${h.dog.id}:${h.next}:${h.state}`,
+      title: overdue ? `${name} was expected to cycle recently — has that happened?` : `${name} is expected to go into heat soon — keep an eye out`,
+      detail: `Predicted around ${h.next} (${heatBasisText(h)}).`,
+      subjectHref: `dog.html?id=${encodeURIComponent(h.dog.id)}`,
+      actions: [
+        { label: 'Log heat', run: async () => { location.href = `dog.html?id=${encodeURIComponent(h.dog.id)}&logEvent=heat_cycle&logDate=${overdue ? today : h.next}`; } }
+      ]
+    });
+  }
+
+  // This month's preventatives (deworming, heartworm, flea & tick): from the 1st,
+  // while any active breeding dog has no preventative event dated this month. It
+  // goes by itself once every one has one. Log opens one form for all of them.
+  const noPreventative = preventativeGaps(scopedDogs, events, today);
+  if (noPreventative.length) {
+    const names = noPreventative.map((d) => d.call_name || 'Unnamed');
+    nudges.push({
+      key: `preventatives:${monthOf(today)}`,
+      title: `Time for ${monthName(today).split(' ')[0]}'s preventatives (deworming, heartworm, flea & tick)`,
+      detail: `Not logged yet this month: ${names.length > 6 ? `${names.slice(0, 6).join(', ')} and ${names.length - 6} more` : names.join(', ')}.`,
+      subjectHref: 'dogs.html?logEvent=preventative&from=today',
+      actions: [
+        { label: 'Log', run: async () => { location.href = 'dogs.html?logEvent=preventative&from=today'; } }
+      ]
+    });
+  }
+
+  // Due soon — a bred or confirmed-pregnant pairing whose expected due date is
+  // today or within DUE_SOON_DAYS, with no litter yet: suggest creating the
+  // litter now (it starts as "Expected"), so it's ready when the pups arrive.
+  // Not for a pairing still "Planned" — nothing says the breeding happened. Its
+  // own key, so dismissing it early doesn't hide the overdue nudge below.
+  for (const p of scopedPairings) {
+    if (!['bred', 'confirmed_pregnant'].includes(p.status) || !p.expected_due_date) continue;
+    if (outgoingPairings.has(p.id)) continue;
+    if (p.expected_due_date < today || p.expected_due_date > addDaysToYMD(today, DUE_SOON_DAYS)) continue;
+    if (pairingIdsWithLitter.has(p.id)) continue;
+    const days = daysBetween(today, p.expected_due_date);
+    const when = days === 0 ? 'today' : days === 1 ? 'tomorrow' : `in ${days} days`;
+    const expected = expectedLitterByPairing.get(p.id);
+    if (expected) {
+      nudges.push({
+        key: `pairingduesoon:${p.id}`,
+        title: `${pairingLabel(p, dogsById)} is due ${when} — get ready for the pups`,
+        detail: `Expected ${p.expected_due_date}. Her litter is on file as Expected: when they arrive, record the birth.`,
+        subjectHref: `litter.html?id=${encodeURIComponent(expected.id)}`,
+        actions: [recordBirth(expected)]
+      });
+      continue;
+    }
+    nudges.push({
+      key: `pairingduesoon:${p.id}`,
+      title: `${pairingLabel(p, dogsById)} is due ${days === 0 ? 'today' : days === 1 ? 'tomorrow' : `in ${days} days`} — create the litter?`,
+      detail: `Expected ${p.expected_due_date}. The litter starts as "Expected" until the pups arrive.`,
+      subjectHref: `pairing.html?id=${encodeURIComponent(p.id)}`,
+      actions: [
+        { label: 'Create litter', run: async () => { location.href = `litter.html?new=1&pairing=${encodeURIComponent(p.id)}`; } }
+      ]
+    });
+  }
+
+  // Overdue pairing — still pre-whelp status past its own expected due date,
+  // with no litter recorded against it yet. Suggests both fixes: sync the
+  // status, or go record the litter (deep-links to the same
+  // litter.html?new=1&pairing=<id> prefill the pairing page's own "Create
+  // Litter" button uses).
+  for (const p of scopedPairings) {
+    if (!PRE_WHELP_STATUSES.includes(p.status) || !p.expected_due_date || p.expected_due_date >= today) continue;
+    if (outgoingPairings.has(p.id)) continue;
+    if (pairingIdsWithLitter.has(p.id)) continue;
+    const expected = expectedLitterByPairing.get(p.id);
+    if (expected) {
+      nudges.push({
+        key: `pairingoverdue:${p.id}`,
+        title: `${pairingLabel(p, dogsById)} is past its expected due date — has she whelped?`,
+        detail: `Expected ${p.expected_due_date}. Her litter is still marked Expected.`,
+        subjectHref: `litter.html?id=${encodeURIComponent(expected.id)}`,
+        actions: [recordBirth(expected)]
+      });
+      continue;
+    }
+    nudges.push({
+      key: `pairingoverdue:${p.id}`,
+      title: `${pairingLabel(p, dogsById)} is past its expected due date`,
+      detail: `Expected ${p.expected_due_date} — still marked "${descriptor(PAIRING_STATUS, p.status).label}".`,
+      subjectHref: `pairing.html?id=${encodeURIComponent(p.id)}`,
+      actions: [
+        { label: 'Mark whelped', run: async () => { await pairingRepo.update(p.id, { status: 'whelped' }); } },
+        { label: 'Create litter', run: async () => { location.href = `litter.html?new=1&pairing=${encodeURIComponent(p.id)}`; } }
+      ]
+    });
+  }
+
+  // Litter ↔ pairing status (the backstop for the prompts on the litter and
+  // pairing pages, which only fire on an edit made there — not on an import, a
+  // sync, another device, or a Skip). Three rules over the pairing ↔ litter link.
+  const pairingsById = new Map(pairings.map((p) => [p.id, p]));
+  const liveLittersByPairing = new Map();
+  for (const l of litters) {
+    if (!l.pairing_id || l.is_archived) continue;
+    const arr = liveLittersByPairing.get(l.pairing_id);
+    if (arr) arr.push(l); else liveLittersByPairing.set(l.pairing_id, [l]);
+  }
+
+  // An Expected litter past its date that no pairing rule above covers (no pairing,
+  // a pairing with no due date, or one already marked whelped or ended): its own
+  // date is the pairing's due date when there is one, else its whelp date (review
+  // K09-1). A pairing that didn't take has its own rule below (archive the litter).
+  for (const l of scopedLitters) {
+    if (!liveExpectedLitter(l)) continue;
+    const p = l.pairing_id ? pairingsById.get(l.pairing_id) : null;
+    if (p && outgoingPairings.has(p.id)) continue;
+    if (p && PAIRING_ENDED_STATUSES.includes(p.status)) continue;
+    if (p && PRE_WHELP_STATUSES.includes(p.status) && p.expected_due_date) continue; // the pairing's nudges speak for it
+    const due = p?.expected_due_date || l.whelp_date;
+    if (!due || due >= today) continue;
+    nudges.push({
+      key: `litteroverdue:${l.id}:${due}`,
+      title: `${litterLabel(l, dogsById)} was expected ${due} — has she whelped?`,
+      detail: 'The litter is still marked Expected. Record the birth, or update its expected date on the litter.',
+      subjectHref: `litter.html?id=${encodeURIComponent(l.id)}`,
+      actions: [recordBirth(l)]
+    });
+  }
+
+  // A litter that's whelped (or later) whose linked pairing still says otherwise
+  // → suggest marking the pairing whelped. Auto-dismisses once it is.
+  for (const l of scopedLitters) {
+    if (l.is_archived || !l.pairing_id || !WHELPED_OR_LATER.includes(l.status)) continue;
+    const p = pairingsById.get(l.pairing_id);
+    if (!p || p.status === 'whelped') continue;
+    nudges.push({
+      key: `litterpairing:${l.id}`,
+      title: `${litterLabel(l, dogsById)} has whelped — mark its pairing whelped?`,
+      detail: `The litter is "${descriptor(LITTER_STATUS, l.status).label}"; the pairing is still "${descriptor(PAIRING_STATUS, p.status).label}".`,
+      subjectHref: `pairing.html?id=${encodeURIComponent(p.id)}`,
+      actions: [
+        { label: 'Mark pairing whelped', run: async () => { await pairingRepo.update(p.id, { status: 'whelped' }); } }
+      ]
+    });
+  }
+
+  for (const p of scopedPairings) {
+    // A pairing that didn't take, with its litter still "Expected" → suggest
+    // archiving the litter (it never happened; archive, not delete, so nothing
+    // that points at it breaks).
+    if (PAIRING_ENDED_STATUSES.includes(p.status)) {
+      for (const l of liveLittersByPairing.get(p.id) || []) {
+        if (l.status !== 'expected') continue;
+        nudges.push({
+          key: `pairingended:${l.id}`,
+          title: `${pairingLabel(p, dogsById)} is "${descriptor(PAIRING_STATUS, p.status).label}" — archive its expected litter?`,
+          detail: 'The litter is still marked Expected.',
+          subjectHref: `litter.html?id=${encodeURIComponent(l.id)}`,
+          actions: [
+            { label: 'Archive litter', run: async () => { await litterRepo.archive(l.id); } }
+          ]
+        });
+      }
+    }
+
+    // A pairing marked whelped with no litter recorded against it (archived ones
+    // count — the litter exists) → suggest recording it. Skipped for an external
+    // dam (our stud's outside breeding: her litter is usually not ours to record),
+    // and for a pairing whose dates are more than LITTER_RECORD_WINDOW_DAYS old, so
+    // historical pairings entered without their litters don't flood Today.
+    if (p.status === 'whelped' && !pairingIdsWithLitter.has(p.id) && !outgoingPairings.has(p.id)) {
+      const dam = dogsById.get(p.dam_id);
+      if (dam && (dam.ownership_type === 'external' || dam.status === 'external_reference')) continue;
+      const refDate = p.expected_due_date || p.last_observed_date || p.planned_date || (p.created_at || '').slice(0, 10);
+      if (refDate && refDate < addDaysToYMD(today, -LITTER_RECORD_WINDOW_DAYS)) continue;
+      nudges.push({
+        key: `pairingnolitter:${p.id}`,
+        title: `${pairingLabel(p, dogsById)} whelped — record the litter?`,
+        detail: 'The pairing is marked Whelped but has no litter yet.',
+        subjectHref: `pairing.html?id=${encodeURIComponent(p.id)}`,
+        actions: [
+          { label: 'Create litter', run: async () => { location.href = `litter.html?new=1&pairing=${encodeURIComponent(p.id)}`; } }
+        ]
+      });
+    }
+  }
+
+  // A dog marked Deceased that's still on an open sale or an unfinished pairing
+  // (the backstop for the prompt on the dog page).
+  // Archived ones too (an archived pup can still have an open sale), so this one
+  // rule reads the dogs again with them.
+  const allDogs = await dogRepo.getAll({ includeArchived: true });
+
+  // An outgoing stud service paid with a pick of the litter: once the pick should
+  // be ready (63 + 56 days after the service, studRules.pickDue), ask whether it's
+  // ready to add to her dogs. Done when a puppy of that stud out of that dam is on
+  // file (archived ones count) or the pick is marked claimed.
+  for (const s of scopedStudServices) {
+    if (!pickDue(s, allDogs, today)) continue;
+    nudges.push({
+      key: `studpick:${s.id}`,
+      title: `Ready to add your pick puppy from ${studPartnerLabel(s, dogsById)}?`,
+      detail: `The litter should be ready to go home about now (bred ${serviceDate(s)}).`,
+      subjectHref: `stud-service.html?id=${encodeURIComponent(s.id)}`,
+      actions: [
+        { label: 'Add the puppy', run: async () => { location.href = `dog.html?new=1&pick=${encodeURIComponent(s.id)}`; } },
+        { label: 'Not getting one', run: async () => { await studServiceRepo.update(s.id, { pick_status: 'waived' }); } }
+      ]
+    });
+  }
+
+  nudges.push(...deceasedDogNudges(dogsInScope(allDogs.filter((d) => d.status === 'deceased')), {
+    pairings, sales, dogsById: new Map(allDogs.map((d) => [d.id, d])), littersById: new Map(litters.map((l) => [l.id, l])), today
+  }));
+
+  // Litter-lifecycle nudges (the rules live in data/litterCheckin.js, shared
+  // with Kels's litter check-in) — all three are aggregate facts over a litter's
+  // puppy roster (and, for the close rule, its sales), so they're grouped once
+  // here from data already loaded above rather than re-scanned per record on
+  // every pup/sale save. Non-archived, non-empty rosters only.
+  const pupsByLitter = new Map();
+  for (const d of dogs) {
+    if (!d.litter_id) continue;
+    const arr = pupsByLitter.get(d.litter_id);
+    if (arr) arr.push(d); else pupsByLitter.set(d.litter_id, [d]);
+  }
+  // The close rule reads the sales of EVERY pup of the litter, archived ones
+  // included: in Lite a delivered pup departs (is archived), but its sale counts.
+  const litterOfDog = new Map(allDogs.filter((d) => d.litter_id).map((d) => [d.id, d.litter_id]));
+  const salesByLitter = new Map();
+  for (const s of sales) {
+    const litterId = litterOfDog.get(s.dog_id);
+    if (!litterId) continue;
+    const arr = salesByLitter.get(litterId);
+    if (arr) arr.push(s); else salesByLitter.set(litterId, [s]);
+  }
+
+  for (const l of scopedLitters) {
+    if (l.is_archived) continue;
+    // A pup marked Deceased is out of the picture. dogRepo nulls its disposition
+    // (puppy-only), and a null disposition would otherwise hold up "mark sold" for
+    // its litter forever. Filtering on status rather than disposition also covers
+    // a row restored or synced from before that rule.
+    const pups = (pupsByLitter.get(l.id) || []).filter((p) => p.status !== 'deceased');
+    const litterSales = salesByLitter.get(l.id) || [];
+    const label = litterLabel(l, dogsById);
+    const href = `litter.html?id=${encodeURIComponent(l.id)}`;
+
+    // Done: no pup Available or Undecided, no sale still open, one went home on a
+    // delivered sale → suggest closing, whatever status it was left at. Checked
+    // before the empty-roster skip: a Lite litter whose pups all departed has none.
+    if (litterCloseDue(l, pups, litterSales)) {
+      nudges.push({
+        key: `litterclose:${l.id}`,
+        title: `${label} — every puppy has gone home or is staying. Close the litter?`,
+        detail: 'No puppy is available or undecided, and every sale is finished.',
+        subjectHref: href,
+        actions: [
+          { label: 'Close litter', run: async () => { await litterRepo.update(l.id, { status: 'closed' }); } }
+        ]
+      });
+      continue;
+    }
+    if (pups.length === 0) continue;
+
+    // Every pup resolved to placed/keeping (or on a health hold — not for sale),
+    // with at least one actually placed (an all-keeping litter never "sold"
+    // anything) → suggest marking it sold.
+    if (litterSoldDue(l, pups, litterSales)) {
+      nudges.push({
+        key: `littersold:${l.id}`,
+        title: `${label} — all puppies spoken for. Mark the litter sold?`,
+        detail: 'Every puppy is placed or being kept.',
+        subjectHref: href,
+        actions: [
+          { label: 'Mark sold', run: async () => { await litterRepo.update(l.id, { status: 'sold' }); } }
+        ]
+      });
+    }
+
+    // A puppy came back available on a sold/closed litter → suggest reopening.
+    if (litterReopenDue(l, pups)) {
+      nudges.push({
+        key: `litterreopen:${l.id}`,
+        title: `${label} has a puppy available again — reopen the litter?`,
+        detail: `Marked "${descriptor(LITTER_STATUS, l.status).label}" but a puppy is available.`,
+        subjectHref: href,
+        actions: [
+          { label: 'Reopen to Ready', run: async () => { await litterRepo.update(l.id, { status: 'ready' }); } }
+        ]
+      });
+    }
+
+  }
+
+  // Training stays (Family Requests plan §6): an extra on an open sale that needs
+  // the pup to stay (boarding_days) with no stay logged → log it (one tap, from the
+  // ready date, its days long, linked to the sale and the extra); a linked stay
+  // still to come whose extra was taken off its sale → remove it, or keep it.
+  if (editionFlags.extraCharges) {
+    const littersById = new Map(litters.map((l) => [l.id, l]));
+    const dogEvents = events.filter((e) => e.subject_type === 'dog' && e.event_type === 'boarding');
+    for (const sale of inScopeOnly(sales).filter((x) => !x.is_archived && isOpenSale(x))) {
+      const pup = dogsById.get(sale.dog_id);
+      if (!pup) continue;
+      for (const charge of saleExtraCharges(sale).filter((c) => c.boarding_days)) {
+        if (trainingStaysFor(sale, charge, dogEvents).length) continue;
+        const start = defaultStart(readyDateOf(littersById.get(pup.litter_id)), today);
+        const stay = trainingStayEvent(pup, sale, charge, start);
+        const name = pup.call_name || 'The pup';
+        // With it, the pickup the day after (a new one, or the next one moved there when
+        // it falls before the stay ends): goHome.stayPickupPlan.
+        const plan = stayPickupPlan({ sale, pup, litter: littersById.get(pup.litter_id), events: events.filter((e) => e.subject_type === 'dog' && e.subject_id === pup.id), today, chargeIds: [charge.id] });
+        const pickup = plan?.stays.length === 1 ? plan.pickup : null;
+        nudges.push({
+          key: `training-stay:${sale.id}:${charge.id}`,
+          title: `${name}'s ${charge.label} needs a ${charge.boarding_days}-day stay. Log it?`,
+          detail: `It goes on ${name}'s calendar as boarding (Training), ${stay.event_date} to ${stay.event_end_date}, linked to the sale. Change the dates on ${name}'s page afterwards if you need to.`,
+          subjectHref: `sale.html?id=${encodeURIComponent(sale.id)}`,
+          actions: [
+            ...(pickup ? [{ label: pickup.event ? `Log the stay, move the pickup to ${pickup.date}` : `Log the stay and the pickup (${pickup.date})`, run: async () => {
+              const logged = plan.stays[0];
+              await eventRepo.create(logged);
+              if (pickup.event) await eventRepo.update(pickup.event.id, { event_date: pickup.date });
+              else await eventRepo.create(pickupEvent(pup, sale, pickup.date));
+              return { title: 'Stay and pickup on the calendar', message: `${name} stays with you ${logged.event_date} to ${logged.event_end_date} for ${charge.label}, and goes home ${pickup.date}.` };
+            } }] : []),
+            { label: 'Log the stay', run: async () => {
+              await eventRepo.create(stay);
+              return { title: 'Stay logged', message: `${name} stays with you ${stay.event_date} to ${stay.event_end_date} for ${charge.label}.` };
+            } }
+          ]
+        });
+      }
+    }
+    const salesById = new Map(sales.map((x) => [x.id, x]));
+    for (const { event, sale } of orphanTrainingStays(dogEvents, salesById, today)) {
+      const name = dogsById.get(event.subject_id)?.call_name || 'the pup';
+      nudges.push({
+        key: `training-stay-orphan:${event.id}`,
+        title: `${event.title || 'A training stay'} for ${name} is still on the calendar, but its extra is off ${sale ? 'the sale' : 'a sale that\'s gone'}`,
+        detail: `${event.event_date}${event.event_end_date ? ` to ${event.event_end_date}` : ''}. Remove the stay, or keep it (dismiss this).`,
+        subjectHref: `dog.html?id=${encodeURIComponent(event.subject_id)}`,
+        actions: [{ label: 'Remove the stay', run: async () => { await eventRepo.archive(event.id); return { title: 'Removed', message: `The stay is off ${name}'s calendar.` }; } }]
+      });
+    }
+  }
+
+  // A sold puppy's way home (data/goHome.js, decided 2026-10-15): from a week
+  // before the ready date, a sale in progress with no pickup or boarding on the
+  // calendar → schedule the pickup; a pickup date that passed with the sale not
+  // Delivered → did they go home? (opens the Sale page set to Delivered, so its
+  // delivery prompts run); a boarding charge on the sale with no boarding logged
+  // → log it. The actions open the puppy's event form prefilled, or the sale.
+  {
+    const openSales = inScopeOnly(sales).filter((x) => GO_HOME_SALE_STATUSES.includes(x.status));
+    if (openSales.length) {
+      const littersById = new Map(litters.map((l) => [l.id, l]));
+      const contactsById = new Map((await contactRepo.getAll({ includeArchived: true })).map((c) => [c.id, c]));
+      const eventsByDog = new Map();
+      for (const e of events) {
+        if (e.subject_type !== 'dog' || (e.event_type !== 'placement' && e.event_type !== 'boarding')) continue;
+        if (!eventsByDog.has(e.subject_id)) eventsByDog.set(e.subject_id, []);
+        eventsByDog.get(e.subject_id).push(e);
+      }
+      // What a family asked for on their status page and she hasn't decided
+      // (familyPickup.pickupWish): Schedule pickup opens with their day, time and place.
+      let wishes = new Map();
+      try { wishes = await pickupWishesFor(openSales); } catch { /* opens without them */ }
+      const done = new Set();
+      for (const sale of openSales) {
+        const pup = dogsById.get(sale.dog_id);
+        if (!pup || done.has(pup.id)) continue;
+        done.add(pup.id);
+        const issue = goHomeIssue({
+          pup, litter: littersById.get(pup.litter_id), today,
+          sales: sales.filter((x) => x.dog_id === pup.id), events: eventsByDog.get(pup.id) || []
+        });
+        if (!issue) continue;
+        const s2 = issue.sale;
+        const name = pup.call_name || pup.registered_name || 'This puppy';
+        const family = contactsById.get(s2.buyer_contact_id)?.name || 'their family';
+        const dogHref = (q) => `dog.html?id=${encodeURIComponent(pup.id)}&${new URLSearchParams(q).toString()}`;
+        // After any stay still to end (a training package, boarding): the day after it.
+        const start = afterStays(eventsByDog.get(pup.id) || [], defaultStart(issue.readyDate, today));
+        const wish = wishes.get(s2.id) || null;
+        const wishDetails = wish ? Object.fromEntries(Object.entries({ placement_time: wish.time, location: wish.location, dropoff_method: wish.method }).filter(([, v]) => v)) : {};
+        const wishText = wish ? ` They asked for ${[wish.date, wish.time].filter(Boolean).join(', ') || 'a time'}${wish.location ? ` at ${wish.location}` : ''} on their status page: Schedule pickup fills it in.` : '';
+        const logPickup = (label) => ({ label, run: async () => {
+          location.href = dogHref({
+            logEvent: 'placement', logDate: wish?.date && wish.date >= today ? wish.date : start, logTitle: wish?.method === 'Local pickup' || !wish ? PICKUP_TITLE : DROPOFF_TITLE,
+            ...(s2.buyer_contact_id ? { logContact: s2.buyer_contact_id } : {}),
+            ...(Object.keys(wishDetails).length ? { logDetails: JSON.stringify(wishDetails) } : {})
+          });
+        } });
+        if (issue.kind === 'boarding') {
+          const end = boardingEnd(s2, start);
+          nudges.push({
+            key: `gohome-boarding:${s2.id}`,
+            title: `${name}'s sale includes boarding (${boardingChargeText(s2)}). Log the boarding?`,
+            detail: `${family} is paying for ${name} to stay with you after the ready date (${issue.readyDate}), but no boarding is logged.`,
+            subjectHref: `sale.html?id=${encodeURIComponent(s2.id)}`,
+            actions: [{ label: 'Log boarding', run: async () => { location.href = dogHref({ logEvent: 'boarding', logDate: start, logTitle: BOARDING_TITLE, ...(end ? { logEnd: end } : {}), logDetails: JSON.stringify({ boarding_reason: 'Deferred pickup' }) }); } }]
+          });
+        } else if (issue.kind === 'schedule') {
+          nudges.push({
+            key: `gohome-schedule:${s2.id}`,
+            title: `${name} is going home to ${family}. Schedule the pickup?`,
+            detail: `The litter is ready ${issue.readyDate}, and there's no pickup or boarding on the calendar.${wishText}`,
+            subjectHref: `sale.html?id=${encodeURIComponent(s2.id)}`,
+            actions: [logPickup('Schedule pickup')]
+          });
+        } else {
+          nudges.push({
+            key: `gohome-overdue:${s2.id}:${issue.pickupDate}`,
+            title: `${name}'s pickup was ${issue.pickupDate}. Did ${name} go home?`,
+            detail: `The sale to ${family} still isn't marked Delivered.`,
+            subjectHref: `sale.html?id=${encodeURIComponent(s2.id)}`,
+            actions: [
+              { label: 'Yes, mark delivered', run: async () => { location.href = `sale.html?id=${encodeURIComponent(s2.id)}&deliver=1`; } },
+              logPickup('No, new pickup date')
+            ]
+          });
+        }
+      }
+    }
+  }
+
+  // Show Tracking Spec §5.4 — a title track the dog's results complete, with no
+  // matching title_earned logged yet → suggest logging it. Decide-not-auto: the
+  // action only opens a prefilled event form on the dog's page. Auto-dismisses
+  // once the title_earned event exists (the event is the done-signal). Pro-only.
+  if (editionFlags.shows) {
+    const eventsByDog = new Map();
+    for (const e of events) {
+      if (e.subject_type !== 'dog' || (e.event_type !== 'show' && e.event_type !== 'title_earned')) continue;
+      const arr = eventsByDog.get(e.subject_id);
+      if (arr) arr.push(e); else eventsByDog.set(e.subject_id, [e]);
+    }
+    for (const d of scopedDogs) {
+      const dogEvents = eventsByDog.get(d.id);
+      if (!dogEvents?.some((e) => e.event_type === 'show')) continue;
+      // A title she holds on the dog (Dog.titles) is done too: she isn't asked again.
+      for (const { track, progress, titleEvent, heldTitle } of showRecordFrom(dogEvents, undefined, { held: d.titles }).tracks) {
+        if (!progress.complete || titleEvent || heldTitle) continue;
+        const qs = new URLSearchParams({
+          id: d.id,
+          logEvent: 'title_earned',
+          logTitle: track.label,
+          logDetails: JSON.stringify({ title_abbreviation: track.title, organization: track.organization })
+        });
+        if (progress.completedOn) qs.set('logDate', progress.completedOn);
+        nudges.push({
+          key: `show-title:${d.id}:${track.value}`,
+          title: `${d.call_name} has finished the ${track.title} — log the title?`,
+          detail: `${track.label} requirements met${progress.completedOn ? ` on ${progress.completedOn}` : ''}.`,
+          subjectHref: `dog.html?id=${encodeURIComponent(d.id)}`,
+          actions: [
+            { label: 'Log title', run: async () => { location.href = `dog.html?${qs.toString()}`; } }
+          ]
+        });
+      }
+    }
+  }
+
+  // What her puppy portal changed here (K7-2): each fact once, for her to see and undo.
+  if (editionFlags.websiteLink) nudges.push(...portalFactNudges(events, dogsById, today));
+  if (editionFlags.waitlist) nudges.push(...(await waitlistNudges(today, litters, dogsById, { dogs, sales })));
+  if (editionFlags.accounts) nudges.push(...(await followUpNudges(today, inScopeOnly(sales), events, dogsById, kennelsById)));
+  if (editionFlags.accounts) nudges.push(...(await integrationReviewNudges(inScopeOnly(sales))));
+  if (editionFlags.extraCharges && sales.some((s) => saleExtraCharges(s).some((x) => x.payments))) {
+    const contactsById = new Map((await contactRepo.getAll({ includeArchived: true })).map((c) => [c.id, c]));
+    nudges.push(...extraDueNudges(today, inScopeOnly(sales), events, dogsById, contactsById, kennelsById));
+  }
+  // A scheduled payment coming due or gone by (Payment Schedule plan §5.2): every
+  // open sale, a sale with no schedule as its one due date. All editions.
+  nudges.push(...(await paymentDueItems(inScopeOnly(sales), today, { dogsById })));
+
+  return nudges;
+}
+
+// --- Payments due (Payment Schedule plan §5.2, D4) ----------------------------------
+// One nudge per due date on a sale's schedule (paymentSchedule.paymentStatement; a
+// sale with no schedule stored is one due date, everything, on its balance due date
+// or else at pickup) that still has money owed:
+//   payment-due     from DUE_SOON_DAYS (7) before its date through the day itself;
+//   payment-missed  its date has gone by without the money marked received.
+// The deposit isn't here (the offer and side-sale nudges ask for it), and neither are
+// extras on their own dates (extra-due). Key per sale, due date and date, so a date
+// she moves brings it back. → Open the sale, where she records the payment, types a
+// new date, or cancels. Never a back-out suggestion.
+const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+// '2026-12-04' → 'Dec 4' ('Dec 4, 2027' outside this year).
+export function nudgeDate(ymd, today) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ''));
+  if (!m) return String(ymd || '');
+  return `${MONTH_SHORT[Number(m[2]) - 1]} ${Number(m[3])}${m[1] !== String(today || '').slice(0, 4) ? `, ${m[1]}` : ''}`;
+}
+export const nudgeMoney = (n) => Number(n || 0).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+
+// Pure: `statements` Map(saleId → statement), worked out for `today`. Each nudge also
+// carries `owed` (what's still owed by that due date), for Kels's Received form.
+export function paymentDueNudges(today, sales, statements, dogsById = new Map(), contactsById = new Map()) {
+  const out = [];
+  for (const s of sales) {
+    if (!isOpenSale(s)) continue;
+    const st = statements.get(s.id);
+    if (!st || st.ended) continue;
+    const family = contactsById.get(s.buyer_contact_id)?.name || 'The buyer';
+    const pup = dogsById.get(s.dog_id)?.call_name || 'their pup';
+    const href = `sale.html?id=${encodeURIComponent(s.id)}`;
+    const open = [{ label: 'Open the sale', run: async () => { location.href = href; } }];
+    for (const d of st.dueDates) {
+      if (!(d.owed > 0) || !d.date) continue;
+      const what = d.isFinal ? (st.dueDates.length > 1 ? 'final payment' : 'payment') : d.label;
+      if (d.status === 'not_received') {
+        out.push({
+          key: `payment-missed:${s.id}:${d.id}:${d.date}`,
+          title: `A scheduled payment was not marked received: ${family}, ${nudgeMoney(d.owed)} due ${nudgeDate(d.date, today)}.`,
+          detail: `The ${what} for ${pup}. On the sale, record the payment, set a new date, or cancel the sale.`,
+          subjectHref: href,
+          owed: d.owed,
+          actions: open
+        });
+      } else if (d.status === 'due_soon') {
+        out.push({
+          key: `payment-due:${s.id}:${d.id}:${d.date}`,
+          title: `${family}'s ${what} for ${pup} ${d.date === today ? 'is due today' : `is due ${nudgeDate(d.date, today)}`}: ${nudgeMoney(d.owed)}`,
+          detail: `${d.filled > 0 ? `${nudgeMoney(d.filled)} of it is already paid. ` : ''}Record it on the sale's Payments card when it comes in.`,
+          subjectHref: href,
+          owed: d.owed,
+          actions: open
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// The payment nudges for these sales (Today, and Review my waitlist's step 7), their
+// statements read as every other surface reads them (incomeView.getSaleStatements).
+export async function paymentDueItems(sales, today = todayYMD(), { dogsById = null } = {}) {
+  const open = sales.filter(isOpenSale);
+  if (!open.length) return [];
+  const [statements, contacts, dogs] = await Promise.all([
+    getSaleStatements(open, { today }),
+    contactRepo.getAll({ includeArchived: true }),
+    dogsById ? null : dogRepo.getAll({ includeArchived: true })
+  ]);
+  return paymentDueNudges(today, open, statements, dogsById || new Map(dogs.map((d) => [d.id, d])), new Map(contacts.map((c) => [c.id, c])));
+}
+
+// --- Follow-up a week after going home (Integrations plan §3) ----------------------
+// Pro (with Accounts, whose shared referral links the note carries). A delivered
+// sale whose pup went home (its latest placement event, else the balance-paid
+// date) FOLLOW_UP_DAYS to FOLLOW_UP_WINDOW_DAYS ago suggests a note to the buyer:
+// a how-is-it-going and thank-you, with the products she shares with families.
+// The note opens in the composer (Today reads `compose`); she sends it herself.
+// Key per sale, so Dismiss (or sending it) retires it for good.
+// What a connected vendor reported that her device didn't apply by itself
+// (Integrations plan §0; data/integrationEvents.js): one nudge per review, on the
+// sale or contract it's about. "Done" removes it from the record.
+async function integrationReviewNudges(sales) {
+  const contracts = inScopeOnly(await contractRepo.getAll());
+  const out = [];
+  const add = (record, repo, href, label) => {
+    for (const r of Array.isArray(record.integration_reviews) ? record.integration_reviews : []) {
+      if (!r || !r.id) continue;
+      out.push({
+        key: `int-review:${record.id}:${r.id}`,
+        title: `${reviewTitle(r)}: ${label}`,
+        detail: `${r.reason}${r.payload?.date ? ` (${r.payload.date})` : ''} Check it, then tap Done.`,
+        subjectHref: href,
+        actions: [{
+          label: 'Done',
+          run: async () => {
+            const fresh = await repo.getById(record.id);
+            await repo.update(record.id, { integration_reviews: (fresh?.integration_reviews || []).filter((x) => x && x.id !== r.id) });
+          }
+        }]
+      });
+    }
+  };
+  for (const s of sales) add(s, saleRepo, `sale.html?id=${encodeURIComponent(s.id)}`, 'a sale');
+  for (const c of contracts) add(c, contractRepo, `contract.html?id=${encodeURIComponent(c.id)}`, c.title || 'a contract');
+  return out;
+}
+
+// A part of an extra's payment plan coming due (Family Requests plan §3.1): from
+// EXTRA_DUE_DAYS before its due date until it's paid (a paid date on the step, or
+// the balance paid). Steps due before pickup read the pup's latest pickup date.
+// On a sale with a payment schedule, only an extra on its own dates (`own_due_dates`)
+// keeps its steps' dates; any other is paid through the schedule (payment-due).
+export const EXTRA_DUE_DAYS = 7;
+export function extraDueNudges(today, sales, events, dogsById, contactsById, kennelsById = new Map()) {
+  const out = [];
+  const pickup = new Map();
+  for (const e of events) {
+    if (e.event_type !== 'placement' || e.subject_type !== 'dog' || !e.event_date || e.is_archived) continue;
+    if (!pickup.has(e.subject_id) || e.event_date > pickup.get(e.subject_id)) pickup.set(e.subject_id, e.event_date);
+  }
+  for (const s of sales) {
+    if (s.is_archived || !isOpenSale(s) || s.balance_paid_date) continue;
+    const scheduled = hasSchedule(s);
+    for (const x of saleExtraCharges(s)) {
+      if (scheduled && x.own_due_dates !== true) continue;
+      for (const st of x.payments || []) {
+        if (st.paid_date) continue;
+        const due = stepDueDate(st, { sale: s, pickupDate: pickup.get(s.dog_id) || '', openDays: businessDays(waitlistConfig(kennelsById.get(s.kennel_id))) });
+        if (!due || due > addDaysToYMD(today, EXTRA_DUE_DAYS)) continue;
+        const who = contactsById?.get(s.buyer_contact_id)?.name || 'The buyer';
+        const pup = dogsById.get(s.dog_id)?.call_name || 'their pup';
+        out.push({
+          key: `extra-due:${s.id}:${x.id}:${st.id}`,
+          title: `${who}'s ${stepLabel(x, st)} for ${pup} ${due < today ? `was due ${due}` : due === today ? 'is due today' : `is due ${due}`}`,
+          detail: `${st.amount ? `$${st.amount.toFixed(2)}. ` : ''}Make the invoice from the sale (it has its own line), and put the day it's paid on the sale.`,
+          subjectHref: `sale.html?id=${encodeURIComponent(s.id)}`,
+          actions: [{ label: 'Open the sale', run: async () => { location.href = `sale.html?id=${encodeURIComponent(s.id)}`; } }]
+        });
+      }
+    }
+  }
+  return out;
+}
+
+async function followUpNudges(today, sales, events, dogsById, kennelsById) {
+  const delivered = sales.filter((s) => s.status === 'delivered' && s.buyer_contact_id);
+  if (!delivered.length) return [];
+  const [contacts, accounts] = await Promise.all([contactRepo.getAll({ includeArchived: true }), accountRepo.getAll()]);
+  const contactsById = new Map(contacts.map((c) => [c.id, c]));
+  const referrals = sharedReferrals(accounts);
+  const placements = new Map(); // dog id -> placement dates
+  for (const e of events) {
+    if (e.event_type !== 'placement' || e.subject_type !== 'dog' || !e.event_date) continue;
+    if (!placements.has(e.subject_id)) placements.set(e.subject_id, []);
+    placements.get(e.subject_id).push(e.event_date);
+  }
+  const out = [];
+  for (const s of delivered) {
+    const home = goHomeDate(s, placements.get(s.dog_id) || [], today);
+    if (!home) continue;
+    const days = daysBetween(home, today);
+    if (days < FOLLOW_UP_DAYS || days > FOLLOW_UP_WINDOW_DAYS) continue;
+    const buyer = contactsById.get(s.buyer_contact_id);
+    if (!buyer) continue;
+    const pup = dogsById.get(s.dog_id)?.call_name || 'their puppy';
+    const kennelName = kennelsById.get(s.kennel_id)?.kennel_name || '';
+    const message = followUpMessage({ buyerName: buyer.name, pupName: pup, kennelName, days, referrals });
+    out.push({
+      key: `follow-up:${s.id}`,
+      title: `Check in with ${buyer.name}: ${pup} went home ${days} days ago`,
+      detail: referrals.length
+        ? `A thank-you and how-is-it-going note, with what you recommend (${referrals.map((r) => r.name).join(', ')}).`
+        : 'A thank-you and how-is-it-going note. (Mark a referral account "Share with families" to add what you recommend.)',
+      subjectHref: `sale.html?id=${encodeURIComponent(s.id)}`,
+      actions: [{
+        label: 'Write the note',
+        run: async () => ({
+          compose: { title: `Check in with ${buyer.name}`, name: buyer.name, email: buyer.email || '', phone: buyer.phone || '', ...message },
+          // Today retires the nudge once she's sent or copied it.
+          doneDismisses: true
+        })
+      }]
+    });
+  }
+  return out;
+}
+
+// --- Waitlist (Waitlist Spec §0/§6.5) -------------------------------------------
+// Today's waitlist nudges on their own, for Kels's Review my waitlist
+// (assets/waitlistReviewUI.js), which works through the same items with the same
+// wording and actions (data/waitlistReview.js reads each key). Scoped like Today.
+// "From your puppy portal" (K7-2): each fact her portal sent back and KennelOS
+// applied leaves a Note on the pup (`details.portal_fact`, portalFeedSync); Today
+// shows each one for PORTAL_FACT_SHOWN_DAYS, dismissable, so a change never lands
+// unseen. She undoes it on the pup or its sale.
+export const PORTAL_FACT_SHOWN_DAYS = 14;
+export function portalFactNudges(events, dogsById, today) {
+  return (events || [])
+    .filter((e) => !e.is_archived && e.event_type === 'note' && e.details?.portal_fact && e.event_date && addDaysToYMD(e.event_date, PORTAL_FACT_SHOWN_DAYS) >= today && dogsById.has(e.subject_id))
+    .map((e) => {
+      const pup = dogsById.get(e.subject_id);
+      const href = e.details.sale_id && e.details.portal_fact === 'picked_up' ? `sale.html?id=${encodeURIComponent(e.details.sale_id)}` : `dog.html?id=${encodeURIComponent(pup.id)}`;
+      return {
+        key: `portal-fact:${e.id}`,
+        title: `From your puppy portal: ${pup.call_name || 'a pup'}`,
+        detail: `${e.notes || ''} If that's wrong, change it on ${e.details.portal_fact === 'picked_up' ? 'the sale and the pickup' : 'the dog'}.`,
+        subjectHref: href,
+        actions: [{ label: 'Open', run: async () => { location.href = href; } }]
+      };
+    });
+}
+
+export async function waitlistNudgeItems(today = todayYMD()) {
+  if (!editionFlags.waitlist) return [];
+  const [dogs, litters, sales] = await Promise.all([dogRepo.getAll(), litterRepo.getAll({ includeArchived: true }), saleRepo.getAll()]);
+  return waitlistNudges(today, litters, new Map(dogs.map((d) => [d.id, d])), { dogs, sales });
+}
+
+// Today's "extra payment due" nudges for these sales (Review my waitlist step 7).
+export async function extraDueItems(sales, today = todayYMD()) {
+  if (!editionFlags.extraCharges) return [];
+  const [dogs, events, contacts, kennels] = await Promise.all([dogRepo.getAll(), eventRepo.getAll(), contactRepo.getAll({ includeArchived: true }), kennelRepo.getAll({ includeArchived: true })]);
+  return extraDueNudges(today, sales, events, new Map(dogs.map((d) => [d.id, d])), new Map(contacts.map((c) => [c.id, c])), new Map(kennels.map((k) => [k.id, k])));
+}
+
+// W1 has no server, so nothing on the waitlist moves while she's away: these
+// surface what needs a decision, and she confirms with one tap. Scoped like every
+// rule (the waitlist is per kennel, so entries/offers carry kennel_id).
+// A waitlist action's `run` returns the message Today shows afterwards (the turn
+// can move on to another family, who she must contact — never silently).
+// "Add your waitlist policies" (Waitlist Policies plan §3.2): each of her kennels with
+// the list online and no policies. Dismiss and Snooze as any nudge; it goes by itself
+// once she adds one. Until then her application doesn't ask about them, so nothing waits on it.
+export function policiesNudges(kennels, { online = true, scopedTo = null } = {}) {
+  if (!online) return [];
+  return kennels
+    .filter((k) => k.is_own_kennel && !k.is_archived && (!scopedTo || k.id === scopedTo))
+    .filter((k) => { const c = waitlistConfig(k); return c.online && !hasPolicies(c); })
+    .map((k) => ({
+      key: `waitlist-policies:${k.id}`,
+      title: kennels.filter((x) => x.is_own_kennel && !x.is_archived).length > 1 ? `Add your waitlist policies for ${k.kennel_name || 'your kennel'}` : 'Add your waitlist policies',
+      detail: 'Families on your list see them, and applicants tick that they\'ve read them. Until you add one, your application doesn\'t ask.',
+      subjectHref: `kennel.html?id=${encodeURIComponent(k.id)}&open=policies#waitlist-settings`,
+      actions: [{ label: 'Add policies', run: async () => { location.href = `kennel.html?id=${encodeURIComponent(k.id)}&open=policies#waitlist-settings`; } }]
+    }));
+}
+
+async function waitlistNudges(today, litters, dogsById, { dogs = [], sales = [] } = {}) {
+  const [entriesAll, offersAll, contacts, kennels] = await Promise.all([
+    waitlistEntryRepo.getAll(),
+    waitlistOfferRepo.getAll(),
+    contactRepo.getAll({ includeArchived: true }),
+    kennelRepo.getAll({ includeArchived: true })
+  ]);
+  const kennelsById = new Map(kennels.map((k) => [k.id, k]));
+  // Deadlines on each kennel's own date when it has a time zone (D11), else `today`.
+  const dayOf = (kennelId) => { const k = kennelsById.get(kennelId); return k?.time_zone ? kennelToday(k) : today; };
+  const entries = inScopeOnly(entriesAll);
+  const offers = inScopeOnly(offersAll);
+  const contactsById = new Map(contacts.map((c) => [c.id, c]));
+  const entriesById = new Map(entriesAll.map((e) => [e.id, e]));
+  const littersById = new Map(litters.map((l) => [l.id, l]));
+  const name = (e) => entryName(e, contactsById.get(e.contact_id));
+  const out = [];
+
+  out.push(...policiesNudges(kennels, { online: isWaitlistOnlineOffered(), scopedTo: getActiveKennelId() }));
+
+  // New applications — one nudge per kennel's queue. The key carries the newest
+  // application's id, so dismissing it hides this batch but a new one resurfaces.
+  const byKennel = new Map();
+  for (const e of entries.filter((x) => x.status === 'applied')) {
+    if (!byKennel.has(e.kennel_id)) byKennel.set(e.kennel_id, []);
+    byKennel.get(e.kennel_id).push(e);
+  }
+  for (const [kennelId, list] of byKennel) {
+    const newest = [...list].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))[0];
+    out.push({
+      key: `waitlist-applications:${kennelId}:${newest.id}`,
+      title: list.length === 1 ? `New waitlist application from ${name(newest)}` : `${list.length} new waitlist applications`,
+      detail: 'Review and approve or decline.',
+      subjectHref: `waitlist.html?kennel=${encodeURIComponent(kennelId)}`,
+      actions: [{ label: 'Review', run: async () => { location.href = `waitlist.html?kennel=${encodeURIComponent(kennelId)}`; } }]
+    });
+  }
+
+  // Two applications on one list that may be one family (applicationDuplicates.js).
+  // Only a suggestion: Compare opens the newer one's page, where Same family… merges
+  // them after she confirms. Dismissing it is "Not the same" (its key is one of the
+  // pair's, so the Import/Export scan and Kels don't ask either).
+  const pairDismissed = (a, b) => duplicateDismissKeys(a, b).some((k) => isDismissed(k));
+  for (const p of duplicateApplicationPairs(entries, { contactsById, dismissed: pairDismissed })) {
+    out.push({
+      key: `waitlist-duplicate:${p.key}`,
+      title: `${name(p.b)} may have applied twice`,
+      detail: `${name(p.b)} (applied ${p.b.applied_date || 'undated'}) and ${name(p.a)} (applied ${p.a.applied_date || 'undated'}) have ${matchReasonText(p)} on one waitlist. If they're one family, merge them and keep one. Dismiss if they're not the same.`,
+      subjectHref: `waitlist-entry.html?id=${encodeURIComponent(p.b.id)}`,
+      actions: [{ label: 'Compare', run: async () => { location.href = `waitlist-entry.html?id=${encodeURIComponent(p.b.id)}`; } }]
+    });
+  }
+
+  // One per TURN (Spec §16.1): a turn covering two litters is one deadline.
+  for (const t of overdueTurns(offers, dayOf)) {
+    const e = entriesById.get(t.entry_id);
+    if (!e) continue;
+    const o = t.offers.find((x) => x.chosen_dog_id) || t.offers[0];
+    const covers = t.offers.map((x) => (littersById.get(x.litter_id) ? litterLabel(littersById.get(x.litter_id), dogsById) : 'Litter')).join(', ');
+    out.push({
+      key: `waitlist-offer-overdue:${t.id}`,
+      // A family that picked a pup but never sent the deposit: same outcome (their
+      // pick lapses and the held Sale is cancelled), worded for the deposit.
+      title: o.chosen_dog_id ? `${name(e)}'s deposit didn't arrive in time` : `${name(e)}'s offer deadline passed`,
+      detail: `${covers} — they had until ${t.respond_by_date}${o.chosen_dog_id ? ' to send the deposit for their pick. Recording no deposit frees the pup' : '. Recording no response closes their turn'}${autoOffers(waitlistConfig(kennelsById.get(o.kennel_id)), closingTrigger(o, 'no_response')) ? ' and offers the next family' : ''}.`,
+      subjectHref: `litter.html?id=${encodeURIComponent(o.litter_id)}`,
+      actions: [{
+        label: o.chosen_dog_id ? 'Record no deposit' : 'Record no response',
+        run: async () => {
+          const res = await recordOutcome(o.id, 'no_response');
+          const fresh = new Map((await waitlistEntryRepo.getAll({ includeArchived: true })).map((x) => [x.id, x]));
+          const lines = outcomeReport(res, { name: name(e), changes: describeOfferChanges(res, {
+            nameOf: (id) => (fresh.get(id) ? name(fresh.get(id)) : 'the next family'),
+            litterOf: (id) => (littersById.get(id) ? litterLabel(littersById.get(id), dogsById) : 'A litter')
+          }) });
+          // `emails`: who to offer an email (Today shows the preview; W2 step 6).
+          return { title: 'Recorded', message: lines.join('\n\n'), emails: [
+            { entryId: e.id, kind: 'deadline_passed', extra: { litterIds: t.offers.map((x) => x.litter_id), respondBy: t.respond_by_date } },
+            ...offerSpecs(res)
+          ] };
+        }
+      }]
+    });
+  }
+
+  for (const e of overdueFees(entries, dayOf)) {
+    out.push({
+      key: `waitlist-fee-overdue:${e.id}`,
+      title: `${name(e)} hasn't paid the application fee`,
+      detail: `The pay-by date was ${e.fee_due_date}. Close the application, or mark the fee received on their page.`,
+      subjectHref: `waitlist-entry.html?id=${encodeURIComponent(e.id)}`,
+      actions: [{ label: 'Close application', run: async () => { await markFeeExpired(e.id); } }]
+    });
+  }
+
+  for (const e of entries.filter((x) => canUndoRemoval(x, dayOf(x.kennel_id)) && x.removed_reason !== 'by_breeder')) {
+    const noAnswer = e.removed_reason === 'no_ready_answer';
+    out.push({
+      key: `waitlist-removed:${e.id}:${e.removed_date}`,
+      title: noAnswer ? `Removed ${name(e)} from the waitlist: no answer to "Ready now?"` : `Removed ${name(e)} from the waitlist after their second pass`,
+      detail: `You can undo this until ${addDaysToYMD(e.removed_date, 7)}. ${noAnswer
+        ? 'Undoing puts them back in their old place and asks "Ready now?" again from today.'
+        : 'Undoing forgives that pass and puts them back in their old place.'}`,
+      subjectHref: `waitlist-entry.html?id=${encodeURIComponent(e.id)}`,
+      actions: [{
+        label: 'Undo',
+        run: async () => {
+          await undoRemoval(e.id, { today: dayOf(e.kennel_id) });
+          return { title: 'Removal undone', message: `${name(e)} is back in their old place. No offer was made for them; offer a litter from their page when you're ready.` };
+        }
+      }]
+    });
+  }
+  // "Ready now?" unanswered for longer than her days, under "keep paused" (§16.7):
+  // they stay held, so nobody waits forever unnoticed.
+  for (const e of entries.filter((x) => readyCheckOverdue(x, dayOf(x.kennel_id), waitlistConfig(kennelsById.get(x.kennel_id))))) {
+    const rc = readyCheck(e, dayOf(e.kennel_id), waitlistConfig(kennelsById.get(e.kennel_id)));
+    out.push({
+      key: `waitlist-ready-overdue:${e.id}:${rc.asked}`,
+      title: `${name(e)} hasn't answered "Ready now?"`,
+      detail: `Asked ${rc.asked}, when the readiness hold from their application ended. They stay paused until they answer (your setting). Contact them, or record their answer if they've told you.`,
+      subjectHref: `waitlist-entry.html?id=${encodeURIComponent(e.id)}`,
+      actions: [{ label: 'They\'re ready', run: async () => { await recordReadyAnswer(e.id, { answer: 'yes', date: today, by: 'breeder' }); } }]
+    });
+  }
+
+  // A side sale's deposit is past due (Side Sale Spec §4): nothing happens by itself.
+  const listedIds = new Set(entries.map((e) => e.id));
+  for (const sale of sales.filter((x) => isSideSalePending(x) && listedIds.has(x.side_entry_id) && x.side_deposit_due && x.side_deposit_due < today)) {
+    const e = entriesById.get(sale.side_entry_id);
+    const pup = dogsById.get(sale.dog_id)?.call_name || 'their pup';
+    out.push({
+      key: `waitlist-side-overdue:${e.id}:${sale.id}:${sale.side_deposit_due}`,
+      title: `${name(e)}'s deposit for ${pup} was due ${sale.side_deposit_due}`,
+      detail: `A side sale you recorded. Nothing happens by itself: record the deposit on their page if it came, or cancel the sale (they keep their place; never a pass)${sale.side_holds_pup ? ` and ${pup} goes back to what it was` : ''}.`,
+      subjectHref: `waitlist-entry.html?id=${encodeURIComponent(e.id)}`,
+      actions: [{ label: 'Cancel side sale', run: async () => {
+        const r = await cancelSideSale(sale.id, { date: today, why: 'the deposit didn\'t arrive in time' });
+        return { title: 'Side sale cancelled', message: `${name(e)} keeps their place on the list.${r.restored ? ` ${pup} is back to ${r.restored.replace('_', ' ')}.` : ''} Let them know.` };
+      } }]
+    });
+  }
+
+  // Two live claims on one pup (Side Sale Spec §5): two sales, or a sale and a turn pick.
+  const claimedDogs = new Set(sales.filter((x) => !x.is_archived && x.side_entry_id && listedIds.has(x.side_entry_id)).map((x) => x.dog_id));
+  for (const o of offers.filter((x) => !x.is_archived && x.outcome === 'open' && x.chosen_dog_id)) claimedDogs.add(o.chosen_dog_id);
+  for (const dogId of claimedDogs) {
+    const claims = pupClaims(dogId, { sales: sales.filter((x) => x.dog_id === dogId), offers });
+    if (claims.length < 2) continue;
+    const pup = dogsById.get(dogId)?.call_name || 'A pup';
+    const who = (c) => { const e = c.entry_id && entriesById.get(c.entry_id); return e ? name(e) : 'a buyer'; };
+    out.push({
+      key: `pup-two-sales:${dogId}:${claims.map((c) => c.sale_id || c.offer_id).sort().join('-')}`,
+      title: `Two sales on ${pup}`,
+      detail: `${claims.map((c) => `${who(c)} (${c.kind === 'side' ? 'side sale' : c.kind === 'pick' ? 'picked in their turn' : 'a sale'})`).join(' and ')}. Whichever deposit you record first wins; the other is ended then. Let the other family know.`,
+      subjectHref: `dog.html?id=${encodeURIComponent(dogId)}`,
+      actions: []
+    });
+  }
+
+  // Deposits were planned to open today (Spec §16.8): suggest Open picks, which
+  // starts the next turn (§16.1). Only for a kennel with families on its list.
+  const listed = new Set(entries.filter((e) => e.status === 'active').map((e) => e.kennel_id));
+  for (const l of depositsDueLitters(inScopeOnly(litters).filter((x) => listed.has(x.kennel_id)), dogs, sales, today)) {
+    const label = litterLabel(l, dogsById);
+    out.push({
+      key: `waitlist-open-picks:${l.id}:${l.accept_deposits_date}`,
+      title: `${label}: you planned to start taking deposits ${l.accept_deposits_date === today ? 'today' : `on ${l.accept_deposits_date}`}. Open picks?`,
+      detail: 'Opening picks offers the next family on your list a turn (or adds this litter to the turn open now). You\'ll see what will happen first. Nothing opens by itself.',
+      subjectHref: `litter.html?id=${encodeURIComponent(l.id)}`,
+      // Opened through the picks preview (Picks Preview Spec §3): the page that runs
+      // the action (Today, Kels's Review my waitlist) opens it for `openPicks`.
+      actions: [{
+        label: 'Open picks…',
+        run: async () => ({ openPicks: l.id })
+      }]
+    });
+  }
+  out.push(...(await statusPageNudges(entries, offers, { today, litters, dogsById, kennelsById, name })));
+  return out;
+}
+
+// What families asked for or said on their status page (W2 step 5). A request
+// waits on the entry until she decides, so dismissing the nudge never loses it
+// (the family's page has the same buttons). Keys carry the request's date or the
+// newest line's id, so a new one resurfaces after a dismiss.
+async function statusPageNudges(entries, offers, { today, litters, dogsById, kennelsById, name }) {
+  const out = [];
+  const href = (e) => `waitlist-entry.html?id=${encodeURIComponent(e.id)}`;
+  const dogName = (id) => dogsById.get(id)?.call_name || 'a dog';
+  const litterName = (l) => litterLabel(l, dogsById);
+  const said = (note) => (note ? ` They said: "${note}"` : '');
+  // Each decision also offers the family an email saying so (W2 step 6).
+  const decide = (approve, decline, done, e, field) => {
+    const emails = (kind) => [{ entryId: e.id, kind, extra: { request: { field, request: e[field] } } }];
+    return [
+      { label: 'Approve', run: async () => { await approve(); return { title: 'Approved', message: done, emails: emails('request_approved') }; } },
+      { label: 'Decline', run: async () => { await decline(); return { title: 'Declined', message: 'Nothing changed for them. Let them know.', emails: emails('request_declined') }; } }
+    ];
+  };
+  let sales = null;
+  const programs = new Map();
+  for (const e of entries) {
+    const open = offers.filter((o) => o.entry_id === e.id && o.outcome === 'open' && !o.is_archived);
+    const openNote = open.length
+      ? ` Their open offer on ${open.map((o) => (litters.find((l) => l.id === o.litter_id) ? litterName(litters.find((l) => l.id === o.litter_id)) : 'a litter')).join(', ')} stays open either way.`
+      : '';
+    if (hasPendingRequest(e, 'pause_request')) {
+      const r = e.pause_request;
+      out.push({
+        key: `waitlist-pause-request:${e.id}:${r.requested_date}:${r.until}`,
+        title: `${name(e)} asked to pause their place until ${r.until}`,
+        detail: `They keep their place and aren't offered pups until then; a pause never counts as a pass.${openNote}${said(r.note)}`,
+        subjectHref: href(e),
+        actions: decide(() => approvePauseRequest(e.id, { date: today }), () => declinePauseRequest(e.id, { date: today }),
+          `${name(e)} is paused until ${r.until}. Let them know.`, e, 'pause_request')
+      });
+    }
+    if (hasPendingRequest(e, 'pref_change_request')) {
+      const r = e.pref_change_request;
+      const kennel = kennelsById.get(e.kennel_id);
+      const config = waitlistConfig(kennel);
+      sales ??= await saleRepo.getAll({ includeArchived: true });
+      if (!programs.has(e.kennel_id)) programs.set(e.kennel_id, await waitlistProgramRepo.getMapForKennel(e.kennel_id));
+      const live = waitlistLitters(e.kennel_id, litters);
+      const fx = prefChangeEffect(e, r.changes || {}, {
+        litters: live, entries: entries.filter((x) => x.kennel_id === e.kennel_id), offers, pups: [...dogsById.values()], sales, today, config, programsById: programs.get(e.kennel_id)
+      });
+      const history = (e.pref_change_log || []).filter((l) => !l.declined);
+      const lines = [
+        fx.narrowed.length
+          ? `Narrower (${fx.narrowed.map((f) => PREF_FIELD_LABEL[f]).join(', ')})${fx.skippedLitters.length ? `: they'd stop being next for ${fx.skippedLitters.map(litterName).join(', ')}` : ''}.`
+          : 'Not narrower: it doesn\'t rule out a pup they could be offered now.',
+        openNote.trim(),
+        history.length ? `${history.length} change${history.length === 1 ? '' : 's'} to these answers since joining; the last on ${history[history.length - 1].date}.` : '',
+        said(r.note).trim()
+      ].filter(Boolean);
+      out.push({
+        key: `waitlist-pref-request:${e.id}:${r.requested_date}`,
+        title: `${name(e)} asked to change ${prefChangeSummary(e, r.changes) || 'their answers'}`,
+        detail: lines.join(' '),
+        subjectHref: href(e),
+        actions: decide(() => approvePrefChange(e.id, { date: today }), () => declinePrefChange(e.id, { date: today }),
+          `${name(e)}'s answers are updated, and the change is in their answer history. Let them know.`, e, 'pref_change_request')
+      });
+    }
+    if (hasPendingRequest(e, 'listen_change_request')) {
+      const r = e.listen_change_request;
+      const parents = [...(r.listen_sire_ids || []), ...(r.listen_dam_ids || [])].map(dogName).join(', ');
+      out.push({
+        key: `waitlist-listen-request:${e.id}:${r.requested_date}`,
+        title: r.listen_mode === 'selected' ? `${name(e)} asked to wait only for litters from ${parents || 'no parents'}`
+          : r.listen_mode === 'except' ? `${name(e)} asked to skip litters from ${parents || 'no parents'}`
+            : `${name(e)} asked to change which litters they wait for`,
+        detail: `Narrower, so it needs you: they wouldn't be offered ${r.listen_mode === 'except' ? 'those' : 'other'} litters, and nothing is counted as a pass for those.${openNote}`,
+        subjectHref: href(e),
+        actions: decide(() => approveListenChange(e.id, { date: today }), () => declineListenChange(e.id, { date: today }),
+          `${name(e)} now ${r.listen_mode === 'except' ? 'skips' : 'waits only for'} those litters. Let them know.`, e, 'listen_change_request')
+      });
+    }
+    if (hasPendingRequest(e, 'companion_request')) {
+      const r = e.companion_request;
+      out.push({
+        key: `waitlist-companion-request:${e.id}:${r.requested_date}`,
+        title: `${name(e)} asked for their Companion link`,
+        detail: `Send it from the Companion page (Current families), then mark it sent so their status page says so.${said(r.note)}`,
+        subjectHref: href(e),
+        actions: [
+          { label: 'Open Companion', run: async () => { location.href = 'companion.html?type=family'; } },
+          { label: 'Mark sent', run: async () => { await markCompanionLinkSent(e.id, { date: today }); return { title: 'Marked sent', message: `${name(e)}'s status page now says their link was sent.` }; } },
+          { label: 'Decline', run: async () => { await declineCompanionRequest(e.id, { date: today }); return { title: 'Declined', message: 'Their status page says you didn\'t send one. Let them know why.' }; } }
+        ]
+      });
+    }
+    // Extras asked for or cancelled (Family Requests plan §3): each waits for her.
+    for (const r of pendingExtraRequests(e)) {
+      const emails = (kind) => [{ entryId: e.id, kind, extra: { request: { field: 'extra_request', request: r } } }];
+      const cancel = r.kind === 'cancel';
+      out.push({
+        key: `waitlist-extra-request:${e.id}:${r.id}`,
+        title: cancel ? `${name(e)} asked to cancel ${r.name}` : `${name(e)} asked for ${r.name}`,
+        detail: `${cancel ? 'Approve takes it off their sale.' : 'Approve adds it to their sale at your price-list price, with its payment plan.'}${said(r.note)}`,
+        subjectHref: href(e),
+        actions: [
+          { label: 'Approve', run: async () => {
+            const res = await approveExtraRequest(e.id, r.id, { date: today });
+            return { title: 'Approved', message: cancel ? `${r.name} is off their sale. Let them know.` : `${r.name} is on their sale${res.charge?.payments ? ', with its payment plan' : ''}. Let them know.`, emails: emails('request_approved') };
+          } },
+          { label: 'Decline', run: async () => { await declineExtraRequest(e.id, r.id, { date: today }); return { title: 'Declined', message: 'Nothing changed on their sale. Let them know.', emails: emails('request_declined') }; } },
+          { label: 'Open', run: async () => { location.href = href(e); } }
+        ]
+      });
+    }
+    // Backing out (Family Requests plan §7): she decides on their page, where she
+    // chooses the outcome and ticks what comes off with the sale.
+    if (hasPendingRequest(e, 'back_out_request')) {
+      const r = e.back_out_request;
+      out.push({
+        key: `waitlist-back-out:${e.id}:${r.requested_date}`,
+        title: `${name(e)} asked to back out`,
+        detail: `Their reason: ${r.reason?.label || ''}${r.reason?.text ? `: "${r.reason.text}"` : ''}. Nothing changes until you decide on their page: cancel the sale and keep what they paid, or put them back in line.${said(r.note)}`,
+        subjectHref: href(e),
+        actions: [{ label: 'Open', run: async () => { location.href = href(e); } }]
+      });
+    }
+    // Pickup requests (Family Requests plan §4): a time or a cancel is decided here;
+    // their own address needs a day, time and fee, so it opens their page.
+    for (const r of pendingPickupRequests(e)) {
+      const emails = (kind, extra = {}) => [{ entryId: e.id, kind, extra: { request: { field: 'pickup_request', request: r }, ...extra } }];
+      const actions = r.kind === 'address'
+        ? [
+            { label: 'Open', run: async () => { location.href = href(e); } },
+            ...(r.far ? [{ label: 'Send transport options', run: async () => ({ title: 'Transport options', message: 'Edit the email, then send it.', emails: [{ entryId: e.id, kind: 'transport_options', extra: Number.isFinite(r.miles) ? { distance: r.miles } : {} }] }) }] : [])
+          ]
+        : [
+            { label: 'Approve', run: async () => {
+              const res = await approvePickupRequest(e.id, r.id, { date: today });
+              const money = (v) => `$${Number(v).toFixed(2)}`;
+              const board = res.boarding ? ` Standard boarding applies: ${res.boarding.days} day${res.boarding.days === 1 ? '' : 's'}, ${money(res.boarding.amount)}, on their sale and logged as a stay.`
+                : res.boardingKept ? ` This date has standard boarding (${res.boardingKept.days} days, ${money(res.boardingKept.amount)}), but the sale already has your own boarding charge, so it was kept; change it on their entry or the sale if you like.` : '';
+              const fee = res.transportFeeLeft ? ` Their ${money(res.transportFeeLeft)} transport fee is still on the sale; take it off there if it no longer applies.` : '';
+              return { title: 'Approved', message: `${r.kind === 'cancel' ? 'Their pickup is off the calendar.' : `It's on the pup's calendar as their pickup.`}${board}${fee} Let them know.`, emails: emails('request_approved') };
+            } },
+            { label: 'Decline', run: async () => { await declinePickupRequest(e.id, r.id, { date: today }); return { title: 'Declined', message: 'Nothing changed. Let them know.', emails: emails('request_declined') }; } }
+          ];
+      out.push({
+        key: `waitlist-pickup-request:${e.id}:${r.id}`,
+        title: `${name(e)} asked ${pickupRequestText(r)}`,
+        detail: `${r.kind === 'address' ? (r.far ? 'Farther than your limit: they were told you\'ll be in touch about driving or a flight nanny. ' : 'Approve on their page with the day, time and transport fee. ') : ''}${said(r.note)}`.trim(),
+        subjectHref: href(e),
+        actions
+      });
+    }
+    // An email held because it waited more than a day to go (K8-11): still send it?
+    for (const m of (e.messages || []).filter(isHeldEmail)) {
+      out.push({
+        key: `waitlist-email-held:${e.id}:${m.id}`,
+        title: `Your email to ${name(e)} is waiting for you`,
+        detail: `"${m.subject}" waited more than a day for a connection, so it wasn't sent by itself: its dates or details may be out of date. Send it as written, or don't and write them a new one.`,
+        subjectHref: href(e),
+        actions: [
+          { label: 'Open', run: async () => { location.href = href(e); } },
+          { label: 'Send as written', run: async () => { await retryEmail(e.id, m.id); return { title: 'Sending', message: 'It goes with the next sync.' }; } },
+          { label: 'Don\'t send', run: async () => { await dropEmail(e.id, m.id); } }
+        ]
+      });
+    }
+    const unread = (e.messages || []).filter((m) => !m.read);
+    if (unread.length) {
+      const newest = unread[unread.length - 1];
+      const msgs = unread.filter((m) => m.kind === 'message').length;
+      const clip = (t) => (t.length > 200 ? `${t.slice(0, 200)}…` : t);
+      out.push({
+        key: `waitlist-messages:${e.id}:${newest.id}`,
+        title: msgs ? `${msgs === 1 ? 'A message' : `${msgs} messages`} from ${name(e)}` : `${name(e)} did something on their status page`,
+        detail: unread.slice(-3).map((m) => clip(m.body)).join(' · '),
+        subjectHref: href(e),
+        actions: [
+          { label: 'Open', run: async () => { location.href = href(e); } },
+          { label: 'Mark read', run: async () => { await markMessagesRead(e.id); } }
+        ]
+      });
+    }
+  }
+  return out;
+}

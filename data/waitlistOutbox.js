@@ -1,0 +1,204 @@
+// waitlistOutbox.js — emails to families, on her device (W2 Plan §8, step 6).
+//
+// An email she sends (from a preview she can edit, or skip) is QUEUED on the
+// family's entry, in `messages` beside their status-page activity:
+//   { id, at, from: 'breeder', kind: 'email', email_kind, subject, body,
+//     status: 'queued' | 'sent' | 'failed', sent_at, error, read: true }
+// cloudWaitlist.sendQueuedEmails sends them after the next publish (so the
+// status page already shows what the email talks about), and records the
+// result. Offline, they wait. A failed one gets Retry on the family's page.
+//
+// Emails are offered only where the family can have a status page: the kennel's
+// list is online (and offered in this edition) and the family has an email.
+// Writes go through the entry repo, so they ride backup like any edit.
+import { kennelRepo } from './kennelRepo.js';
+import { contactRepo } from './contactRepo.js';
+import { waitlistEntryRepo } from './waitlistEntryRepo.js';
+import { waitlistProgramRepo } from './waitlistProgramRepo.js';
+import { litterRepo } from './litterRepo.js';
+import { dogRepo } from './dogRepo.js';
+import { accountRepo } from './accountRepo.js';
+import { sharedTransport } from './referralShare.js';
+import { waitlistConfig, entryName, overallPositions } from './waitlistRules.js';
+import { entryEmail, photoLink } from './waitlistProjection.js';
+import { saleRepo } from './saleRepo.js';
+import { waitlistOfferRepo } from './waitlistOfferRepo.js';
+import { familySale } from './familyExtras.js';
+import { RELEASED_SALE_STATUSES } from './vocab.js';
+import { draftEmail, requestPhrase, emailProblem, EMAIL_KINDS, EMAIL_SUBJECT_MAX, EMAIL_BODY_MAX } from './waitlistEmails.js';
+import { MESSAGES_KEPT } from './waitlistActions.js';
+import { isWaitlistOnlineOffered } from './cloud/cloudConfig.js';
+import { editionFlags } from './editionConfig.js';
+
+const nowISO = () => new Date().toISOString();
+
+// Can her list email this kennel's families at all?
+export function kennelEmailsOn(kennel) {
+  return Boolean(isWaitlistOnlineOffered() && editionFlags.waitlist && kennel && kennel.is_own_kennel && !kennel.is_archived
+    && kennel.public_id && waitlistConfig(kennel).online);
+}
+
+// The family's address (the one their status page is published with), or ''.
+export function familyEmail(entry, contact) {
+  return String(entryEmail(entry, contact) || '').trim();
+}
+
+// The pup of the family's sale (any sale not cancelled, voided or returned, so a
+// pup gone home counts) and its photos link (Dog.url), for the line every email
+// to them ends with: { name, url }, or null without a sale or a link.
+export async function salePupPhotos(entry) {
+  if (!entry) return null;
+  const [sales, offers, entries] = await Promise.all([
+    saleRepo.getAll(), waitlistOfferRepo.getByEntry(entry.id), waitlistEntryRepo.getByKennel(entry.kennel_id)
+  ]);
+  const sale = familySale(entry, sales, offers, entries, (s) => !RELEASED_SALE_STATUSES.includes(s.status));
+  const dog = sale?.dog_id ? await dogRepo.getById(sale.dog_id) : null;
+  const url = photoLink(dog?.url);
+  return url ? { name: dog.call_name || '', url } : null;
+}
+
+const litterLabel = (l, dogsById) => l.nickname || `${dogsById.get(l.dam_id)?.call_name || 'Dam'} × ${dogsById.get(l.sire_id)?.call_name || 'Sire'}`;
+
+// A draft for one family, from her records: { entryId, name, email, kind, subject,
+// body }, or null when this family can't be emailed. `extra`:
+//   litterIds    the litter(s) it's about (an offer, a closed turn, a new litter)
+//   respondBy    YYYY-MM-DD (an offer; a closed turn)
+//   request      { field, request } (a decision on their request)
+export async function draftFor(entryId, kind, extra = {}) {
+  if (!EMAIL_KINDS.includes(kind)) throw new Error(`Unknown email "${kind}".`);
+  const entry = await waitlistEntryRepo.getById(entryId);
+  if (!entry) return null;
+  const kennel = await kennelRepo.getById(entry.kennel_id);
+  if (!kennelEmailsOn(kennel)) return null;
+  const contact = entry.contact_id ? await contactRepo.getById(entry.contact_id) : null;
+  const email = familyEmail(entry, contact);
+  if (!email) return null;
+  const config = waitlistConfig(kennel);
+  const facts = { kennelName: kennel.kennel_name || '', family: entryName(entry, contact), payBy: entry.fee_due_date || null };
+  // Their pup's photos link, when they have a sale and the pup has one.
+  const pupPhotos = await salePupPhotos(entry);
+  if (pupPhotos) facts.pupPhotos = pupPhotos;
+  if (extra.litterIds?.length) {
+    const dogsById = new Map((await dogRepo.getAll({ includeArchived: true })).map((d) => [d.id, d]));
+    const litters = await Promise.all(extra.litterIds.map((id) => litterRepo.getById(id)));
+    facts.litters = litters.filter(Boolean).map((l) => litterLabel(l, dogsById));
+  }
+  if (extra.respondBy) facts.respondBy = extra.respondBy;
+  if (extra.request) facts.request = requestPhrase(extra.request.field, extra.request.request);
+  // Transport options (Family Requests plan §5.1): their latest address's miles, and
+  // her Transport accounts shared with families.
+  if (kind === 'transport_options') {
+    const last = [...(entry.pickup_requests || [])].reverse().find((r) => r.kind === 'address' && Number.isFinite(r.miles));
+    facts.distance = Number.isFinite(extra.distance) ? extra.distance : last ? last.miles : null;
+    facts.transport = editionFlags.accounts ? sharedTransport(await accountRepo.getAll()) : [];
+  }
+  if (entry.status === 'active') {
+    const [entries, programs, sales, dogs] = await Promise.all([
+      waitlistEntryRepo.getByKennel(kennel.id), waitlistProgramRepo.getMapForKennel(kennel.id),
+      saleRepo.getAll({ includeArchived: true }), dogRepo.getAll({ includeArchived: true })
+    ]);
+    facts.position = overallPositions(entries, kennel.id, programs, { sales, dogs }).get(entry.id) || null;
+  }
+  return { entryId, name: facts.family, email, ...draftEmail(kind, facts, config) };
+}
+
+// Drafts for several families at once (nulls dropped), e.g. a turn that moved on.
+export async function draftsFor(specs) {
+  const out = [];
+  for (const s of specs || []) {
+    const d = await draftFor(s.entryId, s.kind, s.extra || {});
+    if (d) out.push(d);
+  }
+  return out;
+}
+
+// The emails a turn change calls for: an offer to every family a turn went to
+// ({ next, offered } as waitlistActions returns them).
+export function offerSpecs(res) {
+  return [res?.next, ...(res?.offered || [])].filter(Boolean).map((t) => ({
+    entryId: t.entry_id, kind: 'offer', extra: { litterIds: t.litter_ids || [t.litter_id], respondBy: t.respond_by_date }
+  }));
+}
+
+// Is this family mid-turn (an open offer anywhere)? They aren't sent "a litter you
+// match was born" on top (like "almost your turn", Spec §15.5).
+export const midTurn = (offers, entryId) => offers.some((o) => o.entry_id === entryId && o.outcome === 'open' && !o.is_archived);
+
+// Queue an email she approved. → the message as stored.
+export async function queueEmail(entryId, { kind, subject, body }) {
+  const problem = emailProblem({ subject, body });
+  if (problem) throw new Error(problem);
+  if (!EMAIL_KINDS.includes(kind)) throw new Error(`Unknown email "${kind}".`);
+  const entry = await waitlistEntryRepo.getById(entryId);
+  if (!entry) throw new Error('That waitlist entry no longer exists.');
+  const message = {
+    id: `em-${crypto.randomUUID()}`, at: nowISO(), from: 'breeder', kind: 'email', email_kind: kind,
+    subject: subject.replace(/\s+/g, ' ').trim(), body: body.trim(), status: 'queued', sent_at: null, error: null, read: true
+  };
+  await waitlistEntryRepo.update(entryId, { messages: [...(entry.messages || []), message].slice(-MESSAGES_KEPT) });
+  return message;
+}
+
+// A message she sent the family herself (share sheet, her own email, or copied),
+// logged beside the emails KennelOS sent so the family page shows it. Already
+// sent, so sendQueuedEmails never picks it up: `via: 'own'`.
+export async function logOwnMessage(entryId, { kind, subject = '', body = '' }) {
+  const entry = await waitlistEntryRepo.getById(entryId);
+  if (!entry) throw new Error('That waitlist entry no longer exists.');
+  const at = nowISO();
+  const message = {
+    id: `em-${crypto.randomUUID()}`, at, from: 'breeder', kind: 'email', email_kind: kind, via: 'own',
+    subject: String(subject).replace(/\s+/g, ' ').trim().slice(0, EMAIL_SUBJECT_MAX), body: String(body).trim().slice(0, EMAIL_BODY_MAX),
+    status: 'sent', sent_at: at, error: null, read: true
+  };
+  await waitlistEntryRepo.update(entryId, { messages: [...(entry.messages || []), message].slice(-MESSAGES_KEPT) });
+  return message;
+}
+
+// Record what happened to one queued email.
+export async function setEmailStatus(entryId, messageId, patch) {
+  const entry = await waitlistEntryRepo.getById(entryId);
+  if (!entry || !(entry.messages || []).some((m) => m.id === messageId)) return null;
+  return waitlistEntryRepo.update(entryId, {
+    messages: entry.messages.map((m) => (m.id === messageId ? { ...m, ...patch } : m))
+  });
+}
+
+// Retry: back in the queue (same id, so it can never arrive twice). Its age counts
+// again from now, so one held as stale goes as written once she says so.
+export const retryEmail = (entryId, messageId) => setEmailStatus(entryId, messageId, { status: 'queued', error: null, requeued_at: nowISO() });
+
+// She chose not to send one that was held (K8-11).
+export const dropEmail = (entryId, messageId) => setEmailStatus(entryId, messageId, { status: 'failed', error: 'not_sent' });
+
+// An email that waited more than a day for a connection (K8-11) isn't sent by itself:
+// its dates ("send your deposit by Wednesday") may have passed. Counted from when she
+// approved it, or sent it again.
+export const EMAIL_STALE_MS = 24 * 60 * 60 * 1000;
+export function isStaleEmail(message, now = Date.now()) {
+  const from = Date.parse(message?.requeued_at || message?.at || '');
+  return Number.isFinite(from) && now - from > EMAIL_STALE_MS;
+}
+export const isHeldEmail = (m) => m?.from === 'breeder' && m.kind === 'email' && m.status === 'failed' && m.error === 'stale';
+
+// Every queued email of these entries, oldest first: [{ entry, message }].
+export function queuedEmails(entries) {
+  const out = [];
+  for (const entry of entries) {
+    for (const m of entry.messages || []) if (m.from === 'breeder' && m.kind === 'email' && m.status === 'queued') out.push({ entry, message: m });
+  }
+  return out.sort((a, b) => String(a.message.at).localeCompare(String(b.message.at)));
+}
+
+// Plain words for why an email couldn't go, from the server's answer.
+export function emailErrorText(code) {
+  return {
+    stale: 'Held, not sent: it waited more than a day for a connection, so its dates or details may be out of date. Read it, then send it as written, or write them a new one.',
+    not_sent: 'You chose not to send it.',
+    not_published: 'This family isn\'t on your online list yet. It goes once the list is published again.',
+    no_email: 'There\'s no email address for this family.',
+    bad_message: 'The email couldn\'t be sent as written.',
+    email_unavailable: 'Email isn\'t working on the server right now.',
+    failed: 'The email service didn\'t take it.'
+  }[code] || 'It couldn\'t be sent.';
+}

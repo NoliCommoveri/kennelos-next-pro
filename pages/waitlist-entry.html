@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Waitlist family — KennelOS</title>
+  <link rel="stylesheet" href="../assets/app.css">
+  <link rel="manifest" href="../manifest.json">
+  <link rel="icon" href="../assets/icons/favicon-32.png" sizes="32x32">
+  <link rel="apple-touch-icon" href="../assets/icons/apple-touch-icon.png">
+  <meta name="theme-color" content="#122138">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="KennelOS">
+</head>
+<body>
+  <div id="app-nav"></div>
+  <main>
+    <div class="page-header">
+      <div style="flex: 1 1 0; min-width: 0;">
+        <a class="muted" id="back-link" href="waitlist.html">← Waitlist</a>
+        <h1 id="entry-title">Waitlist family</h1>
+        <p class="page-subtitle" id="entry-subtitle"></p>
+      </div>
+      <div id="header-actions" class="pill-row" style="flex: none;"></div>
+    </div>
+
+    <div id="page-error"></div>
+    <div id="page-note" aria-live="polite"></div>
+
+    <!-- Viewing a family: three tabs (decided 2026-10-10). Details: who they are and
+         where they stand. Interact: everything that does something. History: the
+         running log, offers and documents. Editing or a new application: the form. -->
+    <nav class="seg-tabs" id="entry-tabs" role="tablist" hidden></nav>
+    <div id="tab-details" role="tabpanel" hidden></div>
+    <div id="tab-interact" role="tabpanel" hidden></div>
+    <div id="tab-history" role="tabpanel" hidden></div>
+
+    <section class="card" id="edit-section" hidden>
+      <div class="row-between">
+        <h2 style="margin:0;" id="edit-title">Details</h2>
+        <div id="profile-actions" class="pill-row"></div>
+      </div>
+      <div id="profile-body"></div>
+    </section>
+  </main>
+
+  <script type="module" src="../app.js"></script>
+  <script type="module" src="./waitlist-entry.js"></script>
+</body>
+</html>

@@ -1,0 +1,492 @@
+// waitlistPicksPanel.js — the Litter page's "Waitlist picks" panel (Waitlist Spec
+// §6.5, §16.1; End-State guide §29). Offers are TURNS: one family at a time across
+// the kennel's open litters, each turn covering every open litter they match, so
+// this litter's open offer may be one part of a family's turn, and the turn may be
+// held on another litter entirely. Open/close picks, the open offer with its outcome
+// buttons (picked a pup → a held Sale, deposit received, change pup, passed, no
+// response / no deposit, void), who's next, the litter queue, and the litter's
+// offer history (change pup on the last accepted pick, undo a pass). Pro-only: litter.js (a shared page)
+// imports this module dynamically only when editionFlags.waitlist is on, and it is
+// in PRO_ONLY_STANDALONE so it is absent from the Lite build.
+import { kennelRepo } from '../data/kennelRepo.js';
+import { dogRepo } from '../data/dogRepo.js';
+import { litterRepo } from '../data/litterRepo.js';
+import { saleRepo } from '../data/saleRepo.js';
+import { contactRepo } from '../data/contactRepo.js';
+import { waitlistEntryRepo } from '../data/waitlistEntryRepo.js';
+import { waitlistOfferRepo } from '../data/waitlistOfferRepo.js';
+import { waitlistProgramRepo } from '../data/waitlistProgramRepo.js';
+import * as actions from '../data/waitlistActions.js';
+import {
+  waitlistConfig, litterQueue, nextTurn, openTurns, turnOffers, turnIdOf, eligiblePupsFor, isPupAvailable,
+  overallPositions, entryName, describeOfferChanges, soonFamiliesForLitter, whelpNotes,
+  isAwaitingDeposit, switchablePups, canSwitchAcceptedPick, undoPassBlocker, autoOffers, autoOfferSummary, closingTrigger,
+  nextTurnPrepassNote, familyPagePlan, isFamilyPageOnly, isTurnOverdue
+} from '../data/waitlistRules.js';
+import { doNotSellRepo } from '../data/doNotSellRepo.js';
+import { doNotSellMatches, doNotSellWarning } from '../data/doNotSell.js';
+import { WAITLIST_OFFER_OUTCOME, SEX } from '../data/vocab.js';
+import { esc, badge, fmtDate, todayYMD, kennelToday, confirmModal, alertModal } from './ui.js';
+import { openSoonNotice, pickDialog, depositDialog, changePickDialog, undoPassDialog, statusLinkFor, copyLink, formModal } from './waitlistUI.js';
+import { offerEmails } from './waitlistEmailUI.js';
+import { offerSpecs, midTurn } from '../data/waitlistOutbox.js';
+import { openPicksPreview, previewParam } from './picksPreviewModal.js';
+import { sideSaleDialog } from './sideSaleUI.js';
+
+const none = '<span class="faint">—</span>';
+const QUEUE_PREVIEW = 5;
+
+async function loadData(litter) {
+  const [kennel, entries, kennelOffers, dogs, allLitters, programsById, allSales, contacts] = await Promise.all([
+    kennelRepo.getById(litter.kennel_id),
+    waitlistEntryRepo.getByKennel(litter.kennel_id),
+    waitlistOfferRepo.getByKennel(litter.kennel_id),
+    dogRepo.getAll({ includeArchived: true }),
+    litterRepo.getAll({ includeArchived: true }),
+    waitlistProgramRepo.getMapForKennel(litter.kennel_id),
+    saleRepo.getAll({ includeArchived: true }),
+    contactRepo.getAll({ includeArchived: true })
+  ]);
+  const pups = dogs.filter((d) => d.litter_id === litter.id);
+  const pupIds = new Set(pups.map((d) => d.id));
+  // The kennel's litters and their pups: a turn covers every open litter (§16.1).
+  const kennelLitters = allLitters.filter((l) => l.kennel_id === litter.kennel_id).map((l) => (l.id === litter.id ? litter : l));
+  const kennelLitterIds = new Set(kennelLitters.map((l) => l.id));
+  const kennelPups = dogs.filter((d) => kennelLitterIds.has(d.litter_id));
+  const kennelPupIds = new Set(kennelPups.map((d) => d.id));
+  const dogsById = new Map(dogs.map((d) => [d.id, d]));
+  return {
+    kennel, entries, pups, programsById, kennelLitters, kennelPups,
+    kennelSales: allSales.filter((s) => kennelPupIds.has(s.dog_id)),
+    // Every sale and dog: a family's number counts families with a pup selected.
+    allSales, dogsById,
+    litterName: (id) => {
+      const l = kennelLitters.find((x) => x.id === id);
+      return l ? (l.nickname || `${dogsById.get(l.dam_id)?.call_name || 'Unknown'} × ${dogsById.get(l.sire_id)?.call_name || 'Unknown'}`) : 'another litter';
+    },
+    offers: kennelOffers.filter((o) => o.litter_id === litter.id),
+    // Every offer on the kennel: the "almost your turn" notice skips families
+    // holding an open offer on ANY litter.
+    kennelOffers,
+    sales: allSales.filter((s) => pupIds.has(s.dog_id)),
+    contactsById: new Map(contacts.map((c) => [c.id, c])),
+    config: waitlistConfig(kennel)
+  };
+}
+
+const pupLabel = (d) => `${d.call_name}${d.sex ? ` (${SEX.find((s) => s.value === d.sex)?.label || d.sex})` : ''}`;
+
+// The "It's almost your turn" / "a litter you match was born" dialog for this
+// litter, from the panel's own data.
+function openNotice(d, litter, soon, opts) {
+  openSoonNotice({
+    kennel: d.kennel, config: d.config, rows: soon, contactsById: d.contactsById,
+    litterLabelOf: (r) => `#${r.soonPosition} in line · pups for them: ${r.eligibleDogs.map(pupLabel).join(', ')}`,
+    litterIdsOf: () => [litter.id],
+    whelp: whelpNotes(d.entries, litter, d.pups, d.sales, opts).filter((w) => w.kind === 'review' || !midTurn(d.kennelOffers, w.entry.id)).map((w) => ({ ...w, litterIds: [litter.id] }))
+  });
+}
+
+// The same dialog opened from outside the panel: the guided "Record a new litter"
+// flow's "Tell my waitlist" step (assets/guidedShareUI.js), right after the birth
+// is saved. It only drafts the notice; she reviews it and sends it herself.
+export async function openLitterWaitlistNotice(litter) {
+  const d = await loadData(litter);
+  const opts = { today: kennelToday(d.kennel), config: d.config, programsById: d.programsById };
+  const soon = soonFamiliesForLitter(d.entries, d.kennelOffers, litter, d.pups, d.sales, opts);
+  openNotice(d, litter, soon, opts);
+}
+
+// Open picks from outside the panel: Kels's litter check-in
+// (assets/litterCheckinUI.js), Today's "Open picks" nudge and Kels's Review my
+// waitlist (pages/today.js, assets/waitlistReviewUI.js), when the accept-deposits
+// date has come. Through the picks preview, like the panel's button, then the same
+// "Email the family?" preview; returns what happened as { title, message }, or
+// null when she closed the preview without opening picks.
+export async function openPicksFromCheckin(litter) {
+  const d = await loadData(litter);
+  const familyName = (entry) => entryName(entry, d.contactsById.get(entry.contact_id));
+  const heldElsewhere = openTurns(d.kennelOffers, litter.kennel_id).length > 0;
+  const res = await openPicksPreview({ litterId: litter.id });
+  if (!res) return null;
+  const turn = res.turn;
+  if (!turn) {
+    return { title: 'Picks are open', message: heldElsewhere
+      ? 'Another family holds the turn and isn\'t first in line for this litter, so it waits for the next turn.'
+      : 'Nobody on the list is eligible for the available pups yet. The litter page shows who\'s next.' };
+  }
+  const said = offeredMessage(turn, await freshEntries(litter), familyName, d.litterName);
+  if (!turn.none) await offerEmails(offerSpecs({ next: turn }));
+  return said;
+}
+
+// Render the panel into `mount` for `litter`. `onChange` lets the litter page
+// refresh its own state (the litter record and roster) after a write.
+export async function renderWaitlistPicksPanel({ mount, litter, onChange = async () => {} }) {
+  if (!mount) return;
+  const d = await loadData(litter);
+  const today = kennelToday(d.kennel);
+  const familyName = (entry) => entryName(entry, d.contactsById.get(entry.contact_id));
+  const familyLink = (entry) => `<a href="waitlist-entry.html?id=${encodeURIComponent(entry.id)}">${esc(familyName(entry))}</a>`;
+  const entriesById = new Map(d.entries.map((e) => [e.id, e]));
+  const pupsById = new Map(d.pups.map((p) => [p.id, p]));
+  const opts = { today, config: d.config, programsById: d.programsById };
+
+  const available = d.pups.filter((p) => isPupAvailable(p, d.sales));
+  const queue = litterQueue(d.entries, litter, d.pups, d.sales, opts);
+  const positions = overallPositions(d.entries, litter.kennel_id, d.programsById, { sales: d.allSales, dogs: d.dogsById });
+  const open = d.offers.find((o) => o.outcome === 'open' && !o.is_archived) || null;
+  // The turn open in the kennel (at most one since §16.1; older offers may leave more).
+  const kennelTurns = openTurns(d.kennelOffers, litter.kennel_id);
+  const otherLitters = (offer) => turnOffers(d.kennelOffers, turnIdOf(offer)).filter((o) => o.outcome === 'open' && o.litter_id !== offer.litter_id).map((o) => d.litterName(o.litter_id));
+  const picksOpen = Boolean(litter.picks_opened_date);
+  const soon = soonFamiliesForLitter(d.entries, d.kennelOffers, litter, d.pups, d.sales, opts);
+
+  // Kept off the waitlist (E3): its family pages, and the way back.
+  if (litter.waitlist_off) return renderKeptOff({ mount, litter, d, familyLink, onChange });
+  // "Non-Waitlist Sales…" (E3): while picks aren't open and nobody holds a turn
+  // or a side sale here, and some pup has a sale with a buyer.
+  const plan = familyPagePlan(litter, { pups: d.pups, sales: d.sales, entries: d.entries, offers: d.kennelOffers });
+  const canSoldBefore = !picksOpen && !d.offers.some((o) => o.outcome === 'open' && !o.is_archived) && plan.rows.length > 0;
+  const soldBeforeBtn = canSoldBefore ? '<button class="btn btn-sm" data-pk="sold-before" title="These pups were sold outside the waitlist: give their families a status page and keep this litter off the waitlist">Non-Waitlist Sales…</button>' : '';
+
+  // Nothing to show for a kennel that has never used the waitlist on this litter.
+  if (!picksOpen && !d.offers.length && !queue.length && !d.entries.some((e) => e.status === 'active')) {
+    if (!canSoldBefore) { mount.innerHTML = ''; return; }
+    mount.innerHTML = `<section class="card" style="margin-top:16px;">
+      <div class="row-between"><h2 style="margin:0;">Waitlist</h2><div class="pill-row">${soldBeforeBtn}</div></div>
+      <p class="field-hint" style="margin:6px 0 0;">Sold these pups outside the waitlist? Their families can still get a status page (pickup times, extras, the puppy portal link and your messages) without being on the list.</p>
+    </section>`;
+    mount.querySelector('[data-pk="sold-before"]').addEventListener('click', async () => {
+      try { if (await soldBeforeDialog(litter)) await onChange(); } catch (e) { await alertModal({ title: 'Couldn\'t do that', message: e.message || String(e) }); }
+    });
+    return;
+  }
+
+  // --- The open offer ---
+  let openHtml = '';
+  if (open) {
+    const entry = entriesById.get(open.entry_id);
+    const live = entry ? eligiblePupsFor(entry, litter, d.pups, d.sales, opts) : [];
+    const overdue = isTurnOverdue(open, today);
+    const picked = isAwaitingDeposit(open) ? pupsById.get(open.chosen_dog_id) : null;
+    // Her request (W2 Plan §8): the family's status-page link, to send by Messenger.
+    const copyBtn = entry && statusLinkFor(entry, d.kennel)
+      ? '<button class="btn btn-sm" data-pk="copy-link" title="Their status page, to send by Messenger or text">Copy status link</button>' : '';
+    openHtml = `
+      <div class="card" style="margin:12px 0 0;background:var(--surface-2, transparent);">
+        <p style="margin:0 0 6px;"><strong>${entry ? familyLink(entry) : 'A family'}'s turn</strong> since ${esc(fmtDate(open.offered_date))}
+          · pick and pay by <strong>${esc(fmtDate(open.respond_by_date))}</strong>${overdue ? ' <span class="badge badge-red">Deadline passed</span>' : ''}</p>
+        ${otherLitters(open).length ? `<p class="muted" style="margin:0 0 6px;">Their turn also covers ${esc(otherLitters(open).join(', '))}: they pick one pup from any of them, or pass on all of them.</p>` : ''}
+        ${isAwaitingDeposit(open)
+          ? `<p style="margin:0 0 10px;"><span class="badge badge-purple">Picked ${esc(picked ? picked.call_name : 'a pup')}</span> <span class="muted">held until the deposit arrives${open.sale_id ? ` · <a href="sale.html?id=${encodeURIComponent(open.sale_id)}">open the sale</a>` : ''}</span></p>
+        <div class="pill-row">
+          <button class="btn btn-primary btn-sm" data-pk="deposit">Deposit received…</button>
+          <button class="btn btn-sm" data-pk="change">Change pup…</button>
+          <button class="btn btn-sm" data-pk="passed">Passed</button>
+          <button class="btn btn-sm" data-pk="no_response" title="The deposit didn't arrive in time (counts like no response)">No deposit</button>
+          <button class="btn btn-sm" data-pk="voided" title="Cancel this offer (never counts as a pass)">Void</button>
+          ${copyBtn}
+        </div>`
+          : `<p class="muted" style="margin:0 0 10px;">Pups available to them: ${live.length ? esc(live.map(pupLabel).join(', ')) : 'none right now'}</p>
+        <div class="pill-row">
+          <button class="btn btn-primary btn-sm" data-pk="accept"${live.length ? '' : ' disabled'}>Picked a pup…</button>
+          <button class="btn btn-sm" data-pk="passed">Passed</button>
+          <button class="btn btn-sm" data-pk="no_response">No response</button>
+          <button class="btn btn-sm" data-pk="voided" title="Cancel this offer (never counts as a pass)">Void</button>
+          ${copyBtn}
+        </div>`}
+      </div>`;
+  }
+
+  // --- Who's next (picks open, no turn open in the kennel) ---
+  let nextHtml = '';
+  // "Not this litter" on the next family's turn (Spec §16.2), said before she taps.
+  const prepassNoteHtml = (n) => {
+    const note = nextTurnPrepassNote(n.entry, n.litters, {
+      offers: d.kennelOffers, config: d.config, program: d.programsById.get(n.entry.waitlist_program_id) || null, litterOf: (l) => d.litterName(l.id)
+    });
+    return note ? `<p class="field-hint" style="margin:6px 0 0;"><span class="badge badge-amber">Not this litter</span> ${esc(note)}</p>` : '';
+  };
+  const heldElsewhere = !open ? kennelTurns[0] : null;
+  if (heldElsewhere) {
+    const holder = entriesById.get(heldElsewhere.entry_id);
+    nextHtml = `<p class="muted" style="margin:12px 0 0;">${holder ? familyLink(holder) : 'Another family'} holds the turn (${esc(heldElsewhere.offers.map((o) => d.litterName(o.litter_id)).join(', '))}) until ${esc(fmtDate(heldElsewhere.respond_by_date))}. One family at a time across your open litters: the next turn is worked out when theirs closes.</p>`;
+  } else if (picksOpen && !open) {
+    const next = nextTurn(d.entries, d.kennelOffers, d.kennelLitters, d.kennelPups, d.kennelSales, { ...opts, kennelId: litter.kennel_id });
+    const here = next && next.litters.some((x) => x.litter.id === litter.id);
+    const others = next ? next.litters.filter((x) => x.litter.id !== litter.id).map((x) => d.litterName(x.litter.id)) : [];
+    nextHtml = next
+      ? `<p style="margin:12px 0 0;">Next turn: <strong>${familyLink(next.entry)}</strong>${here ? (others.length ? ` <span class="muted">(this litter and ${esc(others.join(', '))})</span>` : '') : ` <span class="muted">(for ${esc(others.join(', '))}; nobody ahead of them is waiting for this litter)</span>`} <button class="btn btn-sm btn-primary" data-pk="offer-next">Offer to them</button></p>${prepassNoteHtml(next)}`
+      : `<p class="muted" style="margin:12px 0 0;">${available.length ? 'Nobody else on the list is eligible for the pups still available.' : 'Every pup in this litter is spoken for.'}</p>`;
+  }
+
+  // --- Litter queue preview ---
+  const spent = new Set(d.offers.filter((o) => o.outcome !== 'voided' && !o.is_archived).map((o) => o.entry_id));
+  const waiting = queue.filter((q) => !spent.has(q.entry.id));
+  const queueHtml = waiting.length
+    ? `<table class="data" style="margin-top:8px;"><thead><tr><th>In line</th><th>Family</th><th>Overall</th><th>Pups for them</th></tr></thead><tbody>${
+        waiting.slice(0, QUEUE_PREVIEW).map((q) => `<tr><td>${q.litterPosition}</td><td>${familyLink(q.entry)}</td><td>#${esc(positions.get(q.entry.id))}</td><td>${esc(q.eligibleDogs.map(pupLabel).join(', '))}</td></tr>`).join('')
+      }</tbody></table>${waiting.length > QUEUE_PREVIEW ? `<p class="faint" style="margin:4px 0 0;">…and ${waiting.length - QUEUE_PREVIEW} more.</p>` : ''}`
+    : `<p class="muted" style="margin:8px 0 0;">No families waiting for this litter${available.length ? '' : ' (no pups available)'}.</p>`;
+
+  // --- History ---
+  const history = [...d.offers].filter((o) => o.outcome !== 'open').sort((a, b) => (b.outcome_date || b.offered_date || '').localeCompare(a.outcome_date || a.offered_date || '') || (b.created_at || '').localeCompare(a.created_at || ''));
+  const historyHtml = history.length
+    ? `<details style="margin-top:12px;"><summary>Offer history (${history.length})</summary>
+        <table class="data" style="margin-top:8px;"><thead><tr><th>Family</th><th>Offered</th><th>Outcome</th><th>Pass?</th><th></th></tr></thead><tbody>${
+          history.map((o) => {
+            const e = entriesById.get(o.entry_id);
+            const pup = o.chosen_dog_id ? pupsById.get(o.chosen_dog_id) : null;
+            const act = canSwitchAcceptedPick(o, d.kennelOffers)
+              ? `<button class="btn btn-sm" data-pk-change="${esc(o.id)}" title="Allowed until the next family is offered this litter">Change pup…</button>`
+              : !undoPassBlocker(o, e, today) ? `<button class="btn btn-sm" data-pk-undo="${esc(o.id)}" title="Erase this and give them their turn back">Undo…</button>` : '';
+            return `<tr><td>${e ? familyLink(e) : none}</td><td>${esc(fmtDate(o.offered_date))}</td><td>${badge(WAITLIST_OFFER_OUTCOME, o.outcome)}${pup ? ` ${esc(pup.call_name)}` : ''}${o.outcome_date ? ` <span class="faint">${esc(fmtDate(o.outcome_date))}</span>` : ''}</td><td>${o.counts_as_pass ? '<span class="badge badge-amber">Counts</span>' : none}</td><td>${act}</td></tr>`;
+          }).join('')
+        }</tbody></table></details>`
+    : '';
+
+  mount.innerHTML = `
+    <section class="card" style="margin-top:16px;">
+      <div class="row-between">
+        <h2 style="margin:0;">Waitlist picks</h2>
+        <div class="pill-row">${soldBeforeBtn}${soon.some((r) => !r.inFlight) ? '<button class="btn btn-sm" data-pk="soon" title="Tell the families whose turn is coming up for these pups">Almost your turn…</button>' : ''}<button class="btn btn-sm" data-pk="side" title="Sell a pup to a family on your list outside the turn order">Sell to a waitlist family…</button>${picksOpen
+          ? '<button class="btn btn-sm" data-pk="preview" title="Who\'s in line across your open litters, who\'s left out and why">Who\'s in line…</button><button class="btn btn-sm" data-pk="close">Close picks</button>'
+          : `<button class="btn btn-primary btn-sm" data-pk="open"${available.length ? '' : ' disabled title="No pups available to offer."'}>Open picks</button>`}</div>
+      </div>
+      <p class="field-hint" style="margin:6px 0 0;">${picksOpen
+        ? `Picks opened ${esc(fmtDate(litter.picks_opened_date))}. One family at a time across all your open litters, in list order; each turn shows every pup they match in every open litter, and only passing on all of them counts as a pass. Families with no matching pup, paused, or listening only for other sires or dams are skipped and nothing is held against them. A pup is only theirs once the deposit is in. ${autoOfferSummary(d.config)} Nothing is sent automatically, so tell each family yourself.`
+        : `${available.length} pup${available.length === 1 ? '' : 's'} available. Opening picks offers the next turn (${esc(d.config.respond_days)} days to pick and pay the deposit), or, while a family holds a turn, adds this litter to it when they're first in line for it.`}</p>
+      ${openHtml}
+      ${nextHtml}
+      <h3 style="margin:16px 0 0;font-size:15px;">In line for this litter</h3>
+      ${queueHtml}
+      ${historyHtml}
+    </section>`;
+
+  const rerender = async () => { await onChange(); };
+  const run = (fn) => async () => {
+    try { await fn(); } catch (e) { await alertModal({ title: 'Couldn\'t do that', message: e.message || String(e) }); }
+    await rerender();
+  };
+  const on = (key, fn) => mount.querySelector(`[data-pk="${key}"]`)?.addEventListener('click', run(fn));
+
+  // Open picks goes through the picks preview first (Picks Preview Spec §3): it
+  // opens them only when she taps "Open picks now" there.
+  on('open', async () => {
+    const res = await openPicksPreview({ litterId: litter.id });
+    if (!res) return;
+    const turn = res.turn;
+    await alertModal(turn ? offeredMessage(turn, entriesById, familyName, d.litterName)
+      : { title: 'Picks are open', message: heldElsewhere || kennelTurns.length
+        ? 'Another family holds the turn and isn\'t first in line for this litter, so it waits for the next turn.'
+        : 'Nobody on the list is eligible for the available pups yet. A family is offered as soon as one becomes eligible and you tap "Offer to them".' });
+    if (turn && !turn.none) await offerEmails(offerSpecs({ next: turn }));
+  });
+  // A side sale (Side Sale Spec): a pup of this litter to a family on the list.
+  on('side', async () => {
+    const res = await sideSaleDialog({ kennelId: litter.kennel_id, litterId: litter.id });
+    if (!res) return;
+    const name = familyName(res.entry);
+    await alertModal({ title: res.depositDone ? `${name} is placed` : 'Side sale recorded', message: res.depositDone
+      ? `The money they carried over from an earlier sale covers the deposit for ${res.dog.call_name}, so it's recorded as received today.`
+      : `${res.dog.call_name} is ${res.sale.side_holds_pup ? 'held for' : 'set aside for'} ${name} until ${fmtDate(res.sale.side_deposit_due)}${res.sale.side_holds_pup ? '' : ' (still offered to other families until the deposit)'}. Their page shows it like a pick on their turn. Send them the deposit details from their page (Review sale & send).` });
+  });
+  on('sold-before', async () => { await soldBeforeDialog(litter); });
+  // "Who's in line…" may save settings or a pup, so it re-renders after.
+  on('preview', async () => { await openPicksPreview({ litterId: litter.id }); });
+  // Back from fixing a family or a pup the preview linked to: reopen it.
+  if (previewParam() === litter.id && !mount.dataset.previewReopened) {
+    mount.dataset.previewReopened = '1';
+    setTimeout(() => mount.querySelector(picksOpen ? '[data-pk="preview"]' : '[data-pk="open"]')?.click(), 0);
+  }
+  // Not wrapped in run(): the dialog writes nothing, so there's nothing to re-render.
+  mount.querySelector('[data-pk="soon"]')?.addEventListener('click', () => openNotice(d, litter, soon, opts));
+  on('close', async () => {
+    if (!(await confirmModal({ title: 'Close picks?', message: 'No new offers will be made on this litter. An open offer stays open until you record how it ended.', confirmLabel: 'Close picks' }))) return;
+    await actions.closePicks(litter.id);
+  });
+  on('offer-next', async () => {
+    const turn = await actions.offerNext(litter.id);
+    if (turn) await alertModal(offeredMessage(turn, await freshEntries(litter), familyName, d.litterName));
+    if (turn && !turn.none) await offerEmails(offerSpecs({ next: turn }));
+  });
+
+  const turnNote = (outcome) => (autoOffers(d.config, outcome)
+    ? 'The turn moves to the next eligible family.'
+    : 'Nobody is offered automatically; you\'ll see who\'s next.');
+
+  if (open) {
+    const entry = entriesById.get(open.entry_id);
+    const name = entry ? familyName(entry) : 'this family';
+    const pickedName = open.chosen_dog_id ? (pupsById.get(open.chosen_dog_id)?.call_name || 'their pup') : '';
+    // Not wrapped in run(): copying writes nothing.
+    const link = entry ? statusLinkFor(entry, d.kennel) : null;
+    mount.querySelector('[data-pk="copy-link"]')?.addEventListener('click', (ev) => { if (link) copyLink(link, ev.currentTarget, { title: `${name}'s status page` }); });
+    on('accept', async () => {
+      const live = eligiblePupsFor(entry, litter, d.pups, d.sales, opts);
+      const out = await pickDialog({ offer: open, name, pups: live, pupLabel });
+      if (!out) return;
+      await onChange();
+      const saleId = out.res.sale.id;
+      const lines = out.depositDone
+        ? [`${name} is placed.`, ...(await changeLines(out.res, await freshEntries(litter), familyName))]
+        : [`${pupsById.get(out.res.offer.chosen_dog_id)?.call_name || 'The pup'} is held for ${name} until ${fmtDate(open.respond_by_date)}. Send them the deposit details (the sale has an invoice), and record "Deposit received" when it arrives.`];
+      if (out.depositDone) await offerEmails(offerSpecs(out.res));
+      if (await confirmModal({ title: out.depositDone ? 'Deposit received' : 'Pick recorded', message: `${lines.join('\n\n')}\n\nOpen the sale?`, confirmLabel: 'Open the sale', cancelLabel: 'Stay here' })) {
+        location.href = `sale.html?id=${encodeURIComponent(saleId)}`;
+      }
+    });
+    on('deposit', async () => {
+      const res = await depositDialog({ offer: open, name, pupName: pickedName, sale: open.sale_id ? await saleRepo.getById(open.sale_id) : null });
+      if (!res) return;
+      await alertModal({ title: `${name} is placed`, message: [`Deposit recorded for ${pickedName}.`, ...(await changeLines(res, await freshEntries(litter), familyName)), ...(res.next || res.waiting.length ? [] : ['Nobody else on the list is eligible for this litter right now.'])].join('\n\n') });
+      await offerEmails(offerSpecs(res));
+    });
+    on('change', async () => {
+      const options = switchablePups(entry, litter, d.pups, d.sales, { currentDogId: open.chosen_dog_id, config: d.config });
+      await changePickDialog({ offer: open, name, currentName: pickedName, pups: options, pupLabel });
+    });
+    const lapse = open.chosen_dog_id ? ` Their pick lapses: the sale is cancelled and ${pickedName} is available again.` : '';
+    for (const outcome of ['passed', 'no_response']) {
+      on(outcome, async () => {
+        const also = otherLitters(open);
+        const title = outcome === 'passed' ? (also.length ? `${name} passed on their whole turn?` : `${name} passed on this litter?`)
+          : open.chosen_dog_id ? `No deposit from ${name}?` : `${name} didn't respond in time?`;
+        const whole = also.length ? ` This closes their whole turn, including ${also.join(', ')}, and counts once.` : '';
+        if (!(await confirmModal({ title, message: `${turnNote(closingTrigger(open, outcome))}${whole}${lapse}`, confirmLabel: 'Record it' }))) return;
+        const turnLitterIds = turnOffers(d.kennelOffers, turnIdOf(open)).filter((o) => o.outcome === 'open').map((o) => o.litter_id);
+        const res = await actions.recordOutcome(open.id, outcome);
+        await alertModal(await outcomeMessage(name, res, await freshEntries(litter), familyName));
+        // Their turn closed, and maybe the next family's began (W2 step 6).
+        await offerEmails([
+          { entryId: open.entry_id, kind: outcome === 'passed' ? 'pass_recorded' : 'deadline_passed', extra: { litterIds: turnLitterIds, respondBy: open.respond_by_date } },
+          ...offerSpecs(res)
+        ]);
+      });
+    }
+    on('voided', async () => {
+      const also = otherLitters(open);
+      if (!(await confirmModal({ title: 'Void this turn?', message: `Use this if the offer was a mistake or the litter fell through. It never counts as a pass for ${name}, and the turn isn't moved on automatically.${also.length ? ` It voids their whole turn, including ${also.join(', ')}.` : ''}${lapse}`, confirmLabel: 'Void it' }))) return;
+      await actions.recordOutcome(open.id, 'voided');
+    });
+  }
+
+  // History actions: switch an accepted pick (until the next family is offered),
+  // undo a pass / no response.
+  mount.querySelectorAll('[data-pk-change]').forEach((btn) => btn.addEventListener('click', run(async () => {
+    const o = d.offers.find((x) => x.id === btn.dataset.pkChange);
+    const entry = entriesById.get(o.entry_id);
+    const options = switchablePups(entry, litter, d.pups, d.sales, { currentDogId: o.chosen_dog_id, config: d.config });
+    await changePickDialog({ offer: o, name: familyName(entry), currentName: pupsById.get(o.chosen_dog_id)?.call_name || 'their pup', pups: options, pupLabel });
+  })));
+  mount.querySelectorAll('[data-pk-undo]').forEach((btn) => btn.addEventListener('click', run(async () => {
+    const o = d.offers.find((x) => x.id === btn.dataset.pkUndo);
+    const entry = entriesById.get(o.entry_id);
+    const name = familyName(entry);
+    const holding = kennelTurns.find((t) => t.id !== turnIdOf(o));
+    const holder = holding ? entriesById.get(holding.entry_id) : null;
+    const res = await undoPassDialog({ offer: o, name, holderName: holder ? familyName(holder) : null, removed: entry.status === 'removed' });
+    if (!res) return;
+    await alertModal({ title: 'Their turn is back', message: [`${name}'s turn is back (${res.offers.map((x) => d.litterName(x.litter_id)).join(', ')}), with until ${fmtDate(res.offer.respond_by_date)} to pick and pay the deposit. Let them know.`, ...(await changeLines(res, await freshEntries(litter), familyName))].join('\n\n') });
+    await offerEmails([{ entryId: o.entry_id, kind: 'offer', extra: { litterIds: res.offers.map((x) => x.litter_id), respondBy: res.offer.respond_by_date } }, ...offerSpecs(res)]);
+  })));
+}
+
+// --- Non-Waitlist Sales (E3, Waitlist Fixes Plan §3.3) ------------------------
+
+// What it will do, listed first: each pup with a buyer (a family page, or why not),
+// any pup with no sale, and a buyer on her do-not-sell list (K7-9). Resolves the
+// result of soldBeforeWaitlist, or null.
+async function soldBeforeDialog(litter) {
+  const [plan, listings] = await Promise.all([actions.soldBeforeWaitlistPlan(litter.id), doNotSellRepo.getAll()]);
+  const buyer = (r) => r.contact?.name || 'their buyer';
+  const dns = (r) => (r.contact ? doNotSellWarning(doNotSellMatches({ name: r.contact.name, email: r.contact.email, phone: r.contact.phone }, listings, { contactId: r.contact.id })) : '');
+  const made = plan.rows.filter((r) => !r.blocker);
+  const lines = plan.rows.map((r) => `<li><strong>${esc(r.dog.call_name || 'A pup')}</strong> → ${esc(buyer(r))}${r.blocker ? ` <span class="faint">(no new page: ${esc(r.blocker)})</span>` : ''}${dns(r) ? `<div class="inline-warn" style="margin:4px 0;">${esc(dns(r))}</div>` : ''}</li>`).join('');
+  let res = null;
+  const ok = await formModal({
+    title: 'Non-Waitlist Sales',
+    bodyHtml: `<p style="margin-top:0;">This litter is kept off the waitlist: no picks or turns, and it isn't shown on your waitlist pages (Available Puppies, Coming up). ${made.length ? `${made.length === 1 ? 'Its family gets' : `${made.length} families get`} a status page without being on the list:` : 'Nobody new gets a status page:'}</p>
+      <ul style="margin:4px 0 8px; padding-left:18px;">${lines}</ul>
+      ${plan.unsold.length ? `<p class="field-hint">No sale yet: ${esc(plan.unsold.map((x) => x.call_name || 'a pup').join(', '))}. ${plan.unsold.length === 1 ? 'It isn\'t' : 'They aren\'t'} offered on the waitlist either; give a sale a family page from the Sale page later.</p>` : ''}
+      <p class="field-hint">Their pages show pickup times, extras, the puppy portal link and your messages, never the list. Publish your list to send their links. You can put the litter back on the waitlist from here.</p>`,
+    confirmLabel: made.length ? `Keep off the waitlist and make ${made.length} page${made.length === 1 ? '' : 's'}` : 'Keep off the waitlist',
+    onConfirm: async () => { res = await actions.soldBeforeWaitlist(litter.id); }
+  });
+  return ok ? res : null;
+}
+
+// The panel of a litter kept off the waitlist: its family pages, a sale still without
+// one, and "Put back on the waitlist".
+function renderKeptOff({ mount, litter, d, familyLink, onChange }) {
+  const pupIds = new Set(d.pups.map((p) => p.id));
+  const salesById = new Map(d.allSales.map((x) => [x.id, x]));
+  const pages = d.entries.filter((e) => isFamilyPageOnly(e) && !e.is_archived && pupIds.has(salesById.get(e.placed_sale_id)?.dog_id));
+  const plan = familyPagePlan(litter, { pups: d.pups, sales: d.sales, entries: d.entries, offers: d.kennelOffers });
+  const more = plan.rows.filter((r) => !r.blocker);
+  const pupName = (e) => d.pups.find((p) => p.id === salesById.get(e.placed_sale_id)?.dog_id)?.call_name || '';
+  mount.innerHTML = `<section class="card" style="margin-top:16px;">
+    <div class="row-between"><h2 style="margin:0;">Waitlist</h2><div class="pill-row">
+      ${more.length ? `<button class="btn btn-sm" data-pk="sold-before" title="${esc(more.map((r) => r.dog.call_name).join(', '))}">Make ${more.length} more family page${more.length === 1 ? '' : 's'}…</button>` : ''}
+      <button class="btn btn-sm" data-pk="on-waitlist">Put back on the waitlist…</button></div></div>
+    <p class="field-hint" style="margin:6px 0 0;"><span class="badge badge-blue">Kept off the waitlist</span> Non-Waitlist Sales: no picks or turns, and it isn't on your waitlist pages. Its families have a status page only (Pickup times below is what they book from).</p>
+    ${pages.length ? `<ul style="margin:8px 0 0; padding-left:18px;">${pages.map((e) => `<li>${familyLink(e)}${pupName(e) ? ` · ${esc(pupName(e))}` : ''}${e.status !== 'placed' ? ' <span class="faint">(backed out)</span>' : ''}</li>`).join('')}</ul>` : '<p class="muted" style="margin:8px 0 0;">No family pages yet.</p>'}
+  </section>`;
+  const run = (fn) => async () => {
+    try { await fn(); } catch (e) { await alertModal({ title: 'Couldn\'t do that', message: e.message || String(e) }); }
+    await onChange();
+  };
+  mount.querySelector('[data-pk="sold-before"]')?.addEventListener('click', run(() => soldBeforeDialog(litter)));
+  mount.querySelector('[data-pk="on-waitlist"]').addEventListener('click', run(async () => {
+    if (!(await confirmModal({ title: 'Put this litter back on the waitlist?', message: 'It shows on your waitlist pages again and picks can be opened on it. Its families\' status pages stay as they are (they still aren\'t on the list).', confirmLabel: 'Put it back' }))) return;
+    await actions.putLitterOnWaitlist(litter.id);
+  }));
+}
+
+async function freshEntries(litter) {
+  return new Map((await waitlistEntryRepo.getByKennel(litter.kennel_id, { includeArchived: true })).map((e) => [e.id, e]));
+}
+
+// `turn` from offerNext / openPicks: { entry_id, litter_ids, respond_by_date, joined? }.
+// `{ none: true, auto_passed }` when families were passed ("Not this litter" to
+// their whole turn, Spec §16.2) and nobody was left to offer; the passes lead
+// the message either way.
+function offeredMessage(turn, entriesById, familyName, litterName) {
+  const passed = describeOfferChanges({ auto_passed: turn.auto_passed || [] }, {
+    nameOf: (id) => { const e = entriesById.get(id); return e ? familyName(e) : 'A family'; }, litterOf: litterName
+  });
+  const say = (title, line) => ({ title, message: [...passed, line].join('\n\n') });
+  if (turn.none) return say('No turn offered', 'Nobody else on the list is eligible for the pups available right now.');
+  const e = entriesById.get(turn.entry_id);
+  const name = e ? familyName(e) : 'the next family';
+  const litters = (turn.litter_ids || []).map(litterName).join(', ');
+  return turn.joined
+    ? say('Added to their turn', `${name} is first in line for this litter too, so it joined their turn (${litters}). Their deadline restarted: until ${fmtDate(turn.respond_by_date)}. Let them know.`)
+    : say('Turn offered', `It's ${name}'s turn (${litters}). They have until ${fmtDate(turn.respond_by_date)} to pick a pup from any of these and send the deposit, or pass. Let them know.`);
+}
+
+// describeOfferChanges, with names from a fresh read: an accept or a removal may
+// have closed the family's offers on OTHER litters, which this panel hasn't loaded.
+async function changeLines(res, entriesById, familyName) {
+  const [litters, dogs] = await Promise.all([litterRepo.getAll({ includeArchived: true }), dogRepo.getAll({ includeArchived: true })]);
+  const littersById = new Map(litters.map((l) => [l.id, l]));
+  const dogName = (id) => dogs.find((d) => d.id === id)?.call_name || '—';
+  return describeOfferChanges(res, {
+    nameOf: (id) => { const e = entriesById.get(id); return e ? familyName(e) : 'the next family'; },
+    litterOf: (id) => { const l = littersById.get(id); return l ? (l.nickname || `${dogName(l.dam_id)} × ${dogName(l.sire_id)}`) : 'A litter'; },
+    fmtDate
+  });
+}
+
+async function outcomeMessage(name, res, entriesById, familyName) {
+  const lines = [];
+  if (res.passes) {
+    if (!res.passes.counted) lines.push(`This doesn't count as a pass for ${name}.`);
+    else if (res.removed) lines.push(`That was ${name}'s pass ${res.passes.used} of ${res.passes.max}, so they've been removed from the list. You can undo this from their page for 7 days.`);
+    else lines.push(`This counts as ${name}'s pass ${res.passes.used} of ${res.passes.max}. They keep their place.`);
+  }
+  lines.push(...(await changeLines(res, entriesById, familyName)));
+  if (!res.next && !(res.waiting || []).length) lines.push('Nobody else on the list is eligible for this litter right now.');
+  return { title: 'Recorded', message: lines.join('\n\n') };
+}

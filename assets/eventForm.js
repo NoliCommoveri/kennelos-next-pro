@@ -1,0 +1,660 @@
+// eventForm.js — modal form for creating/editing a HistoryEvent. Picks the
+// type-specific short form from the EVENT_TYPES catalog (Build Brief B1) so
+// `details` stays structured, not a free-text dumping ground.
+//
+// Stage4.5 Addendum §C3/D1: a `span`-duration type (boarding, heat_cycle,
+// medication) also shows the plain `event_end_date` field, and a
+// `relatedContact: true` type (boarding, placement) shows a top-level Contact
+// picker — the canonical events.related_contact_id FK, never a `details` field.
+// A string `relatedContact` (show: 'Handler', vet_visit/surgery: 'Vet') is the
+// picker's label. A `contactFallback` detail field (the vet's plain-text name)
+// is hidden here: the picker replaces it, a matching contact is preselected, and
+// it's dropped on save once a contact is linked (vocab.js EVENT_TYPES).
+//
+// Generic descriptor extensions (Show Tracking Spec §2.4) — none is show-specific
+// in the code: select/combobox options may be { value, label } vocab objects;
+// a field `default` seeds a NEW event's empty detail; `titleFrom` auto-fills the
+// title from a details field until the user types their own; and
+// `prefill.event_date` seeds a new event's date.
+import { HistoryEvent } from '../data/eventRepo.js';
+import { TEST_TYPE_FIELDS, testResultSuggestions } from '../data/healthTestLog.js';
+import { expenseRepo } from '../data/expenseRepo.js';
+import { contactRepo } from '../data/contactRepo.js';
+import { kennelRepo } from '../data/kennelRepo.js';
+import { eventTypesFor, descriptor, EVENT_TYPES, EXPENSE_CATEGORIES, defaultExpenseCategoryFor, TITLE_TRACKS, CONTACT_TYPE, RELATED_CONTACT_ROLE } from '../data/vocab.js';
+import { esc, todayYMD, param, confirmModal } from './ui.js';
+import { attachNewContactButton } from './contactPicker.js';
+
+// Detail keys that link an event to another record and aren't form fields.
+const LINK_DETAIL_KEYS = ['sale_id', 'extra_charge_id', 'pickup_slot_id', 'pickup_boarding'];
+
+// Which combobox field on each test-bearing type draws from the shared test
+// vocabulary rather than a static options list (Test Planning Addendum §3).
+const TEST_VOCAB_FIELDS = { genetic_test: 'panel_name', breed_specific_test: 'test_name', ofa_pennhip: 'joint' };
+
+// Combobox fields whose suggestions are the distinct values already logged on
+// events of the same type (Show Tracking Spec §2.2: a show's club and judge).
+// Free text either way — the suggestions never constrain what's typed. (A test's
+// result field is filled the same way, below, from every test type.)
+const LOGGED_VALUE_FIELDS = { show: ['club', 'judge'] };
+
+// RELATED_CONTACT_ROLE (vocab.js): the role a type's related contact is tagged
+// with on save; the picker lists contacts that already carry it first, and its
+// "＋ New" contact defaults to it.
+
+// The type's `contactFallback` details key (the related contact's plain-text
+// name), or null.
+const fallbackKey = (typeDef) => (typeDef.relatedContact && typeDef.fields.find((f) => f.contactFallback)?.key) || null;
+
+// A select/combobox option is a plain string or a { value, label } vocab object.
+const optValue = (o) => (o && typeof o === 'object' ? o.value : o);
+const optLabel = (o) => (o && typeof o === 'object' ? o.label : o);
+
+// Show-specific soft checks (Show Tracking Spec §2.3) — page-level confirms,
+// never repo blocks. Returns human-readable issues; empty when nothing's off.
+function showSoftIssues(details, eventDate) {
+  const issues = [];
+  const pts = details.points === '' || details.points == null ? null : Number(details.points);
+  const track = TITLE_TRACKS.find((t) => t.value === details.points_toward);
+  const perShowMax = track?.perShowMax ?? 5;
+  if (pts != null && pts > perShowMax) issues.push(`${pts} points is more than the ${perShowMax} per show ${track ? track.organization : 'AKC'} allows — only ${perShowMax} will count.`);
+  if (pts > 0 && details.entry_status !== 'shown') issues.push('Points are recorded but the entry status isn\'t "Shown" — they won\'t count until it is.');
+  if ((details.placement || pts != null) && eventDate && eventDate > todayYMD()) issues.push('Results are filled in for a show that hasn\'t happened yet.');
+  if (pts > 0 && !details.points_toward) issues.push('Points are recorded with no "Points toward" title — they won\'t count toward any track.');
+  return issues;
+}
+
+// Open the modal. opts: { subjectType, subjectId, event?, prefill?, onSaved, onCancel? }
+// If `event` is provided we're editing; otherwise creating. `prefill` seeds a
+// NEW event's draft (event_type/related_contact_id/title/details) — used by the
+// soft-suggestion prompts (Stage4.5 Addendum §C6/§D4: StudService→boarding,
+// Litter→grow-out, Sale→placement). It's a one-time seed, never a stored link
+// back to whatever triggered it.
+//
+// `cascadeTargets` (optional): [{ id, label }] — when present, this is a
+// litter-wide "log for the whole litter" entry (Enhancements Batch #3). Instead
+// of writing one event for `subjectId`, an "Apply to" checkbox list lets the
+// user pick which targets get the SAME payload, and save writes one independent
+// Event per checked target (no cascade record, no stored link between them).
+// `subjectId` is unused in this mode. The single-subject path is unchanged.
+// `cascadeSelected` (ids) ticks only those at first (default: all);
+// `cascadeTitle` heads the form (the Dogs page's "Log events for several dogs").
+
+// --- Weight-check regression guard ---------------------------------------
+// A weight_check whose value is below the dog's previous weight is a soft
+// warning (a puppy losing weight is worth a second look), never a hard block —
+// so it lives here in the UI, not the repo (invariant: soft/interactive checks
+// are the page's job). Weights are compared as total ounces (lbs×16 + oz).
+function weightTotalOz(details) {
+  if (!details) return null;
+  const lbs = details.weight_lbs;
+  const oz = details.weight_oz;
+  const hasLbs = lbs !== '' && lbs != null && Number.isFinite(Number(lbs));
+  const hasOz = oz !== '' && oz != null && Number.isFinite(Number(oz));
+  if (!hasLbs && !hasOz) return null;
+  return (hasLbs ? Number(lbs) : 0) * 16 + (hasOz ? Number(oz) : 0);
+}
+function fmtWeight(details) {
+  const lbs = (details?.weight_lbs ?? '') !== '' ? Number(details.weight_lbs) : 0;
+  const oz = (details?.weight_oz ?? '') !== '' ? Number(details.weight_oz) : 0;
+  const t = String(details?.time_of_day || '').toUpperCase();
+  return `${lbs} lb ${oz} oz${t ? ` ${t}` : ''}`;
+}
+// Same-day AM/PM awareness: a weigh-in's place in the day is AM (0) before PM (1);
+// a blank time sits between so it never mis-sorts a real AM/PM. This lets us find
+// the TRUE preceding weight when two are logged on one day — a PM compares against
+// that morning's AM, and that AM compares against the prior day, not the later PM.
+function timeRank(details) {
+  const t = String(details?.time_of_day || '').toUpperCase();
+  return t === 'PM' ? 1 : (t === 'AM' ? 0 : 0.5);
+}
+// A total order over a dog's weigh-ins: date, then AM-before-PM, then capture time.
+function weighKey(ev) {
+  return { date: ev.event_date || '', rank: timeRank(ev.details), created: ev.created_at || '' };
+}
+function keyCmp(a, b) {
+  if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+  if (a.rank !== b.rank) return a.rank - b.rank;
+  if (a.created !== b.created) return a.created < b.created ? -1 : 1;
+  return 0;
+}
+// The dog's weigh-in (with a real weight) immediately preceding `newKey`,
+// excluding the event being edited. Null when nothing comes before it.
+async function findPriorWeighIn(dogId, newKey, excludeId) {
+  const evs = await HistoryEvent.getForSubject('dog', dogId);
+  let best = null, bestKey = null;
+  for (const e of evs) {
+    if (e.event_type !== 'weight_check' || e.id === excludeId) continue;
+    if (weightTotalOz(e.details) == null) continue;
+    const k = weighKey(e);
+    if (keyCmp(k, newKey) >= 0) continue;            // not before the new entry
+    if (!bestKey || keyCmp(k, bestKey) > 0) { best = e; bestKey = k; }
+  }
+  return best;
+}
+
+export async function openEventForm(opts) {
+  const { subjectType, subjectId, event = null, prefill = null, cascadeTargets = null, cascadeSelected = null, cascadeTitle = 'Log event for whole litter', onSaved, onCancel } = opts;
+  const types = eventTypesFor(subjectType);
+  const isEdit = !!event;
+  const isCascade = !isEdit && !!cascadeTargets?.length;
+  const cascadeChecked = new Set(cascadeTargets ? (cascadeSelected || cascadeTargets.map((t) => t.id)) : []);
+
+  // Contacts are only ever needed for relatedContact types (boarding, placement,
+  // both dog-subject) — loaded once up front so the picker is ready on first render.
+  const contacts = await contactRepo.getAll({ includeArchived: true });
+
+  // The Cost field is a convenience writer into the Financials ledger: an event's
+  // cost lives in the `expenses` table (linked by expenses.event_id), not on the
+  // Event itself. When editing, load any existing linked expense so the field
+  // shows/edits the real ledger row instead of a phantom event field.
+  const linkedExpense = isEdit ? await expenseRepo.getOneByEvent(event.id) : null;
+
+  // Shared test vocabulary (Test Planning Addendum §3) — union of every active
+  // own-kennel's authored panel plus every distinct test token already logged.
+  // Loaded once up front like `contacts`; only test-bearing types read it.
+  const [kennelVocab, seenTokens] = await Promise.all([
+    kennelRepo.getVocabulary(),
+    HistoryEvent.getTestTokens()
+  ]);
+  const testVocabulary = [];
+  {
+    const seen = new Set();
+    for (const t of [...kennelVocab, ...seenTokens]) {
+      const key = t.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      testVocabulary.push(t);
+    }
+  }
+
+  // Logged-value suggestions (club/judge…) for the types that use them, keyed
+  // `${type}.${key}`. Loaded once up front, like the test vocabulary.
+  const loggedValues = new Map();
+  await Promise.all(Object.entries(LOGGED_VALUE_FIELDS)
+    .filter(([type]) => types.some((t) => t.value === type))
+    .flatMap(([type, keys]) => keys.map(async (key) => {
+      loggedValues.set(`${type}.${key}`, await HistoryEvent.getDetailValues(type, key));
+    })));
+  // A test's result field (Result, or Rating for OFA): the usual results plus every
+  // result she's typed on any test type, the same list on all three.
+  if (types.some((t) => TEST_TYPE_FIELDS[t.value])) {
+    const results = testResultSuggestions(await HistoryEvent.getTestResultValues());
+    for (const [type, f] of Object.entries(TEST_TYPE_FIELDS)) loggedValues.set(`${type}.${f.result}`, results);
+  }
+
+  // Working state
+  const draft = {
+    event_type: event?.event_type || prefill?.event_type || types[0].value,
+    event_date: event?.event_date || prefill?.event_date || todayYMD(),
+    event_end_date: event?.event_end_date || prefill?.event_end_date || '',
+    related_contact_id: event?.related_contact_id || prefill?.related_contact_id || '',
+    title: event?.title || prefill?.title || '',
+    details: { ...(event?.details || prefill?.details || {}) },
+    reminder_date: event?.reminder_date || '',
+    cost: linkedExpense?.amount ?? '',
+    expenseCategory: linkedExpense?.category || defaultExpenseCategoryFor(event?.event_type || prefill?.event_type || types[0].value),
+    notes: event?.notes || '',
+    // Cascade-only: per-target overrides keyed by target id (e.g. one weight
+    // per puppy on a litter-wide weight_check, while other detail fields —
+    // like time_of_day — stay shared across every target). Empty otherwise.
+    perTargetDetails: {}
+  };
+
+  // A vet typed as plain text (KennelAssistant, or logged before the picker)
+  // preselects the contact of that name, so saving links it. No match leaves
+  // the text in place and the picker empty — never auto-creates a contact.
+  {
+    const fb = fallbackKey(descriptor(EVENT_TYPES, draft.event_type));
+    const name = fb ? String(draft.details[fb] || '').trim().toLowerCase() : '';
+    if (name && !draft.related_contact_id) {
+      const matches = contacts.filter((c) => (c.name || '').trim().toLowerCase() === name);
+      const hit = matches.find((c) => !c.is_archived) || matches[0];
+      if (hit) draft.related_contact_id = hit.id;
+    }
+  }
+
+  // Field defaults (e.g. a show's entry_status 'planned') seed a NEW event only,
+  // and only where the draft has no value — a prefill always wins.
+  function applyFieldDefaults() {
+    if (isEdit) return;
+    for (const f of descriptor(EVENT_TYPES, draft.event_type).fields || []) {
+      if (f.default !== undefined && (draft.details[f.key] ?? '') === '') draft.details[f.key] = f.default;
+    }
+  }
+  applyFieldDefaults();
+
+  // `titleFrom` auto-title: the last value the form wrote into the title from
+  // the source field. While the title is empty, the type label, or this value,
+  // typing in the source field rewrites it; a hand-edited title is left alone.
+  let lastAutoTitle = draft.details[descriptor(EVENT_TYPES, draft.event_type).titleFrom] ?? null;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal" id="ef-modal" role="dialog" aria-modal="true"></div>`;
+  const modal = overlay.querySelector('.modal');
+  document.body.appendChild(overlay);
+
+  // Per-litter weight_check cascade (Enhancements Batch — litter-wide weight
+  // logging): weight_lbs/weight_oz are collected once per checked puppy
+  // instead of one shared value applied to all; every other detail field
+  // (currently just time_of_day) stays shared across the whole cascade.
+  const PER_TARGET_CASCADE_FIELDS = { weight_check: ['weight_lbs', 'weight_oz'] };
+
+  function renderField(typeDef, f) {
+    const v = draft.details[f.key] ?? '';
+    if (f.type === 'textarea') {
+      return `<div class="field field-wide"><label>${esc(f.label)}</label><textarea data-detail="${esc(f.key)}">${esc(v)}</textarea></div>`;
+    }
+    if (f.type === 'combobox') {
+      const isTestField = TEST_VOCAB_FIELDS[typeDef.value] === f.key;
+      const dlId = `ef-dl-${f.key}`;
+      const logged = loggedValues.get(`${typeDef.value}.${f.key}`);
+      const source = isTestField ? testVocabulary : logged || f.options || [];
+      const opts = source.map((o) => `<option value="${esc(optValue(o))}">${optLabel(o) !== optValue(o) ? esc(optLabel(o)) : ''}</option>`).join('');
+      return `<div class="field"><label>${esc(f.label)}</label><input data-detail="${esc(f.key)}" type="text" list="${dlId}" value="${esc(v)}"><datalist id="${dlId}">${opts}</datalist></div>`;
+    }
+    if (f.type === 'select') {
+      const opts = (f.options || []).map((o) => `<option value="${esc(optValue(o))}"${optValue(o) === v ? ' selected' : ''}>${esc(optLabel(o))}</option>`).join('');
+      return `<div class="field"><label>${esc(f.label)}</label><select data-detail="${esc(f.key)}"><option value="">— select —</option>${opts}</select></div>`;
+    }
+    const inputType = f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : 'text';
+    const stepAttr = f.type === 'number' && f.step ? ` step="${esc(f.step)}"` : '';
+    return `<div class="field"><label>${esc(f.label)}</label><input data-detail="${esc(f.key)}" type="${inputType}"${stepAttr} value="${esc(v)}"></div>`;
+  }
+
+  function perTargetFieldHtml(target, f) {
+    const v = draft.perTargetDetails[target.id]?.[f.key] ?? '';
+    const stepAttr = f.step ? ` step="${esc(f.step)}"` : '';
+    return `<div class="field"><label>${esc(target.label)} — ${esc(f.label)}</label>
+      <input data-cascade-detail="${esc(f.key)}" data-cascade-id="${esc(target.id)}" type="number"${stepAttr} value="${esc(v)}"></div>`;
+  }
+
+  function detailFieldsHtml(typeDef) {
+    const perTargetKeys = isCascade ? (PER_TARGET_CASCADE_FIELDS[typeDef.value] || []) : [];
+    const fb = fallbackKey(typeDef);
+    if (fb) typeDef = { ...typeDef, fields: typeDef.fields.filter((f) => f.key !== fb) };
+    if (!typeDef.fields.length) return '<p class="faint" style="margin:0;">No extra fields for this type — use the title and notes.</p>';
+    if (!perTargetKeys.length) {
+      return `<div class="form-grid">` + typeDef.fields.map((f) => renderField(typeDef, f)).join('') + `</div>`;
+    }
+    const sharedFields = typeDef.fields.filter((f) => !perTargetKeys.includes(f.key));
+    const perTargetFieldDefs = typeDef.fields.filter((f) => perTargetKeys.includes(f.key));
+    const sharedHtml = sharedFields.length
+      ? `<div class="form-grid">` + sharedFields.map((f) => renderField(typeDef, f)).join('') + `</div>` : '';
+    const checkedTargets = cascadeTargets.filter((t) => cascadeChecked.has(t.id));
+    const perTargetHtml = checkedTargets.length
+      ? `<div class="form-grid" style="margin-top:10px;">` + checkedTargets.map((t) =>
+          perTargetFieldDefs.map((f) => perTargetFieldHtml(t, f)).join('')).join('') + `</div>`
+      : '<p class="faint" style="margin-top:10px;">Select at least one above to enter its weight.</p>';
+    return sharedHtml + perTargetHtml;
+  }
+
+  // With a role (a vet, a handler), contacts already carrying it are listed
+  // first in their own group; everyone else stays pickable below.
+  function contactOptions(current, role, label) {
+    const opt = (c) => `<option value="${esc(c.id)}"${c.id === current ? ' selected' : ''}>${esc(c.name)}${c.is_archived ? ' (archived)' : ''}</option>`;
+    if (!role) return `<option value="">— none —</option>` + contacts.map(opt).join('');
+    const hasRole = (c) => (c.contact_type || []).includes(role);
+    const tagged = contacts.filter(hasRole);
+    const rest = contacts.filter((c) => !hasRole(c));
+    return `<option value="">— none —</option>`
+      + (tagged.length ? `<optgroup label="${esc(label)}s">${tagged.map(opt).join('')}</optgroup>` : '')
+      + (rest.length ? `<optgroup label="${tagged.length ? 'Other contacts' : 'Contacts'}">${rest.map(opt).join('')}</optgroup>` : '');
+  }
+
+  function relatedContactFieldHtml(typeDef) {
+    const label = typeof typeDef.relatedContact === 'string' ? typeDef.relatedContact : 'Related contact';
+    const role = RELATED_CONTACT_ROLE[typeDef.value] || null;
+    const roleLabel = role ? (CONTACT_TYPE.find((t) => t.value === role)?.label || role) : '';
+    const fb = fallbackKey(typeDef);
+    const legacy = fb && !draft.related_contact_id ? String(draft.details[fb] || '').trim() : '';
+    const hint = legacy
+      ? `Recorded as “${legacy}” — pick their contact, or ＋ New to add them, to link it.`
+      : role
+        ? `Pick from your contacts, or ＋ New to add one. They're tagged ${roleLabel} automatically.`
+        : 'The person or kennel on the other side of this event.';
+    return `<div class="field"><label>${esc(label)}</label>
+          <select id="ef-related-contact">${contactOptions(draft.related_contact_id, role, label)}</select>
+          <span class="field-hint">${esc(hint)}</span></div>`;
+  }
+
+  function render() {
+    const typeDef = descriptor(EVENT_TYPES, draft.event_type);
+    // Editing an event whose type this edition doesn't offer (e.g. a Pro `show`
+    // restored into Lite) keeps its own type in the picker rather than
+    // silently displaying the first option.
+    const pickable = types.some((t) => t.value === draft.event_type) ? types : [...types, typeDef];
+    const typeOptions = [...pickable].sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' })).map((t) =>
+      `<option value="${esc(t.value)}"${t.value === draft.event_type ? ' selected' : ''}>${esc(t.label)}</option>`).join('');
+    const isSpan = typeDef.duration === 'span';
+    modal.innerHTML = `
+      <div class="row-between" style="margin-bottom:12px;">
+        <h2 style="margin:0;">${isEdit ? 'Edit event' : isCascade ? esc(cascadeTitle) : 'Add event'}</h2>
+        <button class="btn btn-sm" data-act="cancel">✕</button>
+      </div>
+      ${isCascade ? `<div class="field field-wide" style="margin-bottom:14px;">
+        <label>Apply to</label>
+        ${cascadeTargets.map((t) => `<label class="check-inline" style="display:block; margin:4px 0;">
+          <input type="checkbox" data-cascade-target="${esc(t.id)}"${cascadeChecked.has(t.id) ? ' checked' : ''}> ${esc(t.label)}
+        </label>`).join('')}
+      </div>` : ''}
+      <div class="form-grid">
+        <div class="field"><label>Type <span class="req">*</span></label>
+          <select id="ef-type">${typeOptions}</select></div>
+        <div class="field"><label>${isSpan ? 'Start date' : 'Date'} <span class="req">*</span></label>
+          <input id="ef-date" type="date" value="${esc(draft.event_date)}">
+          <span class="field-hint">Future dates are allowed (e.g. a scheduled surgery).</span></div>
+        ${isSpan ? `<div class="field"><label>End date</label>
+          <input id="ef-end-date" type="date" value="${esc(draft.event_end_date)}">
+          <span class="field-hint">Leave blank for an open-ended/ongoing stay.</span></div>` : ''}
+        <div class="field field-wide"><label>Title <span class="req">*</span></label>
+          <input id="ef-title" type="text" value="${esc(draft.title)}" placeholder="Short summary shown in the timeline"></div>
+        ${typeDef.relatedContact ? relatedContactFieldHtml(typeDef) : ''}
+      </div>
+      <h2 style="font-size:15px;">${esc(typeDef.label)} details</h2>
+      <div id="ef-details">${detailFieldsHtml(typeDef)}</div>
+      <div class="form-grid" style="margin-top:14px;">
+        <div class="field"><label>Reminder date</label><input id="ef-reminder" type="date" value="${esc(draft.reminder_date)}"></div>
+        <div class="field"><label>Cost</label><input id="ef-cost" type="number" step="0.01" min="0" value="${esc(draft.cost)}">
+          <span class="field-hint">Logged to Financials against this ${esc(subjectType)}${linkedExpense ? '' : ' (leave blank for none)'}.</span></div>
+        <div class="field"><label>Cost category</label>
+          <select id="ef-cost-category">${EXPENSE_CATEGORIES.map((c) => `<option value="${esc(c.value)}"${c.value === draft.expenseCategory ? ' selected' : ''}>${esc(c.label)}</option>`).join('')}</select></div>
+        <div class="field field-wide"><label>Notes</label><textarea id="ef-notes">${esc(draft.notes)}</textarea></div>
+      </div>
+      <div id="ef-error"></div>
+      <div class="form-actions">
+        <button class="btn btn-primary" data-act="save">Save event</button>
+        <button class="btn" data-act="cancel">Cancel</button>
+      </div>`;
+
+    modal.querySelector('#ef-type').addEventListener('change', (e) => {
+      // The category the old type suggested — captured before we switch types so
+      // we can tell an untouched default from a deliberate override.
+      const prevDefault = defaultExpenseCategoryFor(draft.event_type);
+      captureInputs();
+      draft.event_type = e.target.value;
+      // Auto-fill an empty title with the type label as a convenience.
+      if (!draft.title) draft.title = descriptor(EVENT_TYPES, draft.event_type).label;
+      // Follow the new type's suggested cost category, unless the user has
+      // deliberately picked a different one (then leave their choice alone).
+      if (draft.expenseCategory === prevDefault) draft.expenseCategory = defaultExpenseCategoryFor(draft.event_type);
+      applyFieldDefaults();
+      render();
+    });
+    if (typeDef.titleFrom) {
+      const srcEl = modal.querySelector(`[data-detail="${typeDef.titleFrom}"]`);
+      const titleEl = modal.querySelector('#ef-title');
+      srcEl?.addEventListener('input', () => {
+        const cur = titleEl.value.trim();
+        if (cur && cur !== typeDef.label && cur !== lastAutoTitle) return; // hand-edited — leave it
+        lastAutoTitle = srcEl.value.trim();
+        titleEl.value = lastAutoTitle || typeDef.label;
+      });
+    }
+    const relatedContactEl = modal.querySelector('#ef-related-contact');
+    if (relatedContactEl) {
+      const fb = fallbackKey(typeDef);
+      attachNewContactButton(relatedContactEl, {
+        defaultType: RELATED_CONTACT_ROLE[typeDef.value] || '',
+        defaultName: fb ? String(draft.details[fb] || '').trim() : '',
+        onCreated: (contact) => { contacts.push(contact); draft.related_contact_id = contact.id; }
+      });
+      // Once a contact is picked, the "Recorded as …" note no longer applies.
+      if (fb) relatedContactEl.addEventListener('change', () => {
+        const hintEl = relatedContactEl.parentElement.querySelector('.field-hint');
+        if (hintEl && relatedContactEl.value) hintEl.textContent = 'Linked. Saving replaces the typed name with this contact.';
+      });
+    }
+    if (isCascade) {
+      modal.querySelectorAll('[data-cascade-target]').forEach((cb) => {
+        cb.addEventListener('change', (e) => {
+          captureInputs();
+          const id = e.target.dataset.cascadeTarget;
+          if (e.target.checked) cascadeChecked.add(id); else cascadeChecked.delete(id);
+          // Only re-render when the current type has per-target fields (their
+          // rows track which puppies are checked); other types' shared fields
+          // don't depend on the checked set, so skip the redraw for those.
+          if (PER_TARGET_CASCADE_FIELDS[draft.event_type]?.length) render();
+        });
+      });
+    }
+    modal.querySelector('[data-act="save"]').addEventListener('click', save);
+    modal.querySelectorAll('[data-act="cancel"]').forEach((b) => b.addEventListener('click', close));
+  }
+
+  function captureInputs() {
+    draft.event_date = modal.querySelector('#ef-date').value;
+    const endEl = modal.querySelector('#ef-end-date');
+    draft.event_end_date = endEl ? endEl.value : '';
+    const contactEl = modal.querySelector('#ef-related-contact');
+    draft.related_contact_id = contactEl ? contactEl.value : '';
+    draft.title = modal.querySelector('#ef-title').value.trim();
+    draft.reminder_date = modal.querySelector('#ef-reminder').value;
+    draft.cost = modal.querySelector('#ef-cost').value;
+    draft.expenseCategory = modal.querySelector('#ef-cost-category').value;
+    draft.notes = modal.querySelector('#ef-notes').value;
+    // The hidden contactFallback name isn't an input — carry it over, but only
+    // while no contact is linked (a linked vet replaces the typed name).
+    const fb = fallbackKey(descriptor(EVENT_TYPES, draft.event_type));
+    const fallbackName = fb ? draft.details[fb] : undefined;
+    // A training stay's link to its sale and extra (Family Requests plan §6) isn't
+    // an input either: it rides through an edit unchanged.
+    const links = Object.fromEntries(LINK_DETAIL_KEYS.filter((k) => draft.details[k]).map((k) => [k, draft.details[k]]));
+    draft.details = { ...links };
+    if (fallbackName && !draft.related_contact_id) draft.details[fb] = fallbackName;
+    modal.querySelectorAll('[data-detail]').forEach((el) => {
+      const val = el.value.trim();
+      if (val !== '') draft.details[el.dataset.detail] = el.type === 'number' ? Number(val) : val;
+    });
+    modal.querySelectorAll('[data-cascade-detail]').forEach((el) => {
+      const id = el.dataset.cascadeId;
+      const key = el.dataset.cascadeDetail;
+      const val = el.value.trim();
+      draft.perTargetDetails[id] = draft.perTargetDetails[id] || {};
+      if (val !== '') draft.perTargetDetails[id][key] = Number(val);
+      else delete draft.perTargetDetails[id][key];
+    });
+  }
+
+  function showError(msg) {
+    modal.querySelector('#ef-error').innerHTML = `<div class="inline-error">${esc(msg)}</div>`;
+  }
+
+  // Guards against a rapid double-tap/double-click firing save() twice before
+  // the first call's await chain has a chance to disable anything itself —
+  // each call would otherwise run to completion independently, e.g. creating
+  // two events (or, on a litter-wide cascade, two per puppy) from one tap.
+  async function save() {
+    const btn = modal.querySelector('[data-act="save"]');
+    if (btn?.disabled) return;
+    if (btn) btn.disabled = true;
+    try {
+      await doSave();
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function doSave() {
+    captureInputs();
+    if (isCascade && !cascadeChecked.size) {
+      showError('Select at least one to apply this event to.');
+      return;
+    }
+    // Soft warning: reminder should not precede the event.
+    if (draft.reminder_date && draft.event_date && draft.reminder_date < draft.event_date) {
+      if (!(await confirmModal({ title: 'Reminder is before the event date', message: 'Reminder date is before the event date. Save anyway?', confirmLabel: 'Save anyway', cancelLabel: 'Cancel' }))) return;
+    }
+    // Soft warning: weight below the dog's previous weigh-in. Checked PER DOG,
+    // so a litter-wide bulk weight-add lists exactly which puppies dropped.
+    if (draft.event_type === 'weight_check' && subjectType === 'dog') {
+      const targets = isCascade
+        ? [...cascadeChecked].map((id) => ({ id, details: { ...draft.details, ...(draft.perTargetDetails[id] || {}) }, label: cascadeTargets.find((t) => t.id === id)?.label || 'This puppy' }))
+        : [{ id: subjectId, details: draft.details, label: 'This dog' }];
+      // A new entry sorts after any existing same-day/same-time weigh-in (its
+      // capture time is "now"); an edit keeps its own place via created_at + id.
+      const newCreated = isEdit ? (event.created_at || '~~~~~~') : '~~~~~~';
+      const drops = [];
+      for (const t of targets) {
+        const newOz = weightTotalOz(t.details);
+        if (newOz == null) continue;
+        const newKey = { date: draft.event_date || '', rank: timeRank(t.details), created: newCreated };
+        const prior = await findPriorWeighIn(t.id, newKey, isEdit ? event.id : null);
+        if (prior && newOz < weightTotalOz(prior.details)) {
+          drops.push(`• ${t.label}: ${fmtWeight(t.details)} — down from ${fmtWeight(prior.details)}${prior.event_date ? ` on ${prior.event_date}` : ''}`);
+        }
+      }
+      if (drops.length) {
+        const many = drops.length > 1;
+        const ok = await confirmModal({
+          title: `Weight decreased${many ? ` (${drops.length} dogs)` : ''}`,
+          message: `${many ? 'These weigh-ins are' : 'This weigh-in is'} below the previous weight for the same dog:\n\n${drops.join('\n')}\n\nSave anyway?`,
+          confirmLabel: 'Save anyway', cancelLabel: 'Go back', danger: true
+        });
+        if (!ok) return;
+      }
+    }
+    // Soft checks on a show's results (points cap, status, future date, track).
+    if (draft.event_type === 'show') {
+      const issues = showSoftIssues(draft.details, draft.event_date);
+      if (issues.length) {
+        const ok = await confirmModal({
+          title: 'Check this show result',
+          message: `${issues.map((m) => `• ${m}`).join('\n')}\n\nSave anyway?`,
+          confirmLabel: 'Save anyway', cancelLabel: 'Go back'
+        });
+        if (!ok) return;
+      }
+    }
+    const basePayload = {
+      subject_type: subjectType,
+      event_type: draft.event_type,
+      event_date: draft.event_date,
+      event_end_date: draft.event_end_date || null,
+      related_contact_id: draft.related_contact_id || null,
+      title: draft.title,
+      details: draft.details,
+      reminder_date: draft.reminder_date || null,
+      notes: draft.notes
+    };
+    const amount = draft.cost === '' ? null : Number(draft.cost);
+    if (amount != null && !Number.isFinite(amount)) { showError('Cost must be a number.'); return; }
+    try {
+      let saved;
+      if (isCascade) {
+        const perTargetKeys = PER_TARGET_CASCADE_FIELDS[draft.event_type] || [];
+        saved = await Promise.all(
+          [...cascadeChecked].map((id) => HistoryEvent.create({
+            ...basePayload,
+            subject_id: id,
+            details: perTargetKeys.length ? { ...draft.details, ...(draft.perTargetDetails[id] || {}) } : draft.details
+          }))
+        );
+        // One linked expense per created event when a cost was entered (each
+        // puppy gets its own ledger row for the same amount/category).
+        if (amount != null) {
+          await Promise.all(saved.map((ev) => writeLinkedExpense(ev, subjectType, ev.subject_id, amount, draft)));
+        }
+      } else {
+        const payload = { ...basePayload, subject_id: subjectId };
+        saved = isEdit
+          ? await HistoryEvent.update(event.id, payload)
+          : await HistoryEvent.create(payload);
+        await syncLinkedExpense(saved, subjectType, subjectId, amount, draft, linkedExpense);
+      }
+      // Tag the related contact with this type's role (a show's handler), for a
+      // contact picked from the list as well as one created inline.
+      const role = RELATED_CONTACT_ROLE[draft.event_type];
+      if (role && basePayload.related_contact_id) await contactRepo.ensureType(basePayload.related_contact_id, role);
+      close();
+      onSaved?.(saved);
+    } catch (e) {
+      showError(e.message || String(e));
+    }
+  }
+
+  // Create a fresh expense linked to a just-created event (cascade path).
+  function writeLinkedExpense(ev, sType, sId, amount, d) {
+    return expenseRepo.createForEvent({ ...ev, subject_type: sType, subject_id: sId, event_date: d.event_date }, { amount, category: d.expenseCategory });
+  }
+
+  // Reconcile the single-subject event's linked expense with the Cost field:
+  // upsert when a cost is present, remove the linked row when it's cleared.
+  async function syncLinkedExpense(ev, sType, sId, amount, d, existing) {
+    if (amount != null) {
+      if (existing) {
+        await expenseRepo.update(existing.id, {
+          amount, category: d.expenseCategory, expense_date: d.event_date,
+          subject_type: sType, subject_id: sId
+        });
+      } else {
+        await writeLinkedExpense(ev, sType, sId, amount, d);
+      }
+    } else if (existing) {
+      await expenseRepo.hardDelete(existing.id);
+    }
+  }
+
+  function close() {
+    overlay.remove();
+    document.removeEventListener('keydown', onKey);
+  }
+  function onKey(e) { if (e.key === 'Escape') { close(); onCancel?.(); } }
+
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) { close(); onCancel?.(); } });
+  document.addEventListener('keydown', onKey);
+  render();
+}
+
+// Today's due-out/reminder rows deep-link here via two query params (no
+// standalone event page exists — Event is polymorphic, so it's always opened
+// from its subject's own page): `openEvent=<id>` opens that exact event in
+// edit mode (a due-out — the row IS the event); `logEvent=<event_type>` opens
+// a fresh event of that type (a reminder — nudging the NEXT occurrence, not
+// re-editing the one that fired it). Call once, after the subject page has
+// loaded its record; a no-op if neither param is present.
+//
+// A `logEvent` link may also carry `logDate=<YYYY-MM-DD>`, `logTitle=<text>`,
+// `logEnd=<YYYY-MM-DD>` (a span's end), `logContact=<contact id>` and
+// `logDetails=<URL-encoded JSON object>` to prefill the new event's date, title,
+// end, related contact and details (the "Log the title?" nudge — Show Tracking
+// Spec §5.4; the go-home nudges, data/goHome.js). Only
+// string/number detail values are taken; a malformed `logDetails` is ignored.
+// `fromReminder=<event id>` (Today's reminder "Log new"): saving the new event
+// dismisses that reminder, if it's the same subject and type. Cancelling leaves it.
+export async function openEventFromQuery(subjectType, subjectId, onSaved) {
+  const openId = param('openEvent');
+  if (openId) {
+    const event = await HistoryEvent.getById(openId);
+    if (event) openEventForm({ subjectType, subjectId, event, onSaved });
+    return;
+  }
+  const logType = param('logEvent');
+  if (logType) {
+    const prefill = { event_type: logType };
+    const date = param('logDate');
+    if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) prefill.event_date = date;
+    if (param('logTitle')) prefill.title = param('logTitle');
+    const end = param('logEnd');
+    if (end && /^\d{4}-\d{2}-\d{2}$/.test(end)) prefill.event_end_date = end;
+    if (param('logContact')) prefill.related_contact_id = param('logContact');
+    try {
+      const raw = JSON.parse(param('logDetails') || 'null');
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        prefill.details = Object.fromEntries(Object.entries(raw)
+          .filter(([, v]) => typeof v === 'string' || typeof v === 'number'));
+      }
+    } catch { /* malformed logDetails — open without detail prefill */ }
+    const fromReminder = param('fromReminder');
+    const saved = !fromReminder ? onSaved : async (ev) => {
+      const source = await HistoryEvent.getById(fromReminder);
+      if (source && source.subject_type === subjectType && source.subject_id === subjectId
+        && source.event_type === logType && !source.reminder_dismissed) {
+        await HistoryEvent.dismissReminder(source.id);
+      }
+      onSaved?.(ev);
+    };
+    openEventForm({ subjectType, subjectId, prefill, onSaved: saved });
+  }
+}

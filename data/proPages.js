@@ -1,0 +1,176 @@
+// proPages.js — the canonical list of Pro-only PAGES. Single source of truth for
+// two things that must never disagree about what "Pro-only" means:
+//   1. the Lite build (build/assemble.mjs excludes these files from the Lite artifact);
+//   2. runtime gating of any in-app link to a Pro page from a Lite-kept shared page
+//      (e.g. the Import/Export CSV-type dropdown drops the Pro options).
+//
+// These are the pages that carry Pro features; the data-layer repos they use stay in
+// shared/ (they're imported by shared code), so absence is enforced at the page level.
+
+// Pages under pages/ — basenames of the .html (the matching .js, when present, is
+// excluded alongside it by the build).
+export const PRO_ONLY_PAGES = [
+  // People / Contacts
+  'contacts.html', 'contact.html', 'contact-import.html',
+  // Kennel management (full) — Lite keeps only first-run kennel setup
+  'kennels.html', 'kennel.html', 'kennel-import.html', 'kennel-tests-import.html',
+  // Stud services
+  'stud-services.html', 'stud-service.html', 'stud-service-import.html',
+  // Contracts
+  'contracts.html', 'contract.html',
+  // Reports (all)
+  'reports.html', 'health-tests-report.html', 'litters-report.html',
+  'litter-finances-report.html', 'placements-report.html', 'stud-services-report.html',
+  'pl-report.html', 'year-review.html',
+  'production-report.html', 'pairing-success-report.html', 'puppy-growth-report.html',
+  'waitlist-funnel-report.html', 'demand-supply-report.html',
+  'applications-report.html', 'waitlist-today-report.html', 'offers-removals-report.html',
+  'expenses-report.html', 'receivables-report.html', 'pricing-report.html', 'dog-return-report.html', 'heat-cycles-report.html',
+  'health-gaps-report.html', 'lead-sources-report.html', 'returns-report.html', 'show-record-report.html', 'stud-results-report.html',
+  // Companion share-out
+  'companion.html',
+  // Dog Cards (Shared Dogs Plan §3). Its data layer, data/dogCard.js, stays shared like
+  // kennelCard.js.
+  'dog-cards.html',
+  // KennelAssistant owner console (the helper's own app is the root-level
+  // assistant.html in PRO_ONLY_STANDALONE below — same basename, different
+  // directory, and both are Pro-only so isProOnlyPage's basename match is
+  // correct either way).
+  'assistant.html',
+  // Furever seed-link generator
+  'furever.html',
+  // Per-breed feeding schedules (sent along in the Furever seed packet)
+  'breed-feeding-schedules.html',
+  // Business accounts (vendor logins + referral links/codes)
+  'accounts.html',
+  // Documents + file storage
+  'documents.html',
+  // Invoice / receipt generation (print doc)
+  'invoice.html',
+  // Puppy Record generation (print doc)
+  'puppy-record.html',
+  // Show tracking — the Shows page (Show Tracking Spec §5.2/§7)
+  'shows.html',
+  // Waitlist (Waitlist Spec §11) — the list, one family, and programs
+  'waitlist.html', 'waitlist-entry.html', 'waitlist-programs.html', 'waitlist-import.html',
+  // ...and her application form editor (Waitlist Spec §15.1)
+  'waitlist-form.html',
+  // ...and publishing the list: online, or as text to copy (Spec §15.3)
+  'waitlist-publish.html',
+  // Her do-not-sell list (a tab of Contacts; matched against waitlist applications)
+  'do-not-sell.html',
+];
+
+// Standalone Pro files that live outside pages/ (no nav entry) — also excluded from
+// the Lite build. `assets/documentModal.js` is the shared Documents add/edit + view
+// modal, imported only by the Pro-only Documents and Contract pages, so Lite (which
+// ships neither) doesn't need it — keep it out so no Pro-only code lands in Lite.
+// `assets/kennelCardUI.js` is the same story for Kennel Cards: imported only by the
+// Pro-only Kennel hub and Kennels list. (Its data-layer half, `data/kennelCard.js`,
+// stays in the shared build — it's reached through kennelRepo, exactly like
+// `data/companionExport.js` ships to Lite while `companion.html` does not.)
+export const PRO_ONLY_STANDALONE = [
+  'companion-view.html', 'assistant.html', 'assistant.js',
+  'assets/documentModal.js', 'assets/kennelCardUI.js',
+  // Page-side helpers for the waitlist pages only. Its data layer (repos, rules,
+  // actions) stays shared, like every repo.
+  'assets/waitlistUI.js',
+  'assets/programIcons.js',
+  // The Litter page's waitlist picks panel — litter.js imports it dynamically only
+  // when editionFlags.waitlist is on, so Lite never requests it.
+  'assets/waitlistPicksPanel.js',
+  // The picks preview (Picks Preview Spec), opened by the picks panel and the
+  // Waitlist page before Open picks. Its rules, data/picksPreview.js, stay shared.
+  'assets/picksPreviewModal.js',
+  // Side sales (Side Sale Spec): the family page and the picks panel.
+  'assets/sideSaleUI.js',
+  // The Litter page's pickup times (Family Requests plan §4), imported the same way.
+  'assets/pickupTimesPanel.js',
+  // The Kennel page's "Online list" card (Waitlist W2 Plan §9), imported only when
+  // editionFlags.waitlist is on and the waitlist online is offered.
+  'assets/waitlistOnlineUI.js',
+  // The "Email the family?" preview (W2 step 6), imported by the waitlist pages,
+  // the picks panel and (dynamically) Today's waitlist nudges.
+  'assets/waitlistEmailUI.js',
+  // The Settings page's Notifications card (app alerts and the email digest), imported
+  // only with a server and editionFlags.waitlist.
+  'assets/notificationsUI.js',
+  // Kels's "Set up my waitlist" (pages/kels.js imports it on start, only with the waitlist).
+  'assets/waitlistSetupUI.js',
+  'assets/pickupTransportStep.js',
+  // Kels's "Review my waitlist" (pages/kels.js imports it on start, only with the
+  // waitlist). Its rules, data/waitlistReview.js, stay shared: Today's nudges use them.
+  'assets/waitlistReviewUI.js',
+  // "Same family": merging a duplicate waitlist application (the family's page,
+  // Review my waitlist; Tidy up and the Import/Export scan import it dynamically,
+  // only with the waitlist). Its rules, data/applicationDuplicates.js, stay shared.
+  'assets/applicationMergeUI.js',
+  // A waitlist application's fields: the Waitlist entry page's and Kels's "Set up my waitlist".
+  'assets/waitlistApplicationForm.js',
+  // Kels's applicant step (a family put on the waitlist in the chat): Set up my
+  // waitlist and Add people import it, only with the waitlist.
+  'assets/kelsApplicant.js',
+  // Kels's "Add people" (pages/kels.js imports it on start, only with contacts).
+  'assets/guidedPeopleUI.js',
+  // Kels's "Set up my application form" (pages/kels.js imports it on start, only
+  // with the waitlist) and the fee step it shares with "Set up my waitlist".
+  'assets/guidedFormUI.js', 'assets/waitlistFeeStep.js',
+  // "Review sale & send" on the waitlist family page (Integrations plan §2.6).
+  'assets/pickToSend.js',
+  // E-sign through Firma (Integrations plan §2.3a): Contract templates and the send
+  // dialog, opened from the Pro-only Contracts, Contract and waitlist family pages.
+  // Its data layer (data/cloud/cloudEsign.js, data/esignTemplates.js) stays shared.
+  'assets/esignUI.js',
+  // ...and its Field guide window (its rows, data/prefillGuide.js, stay shared).
+  'assets/fieldGuideUI.js',
+  // The Companion link builder (shared by the Companion console and the guided
+  // litter flow's share step) and that share step itself: guidedLitterUI.js
+  // imports guidedShareUI.js dynamically only when editionFlags.waitlist or
+  // editionFlags.companion is on, so Lite never requests either.
+  'assets/companionLink.js', 'assets/guidedShareUI.js',
+  // "Send payment link" (Integrations plan §4): the Sale page imports it only when
+  // editionFlags.accounts is on, and the Invoice page is Pro.
+  'assets/paymentRequestUI.js',
+  // Invoice / receipt document model + its PDF renderer (Waitlist Spec §15.2),
+  // used only by the Pro invoice page and the waitlist family page, and the
+  // vendored jsPDF they load on demand.
+  'assets/invoiceDoc.js', 'assets/invoicePdf.js', 'vendor/jspdf.umd.min.js',
+  // A family's money for its invoices and receipts (Payment Schedule plan §6).
+  'data/familyMoney.js',
+  // The Invoice / Receipt generator modal, opened from Financials and a Sale's
+  // page — both import it dynamically only when editionFlags.invoicing is on.
+  'assets/invoiceGenerator.js',
+  // Which fields the Puppy Record prints, read only by the Pro-only Puppy Record
+  // and Kennel pages.
+  'data/puppyRecordFields.js',
+  // A kennel's settings as form pieces (logo, nudges, Puppy Record fields): the
+  // Kennel page's, and Kels's "Getting Started", which imports it only in the parts
+  // that need that page (none in Lite).
+  'assets/kennelSettingsFields.js',
+  // What each report reads and the figures its tiles show: the Pro-only report
+  // pages', and Kels's "How my business is doing", which is Pro-only too.
+  'data/reportSources.js', 'data/reportFigures.js',
+  // ...and the sentences she makes from them, with their chat.
+  'data/kennelInsights.js', 'assets/kelsInsightsUI.js',
+  // Her KennelPort website (KennelPort plan 5.5): Settings' Your website card and
+  // Kels's "Update my website", each imported only when websiteLinkOffered() (Pro
+  // with a KennelPort address). The data layer (siteExport, kennelportApi,
+  // kennelportLink, kennelportLinkStore) stays shared, like every repo.
+  'assets/websiteCard.js', 'assets/websiteUpdateUI.js', 'assets/websiteBanner.js'
+];
+
+// True when a link target (an href like "contact-import.html" or with a query string)
+// points at a Pro-only page. Used by runtime gating in Lite-kept pages.
+// Pages the Demo build drops (build/assemble.mjs): no saving, exporting or
+// settings in a read-only demo. Kels's Find never offers them there.
+export const DEMO_EXCLUDED_PAGES = ['import-export.html', 'settings.html', 'assistant.html'];
+
+export function isDemoExcludedPage(href) {
+  const file = String(href || '').split('/').pop().split('?')[0];
+  return DEMO_EXCLUDED_PAGES.includes(file);
+}
+
+export function isProOnlyPage(href) {
+  const file = String(href || '').split('/').pop().split('?')[0];
+  return PRO_ONLY_PAGES.includes(file);
+}

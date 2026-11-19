@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Import / Export — KennelOS</title>
+  <link rel="stylesheet" href="../assets/app.css">
+  <link rel="manifest" href="../manifest.json">
+  <link rel="icon" href="../assets/icons/favicon-32.png" sizes="32x32">
+  <link rel="apple-touch-icon" href="../assets/icons/apple-touch-icon.png">
+  <meta name="theme-color" content="#122138">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="KennelOS">
+</head>
+<body>
+  <div id="app-nav"></div>
+  <main>
+    <div class="page-header">
+      <div>
+        <h1>Import / Export</h1>
+        <p class="page-subtitle">Back up and restore your records, find duplicates, or import CSV data.</p>
+      </div>
+    </div>
+
+    <div id="page-msg"></div>
+
+    <section class="card" id="backup-restore">
+      <h2 style="margin-top:0;">Backup &amp; restore</h2>
+      <div class="seg-tabs" id="br-tabs" role="tablist">
+        <button class="seg-tab active" type="button" data-mode="backup">Back up</button>
+        <button class="seg-tab" type="button" data-mode="restore">Restore</button>
+      </div>
+
+      <!-- Destination/source is chosen per run, independently of the tab above.
+           Cloud is there only when this edition has a cloud server, Dropbox only
+           in Pro; with neither, the row goes and the card is the plain file
+           backup/restore. -->
+      <div class="dest-row" id="dest-row">
+        <span class="dest-label" id="dest-label">To:</span>
+        <div class="seg-tabs seg-tabs-sub" id="dest-tabs">
+          <button class="seg-tab active" type="button" data-dest="cloud">☁️ Cloud</button>
+          <button class="seg-tab" type="button" data-dest="local">💾 This device</button>
+          <button class="seg-tab" type="button" data-dest="dropbox">📦 Dropbox</button>
+        </div>
+      </div>
+
+      <!-- The Cloud destination, both sides: filled by assets/cloudBackupUI.js. -->
+      <div id="br-cloud" hidden></div>
+
+      <div id="br-backup">
+        <p class="muted" id="backup-blurb"></p>
+        <p class="muted">Last backup: <strong id="last-backup">—</strong></p>
+        <button class="btn btn-primary" id="btn-backup">⬇ Download backup</button>
+      </div>
+
+      <div id="br-restore" hidden>
+        <p class="muted" id="restore-blurb"></p>
+        <input type="file" id="restore-file" accept="application/json,.json">
+        <button class="btn" id="btn-dbx-fetch" hidden>⬇ Fetch from Dropbox</button>
+        <div id="restore-preview" style="margin-top:14px;"></div>
+      </div>
+
+      <div id="dropbox-connect"></div>
+    </section>
+
+    <!-- Records entered twice on this device: filled by assets/duplicateScanUI.js. -->
+    <section class="card" style="margin-top:16px;" id="duplicates-card">
+      <h2 style="margin-top:0;">Duplicates</h2>
+      <p class="muted" data-dup="blurb"></p>
+      <button class="btn" type="button" data-dup="scan">Scan for duplicates</button>
+      <div data-dup="results" style="margin-top:12px;"></div>
+    </section>
+
+    <section class="card" style="margin-top:16px;">
+      <h2 style="margin-top:0;">CSV import</h2>
+      <p class="muted">Match-or-create with a dry-run preview before anything is written.</p>
+      <p><a class="btn" href="import-batch.html">Import several files…</a> <span class="muted" style="font-size:13px;">Pick them all at once; they're recognized and imported in the right order.</span></p>
+      <div class="field field-wide">
+        <label for="csv-import-select">Choose what to import</label>
+        <select id="csv-import-select">
+          <option value="" selected>Select data type…</option>
+          <option value="kennel-import.html">Kennels (import first)</option>
+          <option value="contact-import.html">Contacts</option>
+          <option value="dog-import.html">Dogs</option>
+          <option value="pairing-import.html">Pairings</option>
+          <option value="litter-import.html">Litters</option>
+          <option value="sale-import.html">Sales</option>
+          <option value="event-import.html">Events</option>
+          <option value="stud-service-import.html">Stud services</option>
+          <option value="expense-import.html">Expenses</option>
+          <option value="waitlist-import.html">Waitlist applications</option>
+          <option value="kennel-tests-import.html">Kennel tests</option>
+        </select>
+      </div>
+      <div class="field field-wide" style="margin-top:12px;">
+        <label for="csv-template-select">Download a blank template to fill</label>
+        <select id="csv-template-select">
+          <option value="" selected>Select data type…</option>
+        </select>
+        <p class="muted" style="font-size:13px; margin:6px 0 0;">The column names each import reads. Each import screen explains every column.</p>
+      </div>
+    </section>
+
+    <section class="card" style="margin-top:16px; border-color:#e0a0a0;" id="danger-zone-section">
+      <h2 style="margin-top:0;">Danger zone</h2>
+      <p class="muted" id="reset-app-status">Checking…</p>
+      <p class="muted">Permanently deletes every dog, contact, kennel, and event, plus all app settings (kennel setup, sample-data status, last backup date) — landing back on the first-run setup screen, like a browser that has never opened this app. There is no undo. Download a backup first if you might want this data again.</p>
+      <button class="btn btn-danger" id="btn-reset-app">Reset app to start…</button>
+    </section>
+  </main>
+
+  <script type="module" src="../app.js"></script>
+  <script type="module" src="./import-export.js"></script>
+</body>
+</html>

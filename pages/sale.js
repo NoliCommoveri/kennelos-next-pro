@@ -1,0 +1,1302 @@
+// sale.js — Sale Detail. Edit-in-place profile and a derived Contracts panel
+// (contracts.related_sale_id = this sale — canonical on Contract, never a
+// Sale.contract_id, Stage4 Revision v2 §5). Buyer is a Contact (no Buyer table).
+import { saleRepo, ReferenceBlockedError } from '../data/saleRepo.js';
+import { expectedPricing, priceForRegistrationChange } from '../data/saleDefaults.js';
+import { contractRepo } from '../data/contractRepo.js';
+import { dogRepo } from '../data/dogRepo.js';
+import { contactRepo } from '../data/contactRepo.js';
+import { litterRepo } from '../data/litterRepo.js';
+import { accountRepo } from '../data/accountRepo.js';
+import { kennelRepo } from '../data/kennelRepo.js';
+import { saleExtraCharges, readExtraCharges, kennelChargeList, kennelChargeGroups, groupedChargeList, newExtraCharge, chargeFromPriceList, depositFeeChargeBack, cleanSteps, stepWithPaidDate } from '../data/extraCharges.js';
+import { depositPaid, getSaleStatement } from '../data/incomeView.js';
+import { hasSchedule, savedSchedules, finalDueDate } from '../data/paymentSchedule.js';
+import { paymentsCardHtml, wirePaymentsCard, askAboutNewFees } from '../assets/paymentScheduleUI.js';
+import { feeRate, isUsableRate, processingFee, priceToNet, netOf, rateLabel, saleFeeEstimate } from '../data/processingFees.js';
+import { isOpenSale, REGISTRATION_TYPE, SALE_STATUS, RELEASED_SALE_STATUSES, TERMINAL_SALE_STATUSES, SALE_END_REASON, saleEndReasonsFor, CONTRACT_TYPE, CONTRACT_STATUS, BOARDING_FREQUENCY_OPTIONS, descriptor } from '../data/vocab.js';
+import { restoresFamily, businessDays, waitlistConfig } from '../data/waitlistRules.js';
+import { litterCloseDue, litterLabel } from '../data/litterCheckin.js';
+import { promptDisposition, promptReleasedPup, askRegistrationPrice } from '../assets/salePrompts.js';
+import { esc, badge, fmtDate, fmtMoney, todayYMD, param, confirmModal, alertModal, dogRefHtml, dogOptgroups } from '../assets/ui.js';
+import { openEventForm } from '../assets/eventForm.js';
+import { attachNewContactButton } from '../assets/contactPicker.js';
+import { editionFlags } from '../data/editionConfig.js';
+import { earlyPortalState } from '../data/portalFeed.js';
+import { startPortalEarly } from '../assets/portalEarlyUI.js';
+import { doNotSellRepo } from '../data/doNotSellRepo.js';
+import { doNotSellMatches, doNotSellWarning } from '../data/doNotSell.js';
+import { resolveKennelIdForWrite, dogInScope, isScoped } from '../data/kennelScope.js';
+import { renderScopeNotice } from '../assets/kennelScopeUI.js';
+import { deliveredOwnershipChanges, addedStays } from '../data/goHome.js';
+import { offerStayAndPickup } from '../assets/stayPickupUI.js';
+
+// Statuses that warrant the "log a scheduled pickup" prompt (Stage4.5 Addendum §D4).
+const PLACEMENT_PROMPT_STATUSES = ['paid_in_full', 'delivered'];
+
+const els = {
+  title: document.getElementById('sale-title'),
+  subtitle: document.getElementById('sale-subtitle'),
+  headerActions: document.getElementById('header-actions'),
+  profileActions: document.getElementById('profile-actions'),
+  body: document.getElementById('profile-body'),
+  error: document.getElementById('page-error'),
+  contracts: document.getElementById('contracts-section'),
+  payments: document.getElementById('payments-section')
+};
+
+const blankSale = () => ({
+  dog_id: '', buyer_contact_id: '', sale_date: '', price: '', deposit_amount: '',
+  deposit_date: '', balance_due_date: '', balance_paid_date: '', registration_type: '',
+  lead_source: '', referred_by_contact_id: '', status: '', notes: '',
+  transport_fee: '', deferred_boarding_amount: '', deferred_boarding_frequency: '',
+  deferred_boarding_duration_days: '', end_reason: '', end_note: '',
+  sales_channel_account_id: '', processing_fee_amount: '', fee_passed_to_buyer: false,
+  deposit_paid_via_account_id: '', balance_paid_via_account_id: '', extra_charges: []
+});
+
+const ctx = {
+  mode: 'view', original: null, draft: null, pickerArchived: false,
+  // §9's "show all kennels" escape — see dogOptions().
+  pickerAllKennels: false,
+  allDogs: [], allContacts: [], leadSources: [],
+  dogsById: new Map(), contactsById: new Map(), littersById: new Map(),
+  // Sales channels (Pro: Accounts) and the processing fee last filled in for her
+  // (Integrations plan §5) — a fee still at that value follows the price; a fee
+  // she typed stays put.
+  accounts: [], accountsById: new Map(), suggestedFee: null,
+  // Own kennels, for the extra charges price list (Pro, §21.2).
+  kennels: [],
+  // Her do-not-sell list (Pro, with the waitlist): the chosen buyer is checked (K7-9).
+  doNotSell: [],
+  // The sale's payment statement as last shown (Payments card), for the edit form's
+  // final payment date.
+  statement: null
+};
+
+async function loadRefs() {
+  const [dogs, contacts, leadSources, litters, accounts, kennels, doNotSell] = await Promise.all([
+    dogRepo.getAll({ includeArchived: true }),
+    contactRepo.getAll({ includeArchived: true }),
+    saleRepo.getLeadSources(),
+    litterRepo.getAll({ includeArchived: true }),
+    // Accounts are a Pro page; Lite records the fee on the sale alone.
+    editionFlags.accounts ? accountRepo.getAll({ includeArchived: true }) : [],
+    editionFlags.extraCharges ? kennelRepo.getAll() : [],
+    editionFlags.waitlist ? doNotSellRepo.getAll() : []
+  ]);
+  ctx.doNotSell = doNotSell;
+  ctx.kennels = kennels.filter((k) => k.is_own_kennel);
+  ctx.accounts = accounts;
+  ctx.accountsById = new Map(accounts.map((a) => [a.id, a]));
+  ctx.allDogs = dogs;
+  ctx.allContacts = contacts;
+  ctx.leadSources = leadSources;
+  ctx.dogsById = new Map(dogs.map((d) => [d.id, d]));
+  ctx.contactsById = new Map(contacts.map((c) => [c.id, c]));
+  ctx.littersById = new Map(litters.map((l) => [l.id, l]));
+}
+
+// Prefills registration_type from the dog's intended_registration, then
+// price/deposit_amount from the dog's litter (data/saleDefaults.js: by the dog's
+// sex, plus the Full-registration surcharge when the registration is Full) — only
+// into fields still empty, so it never clobbers a value already entered (same
+// pattern as the buyer's first_contact_source -> lead_source prefill below).
+function applyExpectedPricing() {
+  const dog = ctx.dogsById.get(ctx.draft.dog_id);
+  if (dog && !ctx.draft.registration_type && dog.intended_registration) ctx.draft.registration_type = dog.intended_registration;
+  const litter = dog && dog.litter_id ? ctx.littersById.get(dog.litter_id) : null;
+  if (!litter) return;
+  const expected = expectedPricing(dog, litter, ctx.draft.registration_type);
+  if (!ctx.draft.price && expected.price != null) ctx.draft.price = expected.price;
+  if (!ctx.draft.deposit_amount && expected.deposit_amount != null) ctx.draft.deposit_amount = expected.deposit_amount;
+}
+
+// --- Processing fee (Integrations plan §5) -----------------------------------
+// The sale's channel (an Account: Good Dog, Stripe…) carries a fee rate; the fee
+// this sale paid is stored on the sale itself, so a later rate change never
+// rewrites it. The rate only SUGGESTS the fee.
+function channelRate(draft = ctx.draft) {
+  return feeRate(ctx.accountsById.get(draft.sales_channel_account_id));
+}
+
+// The fee the sale's accounts suggest: each payment at the rate of the account
+// it's paid via, else Sold through's (processingFees.saleFeeEstimate). Null = none.
+function estimatedFee(draft = ctx.draft) {
+  return saleFeeEstimate(draft, ctx.accountsById)?.total ?? null;
+}
+
+// Fill the fee from the estimate when it's empty or still the amount we filled in
+// last time (so it follows a price change); never over a fee she typed.
+function applySuggestedFee() {
+  const d = ctx.draft;
+  const current = d.processing_fee_amount === '' || d.processing_fee_amount == null ? null : Number(d.processing_fee_amount);
+  if (current != null && current !== ctx.suggestedFee) return;
+  const next = estimatedFee(d);
+  if (next == null) {
+    if (current != null && current === ctx.suggestedFee) d.processing_fee_amount = '';
+    ctx.suggestedFee = null;
+    return;
+  }
+  d.processing_fee_amount = next;
+  ctx.suggestedFee = next;
+}
+
+function dogName(id) {
+  const d = ctx.dogsById.get(id);
+  return d ? (d.call_name + (d.registered_name ? ` (${d.registered_name})` : '')) : '';
+}
+function contactName(id) {
+  return ctx.contactsById.get(id)?.name || '';
+}
+
+// --- Option builders -----------------------------------------------------
+function vocabOptions(vocab, current, placeholder) {
+  const head = placeholder != null ? `<option value="">${esc(placeholder)}</option>` : '';
+  return head + vocab.map((v) =>
+    `<option value="${esc(v.value)}"${v.value === current ? ' selected' : ''}>${esc(v.label)}</option>`
+  ).join('');
+}
+
+// The dog being placed. Active-kennel scope (Multi-Kennel Scope Spec §9):
+// scoped by default with the "show all my kennels" escape, since a sale's own
+// kennel is INHERITED from this dog — picking one from another kennel files the
+// sale there, which should be a deliberate act. The current selection is always
+// listed so an existing sale never becomes uneditable.
+function dogOptions(current) {
+  const dogs = ctx.allDogs
+    .filter((d) => ctx.pickerAllKennels || d.id === current || dogInScope(d))
+    .filter((d) => ctx.pickerArchived || !d.is_archived || d.id === current);
+  const opt = (d) => `<option value="${esc(d.id)}"${d.id === current ? ' selected' : ''}>${esc(d.call_name)}${d.registered_name ? ' — ' + esc(d.registered_name) : ''}${d.is_archived ? ' (archived)' : ''}</option>`;
+  return `<option value="">— select —</option>` + dogOptgroups(dogs, opt, (d) => d.call_name || d.registered_name);
+}
+
+// NOT scoped, deliberately (§7): buyers are program-wide — one person who may
+// have bought from more than one of your kennels.
+function contactOptions(current) {
+  const opts = ctx.allContacts
+    .filter((c) => ctx.pickerArchived || !c.is_archived || c.id === current)
+    .map((c) => `<option value="${esc(c.id)}"${c.id === current ? ' selected' : ''}>${esc(c.name)}${c.is_archived ? ' (archived)' : ''}</option>`)
+    .join('');
+  return `<option value="">— select —</option>` + opts;
+}
+
+function frequencyOptions(current) {
+  const opts = BOARDING_FREQUENCY_OPTIONS
+    .map((o) => `<option value="${esc(o)}"${o === current ? ' selected' : ''}>${esc(o)}</option>`)
+    .join('');
+  return `<option value="">— select —</option>` + opts;
+}
+
+// Sales channels: every account (archived ones only when already chosen), by
+// name. Blank = sold directly, no channel.
+function channelOptions(current) {
+  const opts = ctx.accounts
+    .filter((a) => !a.is_archived || a.id === current)
+    .map((a) => {
+      const rate = feeRate(a);
+      return `<option value="${esc(a.id)}"${a.id === current ? ' selected' : ''}>${esc(a.name)}${rate ? ` (${esc(rateLabel(rate))})` : ''}${a.is_archived ? ' (archived)' : ''}</option>`;
+    }).join('');
+  return `<option value="">— sold directly —</option>` + opts;
+}
+
+// Payment service accounts for a "paid via" picker (archived ones only when chosen).
+function paidViaOptions(current) {
+  const opts = ctx.accounts
+    .filter((a) => a.account_type === 'payment_service' && (!a.is_archived || a.id === current))
+    .map((a) => {
+      const rate = feeRate(a);
+      return `<option value="${esc(a.id)}"${a.id === current ? ' selected' : ''}>${esc(a.name)}${rate ? ` (${esc(rateLabel(rate))})` : ''}${a.is_archived ? ' (archived)' : ''}</option>`;
+    }).join('');
+  return `<option value="">— not set —</option>` + opts;
+}
+
+// The fee fields of the edit form: channel and how each payment is taken (Pro),
+// fee, passed-on flag, what she nets, and the price-to-net helper.
+function feeFields(s) {
+  const rate = channelRate(s);
+  const estimated = estimatedFee(s);
+  const channel = editionFlags.accounts
+    ? `${field('Sold through', `<select id="f-sales_channel_account_id">${channelOptions(s.sales_channel_account_id)}</select>`, { hint: 'A marketplace that handles the whole sale and keeps a fee (Good Dog…). Set its fee on the Accounts page.' })}
+      ${field('Deposit paid via', `<select id="f-deposit_paid_via_account_id">${paidViaOptions(s.deposit_paid_via_account_id)}</select>`, { hint: 'The Payment service the deposit is paid through (Stripe, Zelle…).' })}
+      ${field('Balance paid via', `<select id="f-balance_paid_via_account_id">${paidViaOptions(s.balance_paid_via_account_id)}</select>`, { hint: 'The rest of the price, transport, boarding and extra charges. Blank: the deposit\'s.' })}`
+    : '';
+  return `${channel}
+      ${field('Processing fee', `<input id="f-processing_fee_amount" type="number" min="0" step="0.01" value="${esc(s.processing_fee_amount)}">`, { hint: estimated != null ? `Estimated ${fmtMoney(estimated)} from each payment's account rate. Change it to what was actually charged.` : 'What the marketplace or payment service kept of this sale.' })}
+      <div class="field field-wide">
+        <label class="check-inline"><input id="f-fee_passed_to_buyer" type="checkbox"${s.fee_passed_to_buyer ? ' checked' : ''}> The fee is passed to the buyer in the price</label>
+        <span class="field-hint" id="fee-net-line"></span>
+      </div>
+      <details class="field field-wide" id="net-helper">
+        <summary>Work out a price that nets you a set amount</summary>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:8px;">
+          <span class="faint">Net</span>
+          <input id="nh-net" type="number" min="0" step="0.01" placeholder="e.g. 3000" style="flex:1; min-width:90px;">
+          <span class="faint">after</span>
+          <input id="nh-percent" type="number" min="0" max="99.99" step="0.01" value="${esc(rate ? rate.percent : '')}" placeholder="%" style="flex:1; min-width:70px;">
+          <span class="faint">% +  $</span>
+          <input id="nh-fixed" type="number" min="0" step="0.01" value="${esc(rate ? rate.fixed : '')}" placeholder="fixed" style="flex:1; min-width:70px;">
+          <button type="button" class="btn btn-sm" id="nh-apply" disabled>Set price</button>
+        </div>
+        <span class="field-hint" id="nh-preview">The fee is taken from the higher price, so adding the percentage on top isn't enough: at 6.25%, netting $3,000 takes a $3,200 price, not $3,187.50.</span>
+      </details>`;
+}
+
+// "You net $X" under the fee, live as the price or fee changes.
+function updateNetLine() {
+  const el = document.getElementById('fee-net-line');
+  if (!el) return;
+  const price = document.getElementById('f-price')?.value ?? '';
+  const fee = document.getElementById('f-processing_fee_amount')?.value ?? '';
+  el.textContent = price !== '' && fee !== '' && Number(fee) > 0
+    ? `You net ${fmtMoney(netOf(price, fee))} of the ${fmtMoney(price)} price.`
+    : '';
+}
+
+function helperRate() {
+  const v = (id) => document.getElementById(id)?.value ?? '';
+  const rate = { percent: Number(v('nh-percent') || 0), fixed: Number(v('nh-fixed') || 0) };
+  return isUsableRate(rate) ? rate : null;
+}
+
+function wireFeeFields() {
+  const priceEl = document.getElementById('f-price');
+  const feeEl = document.getElementById('f-processing_fee_amount');
+  // A price or deposit change carries a still-suggested fee along with it.
+  const follow = () => {
+    if (feeEl && (feeEl.value === '' || Number(feeEl.value) === ctx.suggestedFee)) {
+      const next = estimatedFee(readForm());
+      feeEl.value = next ?? '';
+      ctx.suggestedFee = next;
+    }
+    updateNetLine();
+  };
+  priceEl?.addEventListener('input', follow);
+  document.getElementById('f-deposit_amount')?.addEventListener('input', follow);
+  for (const id of ['f-deposit_paid_via_account_id', 'f-balance_paid_via_account_id']) {
+    document.getElementById(id)?.addEventListener('change', () => {
+      ctx.draft = readForm();
+      applySuggestedFee();
+      renderEdit();
+    });
+  }
+  feeEl?.addEventListener('input', updateNetLine);
+  document.getElementById('f-sales_channel_account_id')?.addEventListener('change', (e) => {
+    ctx.draft = readForm();
+    const account = ctx.accountsById.get(e.target.value);
+    if (account) ctx.draft.fee_passed_to_buyer = !!account.fee_passed_to_buyer_default;
+    applySuggestedFee();
+    renderEdit();
+  });
+  const preview = document.getElementById('nh-preview');
+  const apply = document.getElementById('nh-apply');
+  const onHelper = () => {
+    const rate = helperRate();
+    const price = rate ? priceToNet(document.getElementById('nh-net').value, rate) : null;
+    apply.disabled = price == null;
+    if (price != null) {
+      const fee = processingFee(price, rate);
+      preview.textContent = `Price ${fmtMoney(price)} · fee ${fmtMoney(fee)} · you net ${fmtMoney(netOf(price, fee))}.`;
+    }
+  };
+  ['nh-net', 'nh-percent', 'nh-fixed'].forEach((id) => document.getElementById(id)?.addEventListener('input', onHelper));
+  apply?.addEventListener('click', () => {
+    const rate = helperRate();
+    const price = rate ? priceToNet(document.getElementById('nh-net').value, rate) : null;
+    if (price == null) return;
+    ctx.draft = readForm();
+    ctx.draft.price = price;
+    ctx.draft.processing_fee_amount = processingFee(price, rate);
+    ctx.draft.fee_passed_to_buyer = true;
+    ctx.suggestedFee = ctx.draft.processing_fee_amount;
+    renderEdit();
+  });
+  updateNetLine();
+}
+
+// --- Extra charges (Pro, §21.2) ------------------------------------------------
+// Photo packages, a payment fee charged back…: one invoice line each, paid with
+// the balance. The price list is the sale's kennel's (the dog's, for a new sale);
+// with neither known, every own kennel's.
+function priceKennel(draft = ctx.draft) {
+  const own = (id) => ctx.kennels.find((k) => k.id === id);
+  return own(draft.kennel_id) || own(ctx.dogsById.get(draft.dog_id)?.kennel_id) || null;
+}
+
+function priceList(draft = ctx.draft) {
+  const kennel = priceKennel(draft);
+  if (kennel) return kennelChargeList(kennel);
+  const seen = new Set();
+  return ctx.kennels.flatMap(kennelChargeList).filter((x) => {
+    const k = `${x.label}|${x.amount}`;
+    return seen.has(k) ? false : (seen.add(k), true);
+  });
+}
+
+function extraChargesField(s) {
+  if (!editionFlags.extraCharges) return '';
+  const rows = (Array.isArray(s.extra_charges) ? s.extra_charges : []).map((x) => `
+    <div class="xc-row" data-xc-id="${esc(x.id)}" style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+      <input class="xc-label" type="text" value="${esc(x.label)}" placeholder="e.g. Gold photo package" style="flex:2; min-width:120px;">
+      <input class="xc-amount" type="number" min="0" step="0.01" value="${esc(x.amount)}" placeholder="$" style="flex:1; min-width:80px;">
+      <label class="check-inline" style="gap:4px; white-space:nowrap;" title="The work is finished (a backed-out family still owes it)"><input type="checkbox" class="xc-done"${x.completed_date ? ' checked' : ''}> Done</label>
+      <button type="button" class="btn btn-sm" data-xc-remove aria-label="Remove">✕</button>
+    </div>${stepsHtml(x)}`).join('');
+  const presets = priceList(s);
+  return `<div class="field field-wide">
+      <label>Extra charges</label>
+      <div id="xc-rows">${rows}</div>
+      <select id="xc-add" style="max-width:320px;">
+        <option value="">+ Add an extra charge…</option>
+        ${groupedChargeList(presets).map(({ group, items }) => {
+          const opts = items.map((p) => `<option value="${esc(p.id)}">${esc(p.label)} (${esc(fmtMoney(p.amount))})</option>`).join('');
+          return group ? `<optgroup label="${esc(group)}">${opts}</optgroup>` : opts;
+        }).join('')}
+        <option value="custom">Something else…</option>
+      </select>
+      <span class="field-hint">Each prints as its own line on the invoice, paid with the balance unless it has a payment plan (set on the Kennel page's Extra charges price list, where you keep your usual ones). Changing an amount changes its payments still to come; a payment already made keeps its amount.</span>
+    </div>`;
+}
+
+// An extra's payment plan steps (Family Requests plan §3.1): each with its share,
+// when it's due and the day it was paid. A step's date she leaves blank reads live
+// (before pickup, with the balance).
+function stepsHtml(x) {
+  if (!Array.isArray(x.payments) || !x.payments.length) return '';
+  const steps = cleanSteps(x.payments, Number(x.amount) || 0) || [];
+  const when = (st) => st.due_date ? `due ${fmtDate(st.due_date)}` : st.due === 'before_pickup' ? `due ${st.n || 0} day${st.n === 1 ? '' : 's'} before pickup` : 'due with the balance';
+  return `<div class="xc-steps" data-xc-for="${esc(x.id)}" style="margin:-2px 0 8px 12px; font-size:0.92em;">
+    ${steps.map((st) => `<div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:4px;">
+      <span>${esc(`${st.percent}% · ${fmtMoney(st.amount)} · ${when(st)}`)}</span>
+      <label class="check-inline" style="gap:4px; white-space:nowrap;">Paid on <input type="date" class="xc-paid" data-step="${esc(st.id)}" value="${esc(st.paid_date || '')}"></label>
+    </div>`).join('')}
+  </div>`;
+}
+
+function readExtraChargeRows() {
+  const prior = new Map((Array.isArray(ctx.draft.extra_charges) ? ctx.draft.extra_charges : []).map((x) => [x.id, x]));
+  return [...document.querySelectorAll('#xc-rows .xc-row')].map((el) => {
+    const row = { ...prior.get(el.dataset.xcId), id: el.dataset.xcId, label: el.querySelector('.xc-label').value, amount: el.querySelector('.xc-amount').value };
+    // Done (Family Requests plan §7.2): the day she ticked it, kept while it stays ticked.
+    const done = el.querySelector('.xc-done')?.checked;
+    if (done) row.completed_date = row.completed_date || todayYMD();
+    else delete row.completed_date;
+    const box = document.querySelector(`#xc-rows .xc-steps[data-xc-for="${CSS.escape(el.dataset.xcId)}"]`);
+    if (box && Array.isArray(row.payments)) {
+      row.payments = row.payments.map((st) => {
+        const input = box.querySelector(`.xc-paid[data-step="${CSS.escape(st.id)}"]`);
+        return input ? stepWithPaidDate(st, input.value) : st;
+      });
+    }
+    return row;
+  });
+}
+
+function wireExtraCharges() {
+  document.getElementById('xc-add')?.addEventListener('change', (e) => {
+    const choice = e.target.value;
+    if (!choice) return;
+    ctx.draft = readForm();
+    const preset = priceList().find((p) => p.id === choice) || null;
+    // From the price list: where it came from, and its payment plan as dated steps.
+    const kennel = priceKennel();
+    const charge = preset
+      ? chargeFromPriceList(preset, { groups: kennelChargeGroups(kennel), approvalDate: todayYMD(), birthDate: ctx.dogsById.get(ctx.draft.dog_id)?.date_of_birth || null, openDays: businessDays(waitlistConfig(kennel)) })
+      : newExtraCharge();
+    ctx.draft.extra_charges = [...ctx.draft.extra_charges, charge];
+    renderEdit();
+    const labels = document.querySelectorAll('#xc-rows .xc-label');
+    if (!preset) labels[labels.length - 1]?.focus();
+  });
+  document.getElementById('xc-rows')?.addEventListener('click', (e) => {
+    const row = e.target.closest('[data-xc-remove]')?.closest('.xc-row');
+    if (!row) return;
+    ctx.draft = readForm();
+    ctx.draft.extra_charges = ctx.draft.extra_charges.filter((x) => x.id !== row.dataset.xcId);
+    renderEdit();
+  });
+}
+
+// After a save: the deposit was paid through an account set to charge its fee back
+// (Account.fee_charge_back), so offer to add that fee to the balance as an extra
+// charge. Asked once, when it first applies: a sale that already qualified before
+// this save (she said no then) isn't asked again.
+async function offerDepositFeeChargeBack(saved, before) {
+  if (!editionFlags.extraCharges) return saved;
+  const offerFor = (s) => s && depositFeeChargeBack(s, ctx.accountsById.get(s.deposit_paid_via_account_id), depositPaid(s));
+  const offer = offerFor(saved);
+  if (!offer || offerFor(before)) return saved;
+  const ok = await confirmModal({
+    title: `Add the ${offer.label.replace(/ fee$/, '')} fee to the balance?`,
+    message: `The deposit was paid through ${ctx.accountsById.get(saved.deposit_paid_via_account_id)?.name || 'an account'}, which took about ${fmtMoney(offer.amount)}. Add "${offer.label}" (${fmtMoney(offer.amount)}) as an extra charge? Fees charged back are collected with the final payment. You can change or remove it on the sale.`,
+    confirmLabel: 'Add it', cancelLabel: 'Skip'
+  });
+  if (!ok) return saved;
+  const extra_charges = [...saleExtraCharges(saved), { id: crypto.randomUUID(), ...offer }];
+  return saleRepo.update(saved.id, { extra_charges });
+}
+
+// --- Read-only view --------------------------------------------------------
+function row(label, valueHtml) {
+  return `<dt>${esc(label)}</dt><dd>${valueHtml || '<span class="faint">—</span>'}</dd>`;
+}
+
+function money(v) {
+  return v != null && v !== '' ? `$${Number(v).toFixed(2)}` : '';
+}
+
+function renderView() {
+  const s = ctx.original;
+  els.body.innerHTML = `
+    <dl class="dl-meta" style="margin-top:14px;">
+      ${row('Dog', dogRefHtml(s.dog_id, dogName(s.dog_id) || '—', ctx.dogsById.get(s.dog_id)?.is_archived))}
+      ${row('Buyer', editionFlags.contactsSection
+        ? `<a href="contact.html?id=${encodeURIComponent(s.buyer_contact_id)}">${esc(contactName(s.buyer_contact_id) || '—')}</a>`
+        : esc(contactName(s.buyer_contact_id) || '—'))}
+      ${row('Registration', badge(REGISTRATION_TYPE, s.registration_type))}
+      ${row('Status', badge(SALE_STATUS, s.status))}
+      ${s.end_reason ? row('Why it ended', esc(descriptor(SALE_END_REASON, s.end_reason).label)) : ''}
+      ${s.end_note ? row('About it', esc(s.end_note).replace(/\n/g, '<br>')) : ''}
+      ${row('Price', esc(money(s.price)))}
+      ${editionFlags.accounts && s.sales_channel_account_id ? row('Sold through', esc(ctx.accountsById.get(s.sales_channel_account_id)?.name || '—')) : ''}
+      ${editionFlags.accounts && s.deposit_paid_via_account_id ? row('Deposit paid via', esc(ctx.accountsById.get(s.deposit_paid_via_account_id)?.name || '—')) : ''}
+      ${editionFlags.accounts && s.balance_paid_via_account_id ? row('Balance paid via', esc(ctx.accountsById.get(s.balance_paid_via_account_id)?.name || '—')) : ''}
+      ${editionFlags.accounts && s.payment_link_url ? row('Payment link', `<a href="${esc(s.payment_link_url)}" target="_blank" rel="noopener noreferrer">One-time Stripe link</a>
+        <span class="muted">· ${esc(s.payment_link_component === 'deposit' ? 'deposit' : 'balance')}${s.payment_link_amount != null ? ` ${esc(fmtMoney(s.payment_link_amount))}` : ''}${s.payment_link_date ? ` · made ${esc(fmtDate(s.payment_link_date))}` : ''} · not paid yet</span>
+        <button type="button" class="btn btn-sm" data-pl-copy>Copy</button> <button type="button" class="btn btn-sm" data-pl-check>Check now</button>`) : ''}
+      ${s.processing_fee_amount != null && s.processing_fee_amount !== '' ? row('Processing fee', `${esc(money(s.processing_fee_amount))}${s.fee_passed_to_buyer ? ' <span class="muted">(passed to the buyer in the price)</span>' : ''}`) : ''}
+      ${s.processing_fee_amount != null && s.processing_fee_amount !== '' && s.price != null && s.price !== '' ? row('You net', esc(money(netOf(s.price, s.processing_fee_amount)))) : ''}
+      ${row('Deposit amount', esc(money(s.deposit_amount)))}
+      ${row('Transport fee', esc(money(s.transport_fee)))}
+      ${row('Deferred pickup boarding', s.deferred_boarding_amount != null && s.deferred_boarding_amount !== '' ? `${esc(money(s.deferred_boarding_amount))}${s.deferred_boarding_frequency ? ` per ${esc(s.deferred_boarding_frequency)}` : ''}${s.deferred_boarding_duration_days ? ` × ${esc(s.deferred_boarding_duration_days)}` : ''}` : '')}
+      ${saleExtraCharges(s).length ? row('Extra charges', saleExtraCharges(s).map((x) => `${esc(x.label)} <span class="muted">${esc(money(x.amount))}</span>${(x.payments || []).map((st) => `<br><span class="faint" style="margin-left:12px;">${esc(`${st.percent}% · ${money(st.amount)}`)} · ${st.paid_date ? `paid ${esc(fmtDate(st.paid_date))}` : st.due_date ? `due ${esc(fmtDate(st.due_date))}` : st.due === 'before_pickup' ? `due ${st.n || 0} days before pickup` : 'due with the balance'}</span>`).join('')}`).join('<br>')) : ''}
+      ${row('Sale date', s.sale_date ? esc(fmtDate(s.sale_date)) : '')}
+      ${row('Deposit date', s.deposit_date ? esc(fmtDate(s.deposit_date)) : '')}
+      ${hasSchedule(s)
+        ? row('Final payment due', (finalDueDate(ctx.statement) || s.balance_due_date) ? `${esc(fmtDate(finalDueDate(ctx.statement) || s.balance_due_date))} <span class="faint">(payment schedule)</span>` : '<span class="faint">Not known yet (payment schedule)</span>')
+        : row('Balance due date', s.balance_due_date ? esc(fmtDate(s.balance_due_date)) : '')}
+      ${row('Balance paid date', s.balance_paid_date ? esc(fmtDate(s.balance_paid_date)) : '')}
+      ${row('Lead source', esc(s.lead_source))}
+      ${editionFlags.contactsSection ? row('Referred by', s.referred_by_contact_id
+        ? `<a href="contact.html?id=${encodeURIComponent(s.referred_by_contact_id)}">${esc(contactName(s.referred_by_contact_id) || '—')}</a>`
+        : '') : ''}
+      ${row('Notes', s.notes ? esc(s.notes).replace(/\n/g, '<br>') : '')}
+    </dl>`;
+}
+
+// --- Edit form ---------------------------------------------------------
+
+// Why a voided or returned sale ended (vocab SALE_END_REASON): required for those
+// two statuses, and hidden for every other. Voided = it fell through on your side
+// (the pup died or can't be sold); Cancelled = the buyer backed out; Returned = the
+// pup came back after going home.
+function endReasonFields(s) {
+  const reasons = saleEndReasonsFor(s.status);
+  if (!reasons.length) return '';
+  const hint = s.status === 'voided'
+    ? 'Voided: the sale fell through on your side, not the buyer\'s. Nothing on it counts as income. (A buyer backing out is Cancelled.)'
+    : 'Returned: the pup came back after going home.';
+  return `${field('Why it ended', `<select id="f-end_reason">${vocabOptions(reasons, s.end_reason, 'Select…')}</select>`, { required: true, hint })}
+      ${field('About it', `<input id="f-end_note" type="text" value="${esc(s.end_note)}" placeholder="e.g. what the vet found">`)}`;
+}
+// The chosen buyer against her do-not-sell list (K7-9): only a warning, as everywhere.
+function buyerDoNotSellText(contactId) {
+  const c = contactId ? ctx.contactsById.get(contactId) : null;
+  if (!c || !ctx.doNotSell.length) return '';
+  return doNotSellWarning(doNotSellMatches({ name: c.name, email: c.email, phone: c.phone }, ctx.doNotSell, { contactId: c.id }));
+}
+function buyerDoNotSellHtml(contactId) {
+  const warn = buyerDoNotSellText(contactId);
+  return warn ? `<div class="inline-warn field-wide" role="status">${esc(/[.!?]$/.test(warn) ? warn : `${warn}.`)} You can still record the sale.</div>` : '';
+}
+
+function field(label, inner, { required = false, hint = '', wide = false } = {}) {
+  return `<div class="field${wide ? ' field-wide' : ''}">
+    <label>${esc(label)}${required ? ' <span class="req">*</span>' : ''}</label>
+    ${inner}
+    ${hint ? `<span class="field-hint">${esc(hint)}</span>` : ''}
+  </div>`;
+}
+
+function renderEdit() {
+  const s = ctx.draft;
+  const sourceList = ctx.leadSources.map((v) => `<option value="${esc(v)}"></option>`).join('');
+  els.body.innerHTML = `
+    <div class="form-grid" id="sale-form" style="margin-top:14px;">
+      ${field('Dog', `<select id="f-dog_id">${dogOptions(s.dog_id)}</select>`, { required: true })}
+      ${field('Buyer', `<select id="f-buyer_contact_id">${contactOptions(s.buyer_contact_id)}</select>`, { required: true })}
+      ${buyerDoNotSellHtml(s.buyer_contact_id)}
+      ${field('Registration', `<select id="f-registration_type">${vocabOptions(REGISTRATION_TYPE, s.registration_type, 'Select…')}</select>`, { required: true, hint: 'Full adds the litter\'s Full-registration surcharge to a prefilled price.' })}
+      ${field('Status', `<select id="f-status">${vocabOptions(SALE_STATUS, s.status, 'Select…')}</select>`, { required: true })}
+      ${endReasonFields(s)}
+      ${field('Price', `<input id="f-price" type="number" min="0" step="0.01" value="${esc(s.price)}">`)}
+      ${feeFields(s)}
+      ${field('Deposit amount', `<input id="f-deposit_amount" type="number" min="0" step="0.01" value="${esc(s.deposit_amount)}">`)}
+      ${field('Transport fee', `<input id="f-transport_fee" type="number" min="0" step="0.01" value="${esc(s.transport_fee)}">`)}
+      ${field('Deferred pickup boarding', `<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <input id="f-deferred_boarding_amount" type="number" min="0" step="0.01" value="${esc(s.deferred_boarding_amount)}" style="flex:1; min-width:90px;">
+          <span class="faint">per</span>
+          <select id="f-deferred_boarding_frequency" style="flex:1; min-width:90px;">${frequencyOptions(s.deferred_boarding_frequency)}</select>
+          <span class="faint">×</span>
+          <input id="f-deferred_boarding_duration_days" type="text" placeholder="count" value="${esc(s.deferred_boarding_duration_days)}" style="flex:1; min-width:70px;">
+        </div>`, { hint: 'A boarding rate for a buyer who delayed pickup — the count is the number of frequency units (e.g. 2 = 2 weeks). A plain rate, not a Financials cost.' })}
+      ${extraChargesField(s)}
+      ${field('Sale date', `<input id="f-sale_date" type="date" value="${esc(s.sale_date)}">`)}
+      ${field('Deposit date', `<input id="f-deposit_date" type="date" value="${esc(s.deposit_date)}">`)}
+      ${hasSchedule(s)
+        ? field('Final payment due', `<div style="padding:8px 0;">${(finalDueDate(ctx.statement) || s.balance_due_date) ? esc(fmtDate(finalDueDate(ctx.statement) || s.balance_due_date)) : 'Not known yet'}</div>`, { hint: 'This sale has a payment schedule: change its dates with Edit the schedule, under Payments.' })
+        : field('Balance due date', `<input id="f-balance_due_date" type="date" value="${esc(s.balance_due_date)}">`)}
+      ${field('Balance paid date', `<input id="f-balance_paid_date" type="date" value="${esc(s.balance_paid_date)}">`)}
+      ${field('Lead source', `<input id="f-lead_source" type="text" list="lead-source-list" value="${esc(s.lead_source)}"><datalist id="lead-source-list">${sourceList}</datalist>`, { hint: 'How this specific sale came in. Prefills from the buyer, but may differ.' })}
+      ${editionFlags.contactsSection ? field('Referred by', `<select id="f-referred_by_contact_id">${contactOptions(s.referred_by_contact_id)}</select>`, { hint: 'The contact who referred this buyer. Tags them as a Buyer referrer automatically.' }) : ''}
+      ${editionFlags.includeArchivedToggles ? `<div class="field field-wide">
+        <label class="check-inline"><input id="picker-archived" type="checkbox"${ctx.pickerArchived ? ' checked' : ''}> Include archived dogs/contacts in the pickers above</label>
+      </div>` : ''}
+      ${isScoped() ? `<div class="field field-wide">
+        <label class="check-inline"><input id="picker-all-kennels" type="checkbox"${ctx.pickerAllKennels ? ' checked' : ''}> Show dogs from all my kennels</label>
+        <span class="field-hint">Off by default while a kennel is active. The sale is filed under the kennel of the dog you pick.</span>
+      </div>` : ''}
+      ${field('Notes', `<textarea id="f-notes">${esc(s.notes)}</textarea>`, { wide: true })}
+    </div>`;
+
+  wireFeeFields();
+  wireExtraCharges();
+  document.getElementById('picker-archived')?.addEventListener('change', (e) => {
+    ctx.draft = readForm();
+    ctx.pickerArchived = e.target.checked;
+    renderEdit();
+  });
+  document.getElementById('picker-all-kennels')?.addEventListener('change', (e) => {
+    ctx.draft = readForm();
+    ctx.pickerAllKennels = e.target.checked;
+    renderEdit();
+  });
+  // Voided/Returned need a reason; the reason fields come and go with the status.
+  document.getElementById('f-status').addEventListener('change', () => {
+    ctx.draft = readForm();
+    renderEdit();
+  });
+  // Prefilling price/deposit_amount from the selected dog's litter (only when
+  // those fields are still empty, so it never clobbers a deliberate entry).
+  document.getElementById('f-dog_id').addEventListener('change', () => {
+    ctx.draft = readForm();
+    applyExpectedPricing();
+    applySuggestedFee();
+    renderEdit();
+  });
+  // A registration change asks whether the price follows (decided 2026-10-11):
+  // the Full surcharge comes or goes on top of the price as it stands, so a
+  // discount she gave stays (saleDefaults.priceForRegistrationChange).
+  document.getElementById('f-registration_type').addEventListener('change', async () => {
+    const was = ctx.draft.registration_type;
+    ctx.draft = readForm();
+    const dog = ctx.dogsById.get(ctx.draft.dog_id);
+    const litter = dog && dog.litter_id ? ctx.littersById.get(dog.litter_id) : null;
+    if (litter) {
+      const change = priceForRegistrationChange(dog, litter, ctx.draft.price, was, ctx.draft.registration_type);
+      const price = await askRegistrationPrice(change, was, ctx.draft.registration_type);
+      if (price != null) ctx.draft.price = price;
+    }
+    applySuggestedFee();
+    renderEdit();
+  });
+  // Prefilling lead_source from the buyer's first_contact_source (only when
+  // lead_source is still empty, so it never clobbers a deliberate choice) —
+  // Stage4 Revision v2 §3.
+  document.getElementById('f-buyer_contact_id').addEventListener('change', (e) => {
+    ctx.draft = readForm();
+    const c = ctx.contactsById.get(e.target.value);
+    if (c && c.first_contact_source && !ctx.draft.lead_source) {
+      ctx.draft.lead_source = c.first_contact_source;
+    }
+    renderEdit();
+  });
+  const onNewContact = (contact) => {
+    ctx.allContacts.push(contact);
+    ctx.contactsById.set(contact.id, contact);
+  };
+  attachNewContactButton(document.getElementById('f-buyer_contact_id'), { onCreated: onNewContact });
+  const referredByEl = document.getElementById('f-referred_by_contact_id');
+  if (referredByEl) attachNewContactButton(referredByEl, { onCreated: onNewContact });
+}
+
+function readForm() {
+  const val = (id) => document.getElementById(id)?.value ?? '';
+  return {
+    ...ctx.draft,
+    dog_id: val('f-dog_id') || '',
+    buyer_contact_id: val('f-buyer_contact_id') || '',
+    registration_type: val('f-registration_type'),
+    status: val('f-status'),
+    sale_date: val('f-sale_date'),
+    price: val('f-price'),
+    deposit_amount: val('f-deposit_amount'),
+    deposit_date: val('f-deposit_date'),
+    // With a payment schedule the box isn't shown (its dates are the schedule's): keep it.
+    balance_due_date: document.getElementById('f-balance_due_date') ? val('f-balance_due_date') : (ctx.draft.balance_due_date || ''),
+    balance_paid_date: val('f-balance_paid_date'),
+    transport_fee: val('f-transport_fee'),
+    deferred_boarding_amount: val('f-deferred_boarding_amount'),
+    deferred_boarding_frequency: val('f-deferred_boarding_frequency'),
+    deferred_boarding_duration_days: val('f-deferred_boarding_duration_days').trim(),
+    lead_source: val('f-lead_source').trim(),
+    referred_by_contact_id: val('f-referred_by_contact_id') || null,
+    end_reason: val('f-end_reason') || null,
+    end_note: val('f-end_note').trim() || null,
+    // Lite has no channel picker: a channel set elsewhere is kept as it was.
+    sales_channel_account_id: document.getElementById('f-sales_channel_account_id')
+      ? val('f-sales_channel_account_id') || null
+      : ctx.draft.sales_channel_account_id || null,
+    // How each payment is taken (Pro); Lite keeps whatever was set elsewhere.
+    deposit_paid_via_account_id: document.getElementById('f-deposit_paid_via_account_id')
+      ? val('f-deposit_paid_via_account_id') || null
+      : ctx.draft.deposit_paid_via_account_id || null,
+    balance_paid_via_account_id: document.getElementById('f-balance_paid_via_account_id')
+      ? val('f-balance_paid_via_account_id') || null
+      : ctx.draft.balance_paid_via_account_id || null,
+    processing_fee_amount: val('f-processing_fee_amount'),
+    fee_passed_to_buyer: !!document.getElementById('f-fee_passed_to_buyer')?.checked,
+    // Extra charges (Pro); Lite keeps whatever was set elsewhere.
+    extra_charges: document.getElementById('xc-rows')
+      ? readExtraChargeRows()
+      : (Array.isArray(ctx.draft.extra_charges) ? ctx.draft.extra_charges : []),
+    notes: val('f-notes')
+  };
+}
+
+// Empty numeric strings become null.
+function normalizeMoney(candidate) {
+  for (const k of ['price', 'deposit_amount', 'transport_fee', 'deferred_boarding_amount', 'processing_fee_amount']) {
+    candidate[k] = candidate[k] === '' || candidate[k] == null ? null : Number(candidate[k]);
+  }
+  // Duration is a free-text field (e.g. "10-14"), not a number — only the
+  // empty-string-to-null normalization applies.
+  candidate.deferred_boarding_duration_days = candidate.deferred_boarding_duration_days || null;
+  return candidate;
+}
+
+// --- Actions -------------------------------------------------------------
+function renderProfileActions() {
+  if (ctx.mode === 'view') {
+    els.profileActions.innerHTML = `<button class="btn btn-sm" id="btn-edit">Edit</button>`;
+    document.getElementById('btn-edit').onclick = enterEdit;
+  } else {
+    els.profileActions.innerHTML = `
+      <button class="btn btn-primary btn-sm" id="btn-save">Save</button>
+      <button class="btn btn-sm" id="btn-cancel">Cancel</button>`;
+    document.getElementById('btn-save').onclick = save;
+    document.getElementById('btn-cancel').onclick = cancel;
+  }
+}
+
+async function renderHeaderActions() {
+  els.headerActions.innerHTML = '';
+  if (ctx.mode === 'new' || !ctx.original) return;
+  const s = ctx.original;
+  const archiveLabel = s.is_archived ? 'Unarchive' : 'Archive';
+  const blockers = await saleRepo.getDeleteBlockers(s.id);
+  const delTitle = blockers.length
+    ? 'Referenced as ' + blockers.map((b) => `${b.label} (${b.count})`).join(', ') + ' — archive instead.'
+    : 'Permanently delete this record.';
+  const puppyRecordBtn = editionFlags.puppyRecord
+    ? `<a class="btn btn-sm" id="btn-puppy-record" href="puppy-record.html?sale=${encodeURIComponent(s.id)}">Puppy Record (PDF)</a>`
+    : '';
+  // Invoice / Receipt for THIS sale without a trip to Financials (Pro-only, like
+  // the Financials generator it opens; Lite never loads the module).
+  const invoiceBtn = editionFlags.invoicing
+    ? '<button class="btn btn-sm" id="btn-invoice">Invoice / Receipt</button>'
+    : '';
+  // Her own payment link (Integrations plan §4, Pro: it lives on an Account),
+  // while the sale is still open.
+  const payBtn = editionFlags.accounts && isOpenSale(s)
+    ? '<button class="btn btn-sm" id="btn-pay-link">Send payment link</button>'
+    : '';
+  // A family page without the list (E3, Pro with the waitlist): her link to this sale's
+  // family page, or the way to give them one.
+  const famPage = editionFlags.waitlist ? await familyPageFor(s) : null;
+  const famBtn = famPage?.entry
+    ? `<a class="btn btn-sm" href="waitlist-entry.html?id=${encodeURIComponent(famPage.entry.id)}">${famPage.entry.off_list ? 'Family page' : 'Waitlist family'}</a>`
+    : famPage?.can ? '<button class="btn btn-sm" id="btn-family-page" title="Their own status page (pickup times, extras, the puppy portal link, your messages) without being on the waitlist">Give this family a status page</button>' : '';
+  // Her puppy portal before the contract is signed (Pro with a KennelPort website
+  // whose portal is on): Start it now, or say it was started.
+  const early = editionFlags.websiteLink
+    ? earlyPortalState({ kennel: await kennelRepo.getById(s.kennel_id), sale: s, contracts: await contractRepo.getBySale(s.id) })
+    : null;
+  const earlyBtn = early === 'offer'
+    ? '<button class="btn btn-sm" id="btn-portal-early" title="Their puppy portal before the contract is signed; its signed date fills in once it is">Start puppy portal now</button>'
+    : early === 'started' ? `<span class="badge badge-blue" title="Started ${esc(fmtDate(s.portal_early_on))}. The contract's signed date fills in once it's signed.">Puppy portal started early</span>` : '';
+  els.headerActions.innerHTML = `
+    ${earlyBtn}
+    ${famBtn}
+    ${payBtn}
+    ${invoiceBtn}
+    ${puppyRecordBtn}
+    <button class="btn btn-sm" id="btn-archive">${archiveLabel}</button>
+    <button class="btn btn-danger btn-sm" id="btn-delete"${blockers.length ? ' disabled' : ''} title="${esc(delTitle)}">Delete</button>`;
+  document.getElementById('btn-archive').onclick = toggleArchive;
+  const inv = document.getElementById('btn-invoice');
+  if (inv) {
+    inv.onclick = async () => {
+      try {
+        const { openInvoiceGenerator } = await import('../assets/invoiceGenerator.js');
+        await openInvoiceGenerator({ preselect: { source: 'sale', id: s.id } });
+      } catch (err) { showError(err.message || String(err)); }
+    };
+  }
+  const pay = document.getElementById('btn-pay-link');
+  if (pay) {
+    pay.onclick = async () => {
+      clearError();
+      try {
+        const { openPaymentRequest } = await import('../assets/paymentRequestUI.js');
+        // Paying through an account fills an empty Sold / paid through: show it.
+        if (await openPaymentRequest({ saleId: s.id }) && ctx.mode === 'view') {
+          ctx.original = await saleRepo.getById(s.id);
+          renderAll();
+        }
+      } catch (err) { showError(err.message || String(err)); }
+    };
+  }
+  const earlyEl = document.getElementById('btn-portal-early');
+  if (earlyEl) {
+    earlyEl.onclick = async () => {
+      clearError();
+      try {
+        if (await startPortalEarly(s, { buyer: contactName(s.buyer_contact_id), pup: ctx.dogsById.get(s.dog_id)?.call_name })) {
+          ctx.original = await saleRepo.getById(s.id);
+          renderAll();
+        }
+      } catch (err) { showError(err.message || String(err)); }
+    };
+  }
+  const fam = document.getElementById('btn-family-page');
+  if (fam) {
+    fam.onclick = async () => {
+      clearError();
+      try {
+        const { addFamilyPage } = await import('../data/waitlistActions.js');
+        const buyer = contactName(s.buyer_contact_id) || 'This family';
+        const warn = ctx.doNotSell.length ? buyerDoNotSellText(s.buyer_contact_id) : '';
+        if (!(await confirmModal({ title: 'Give this family a status page?', message: `This gives ${buyer} their own status page, with their pickup times, extras, the puppy portal link and your messages. They aren't put on the waitlist and show on no list.${warn ? `\n\n${warn}` : ''}\n\nPublish your list (Waitlist, Publish list) to make their link.`, confirmLabel: 'Make their page' }))) return;
+        const entry = await addFamilyPage(s.id);
+        location.href = `waitlist-entry.html?id=${encodeURIComponent(entry.id)}`;
+      } catch (err) { showError(err.message || String(err)); }
+    };
+  }
+  const del = document.getElementById('btn-delete');
+  if (!blockers.length) del.onclick = doDelete;
+}
+
+// This sale's waitlist record (one claiming it), or whether it can be given a family
+// page: { entry } | { can: true } | null.
+async function familyPageFor(s) {
+  const dog = ctx.dogsById.get(s.dog_id);
+  const litter = dog?.litter_id ? ctx.littersById.get(dog.litter_id) : null;
+  const kennelId = litter?.kennel_id || s.kennel_id || null;
+  if (!kennelId) return null;
+  const [{ waitlistEntryRepo }, { waitlistOfferRepo }, { familyPageBlocker }] = await Promise.all([
+    import('../data/waitlistEntryRepo.js'), import('../data/waitlistOfferRepo.js'), import('../data/waitlistRules.js')
+  ]);
+  const [entries, offers] = await Promise.all([waitlistEntryRepo.getByKennel(kennelId), waitlistOfferRepo.getByKennel(kennelId)]);
+  const entry = entries.find((e) => !e.is_archived && e.placed_sale_id === s.id);
+  if (entry) return { entry };
+  return familyPageBlocker(s, entries, offers) ? null : { can: true };
+}
+
+function showError(msg) {
+  els.error.innerHTML = `<div class="inline-error">${esc(msg)}</div>`;
+  els.error.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function clearError() { els.error.innerHTML = ''; }
+// A friendly line in the same spot (not an error).
+function showNotice(msg) {
+  els.error.innerHTML = `<div class="inline-notice">${esc(msg)}</div>`;
+}
+
+function enterEdit() {
+  clearError();
+  ctx.mode = 'edit';
+  ctx.draft = { ...ctx.original };
+  ctx.suggestedFee = null; // a stored fee is hers: it never follows the price
+  renderEdit();
+  renderProfileActions();
+  renderContractsSection();
+  renderPaymentsSection();
+}
+
+function cancel() {
+  clearError();
+  if (ctx.mode === 'new') { location.href = 'sales.html'; return; }
+  ctx.mode = 'view';
+  renderView();
+  renderProfileActions();
+  renderContractsSection();
+  renderPaymentsSection();
+}
+
+// Soft prompt on the Delivered transition (Enhancements Batch #7): offer to
+// update the sold dog's ownership to reflect it has left the program.
+// "External"/"Co-owned" are OWNERSHIP_TYPE values, not DOG_STATUS values — this
+// edits dog.ownership_type (and, for External, may also set status to
+// external_reference). Optional/warn-don't-block: the sale is already saved by
+// the time this shows, and a skipped/failed update never blocks anything.
+// Resolves once the modal is dismissed, so callers can sequence it.
+function promptOwnershipUpdate(sale) {
+  return new Promise((resolve) => {
+    const dogLabel = dogName(sale.dog_id) || 'this dog';
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal" role="dialog" aria-modal="true">
+      <h2 style="margin-top:0;">Sale delivered — update ${esc(dogLabel)}'s ownership?</h2>
+      <div class="field">
+        <label>Ownership</label>
+        <select id="own-choice">
+          <option value="">— leave unchanged —</option>
+          <option value="external">External</option>
+          <option value="co_owned">Co-owned</option>
+        </select>
+      </div>
+      <div class="field" id="own-owner-field" hidden>
+        <label>Owner</label>
+        <select id="own-owner">${contactOptions(sale.buyer_contact_id)}</select>
+      </div>
+      <div id="own-error"></div>
+      <div class="form-actions">
+        <button class="btn btn-primary" id="own-confirm">Confirm</button>
+        <button class="btn" id="own-skip">Skip</button>
+      </div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const close = () => { overlay.remove(); resolve(); };
+    overlay.querySelector('#own-skip').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    const choiceSelect = overlay.querySelector('#own-choice');
+    const ownerField = overlay.querySelector('#own-owner-field');
+    // Owner is the single owner_contact_id field, which only applies to
+    // External — Co-owned adds the buyer to co_owner_contact_ids instead
+    // (handled below without needing a picker; owner_contact_id there stays
+    // whoever it already was, typically the breeder).
+    choiceSelect.addEventListener('change', () => {
+      ownerField.hidden = choiceSelect.value !== 'external';
+    });
+    overlay.querySelector('#own-confirm').addEventListener('click', async () => {
+      const choice = choiceSelect.value;
+      if (!choice) { close(); return; }
+      try {
+        // Re-fetch: the co-own convenience above may have just updated this dog.
+        const dog = await dogRepo.getById(sale.dog_id);
+        const updates = deliveredOwnershipChanges(dog, choice, {
+          ownerId: choice === 'external' ? overlay.querySelector('#own-owner').value || null : null,
+          buyerId: sale.buyer_contact_id, today: todayYMD()
+        });
+        if (updates) await dogRepo.update(sale.dog_id, updates);
+        close();
+      } catch (e) {
+        overlay.querySelector('#own-error').innerHTML = `<div class="inline-error">${esc(e.message || String(e))}</div>`;
+      }
+    });
+  });
+}
+
+// Lite's delivery-departure (cap spec §5): on the transition into Delivered,
+// offer to remove the sold dog (or sold puppy) from the roster. This is the Lite
+// exit that replaces the Pro ownership→External prompt — archiving is the only
+// way a dog leaves the roster in Lite, always gated by the blocking "permanent"
+// confirm. Declining keeps the dog. The Sale record and pedigree survive either
+// way (archive is a soft delete). A pup never counted toward the cap, so this is
+// roster tidiness for pups and a genuine slot-free for a sold adult.
+async function promptDepartOnDelivery(sale) {
+  const dog = await dogRepo.getById(sale.dog_id);
+  if (!dog || dog.is_archived) return;
+  const dogLabel = dog.call_name || 'this dog';
+  const ok = await confirmModal({
+    title: `Remove “${dogLabel}” from your program?`,
+    message: `This sale is delivered. This can't be undone here — ${dogLabel} leaves your roster and you won't be able to edit it or bring it back. It stays in your dogs' pedigrees and this Sale record for history.`,
+    confirmLabel: 'Remove permanently',
+    cancelLabel: 'Keep on roster',
+    danger: true,
+  });
+  if (ok) await dogRepo.archive(sale.dog_id);
+}
+
+// --- Sale-specific prompt helpers ----------------------------------------
+// Opens the shared event modal and resolves once it's saved or dismissed, so the
+// post-save sequence can await it before navigating/re-rendering.
+function openEventFormAwait(opts) {
+  return new Promise((resolve) => {
+    openEventForm({ ...opts, onSaved: () => resolve(true), onCancel: () => resolve(false) });
+  });
+}
+
+// Guards against a rapid double-tap/double-click firing save() twice before
+// the first call's await chain has a chance to disable anything itself —
+// each call would otherwise run to completion independently, e.g. creating
+// two sales from one "Save" tap.
+async function save() {
+  const btn = document.getElementById('btn-save');
+  if (btn?.disabled) return;
+  if (btn) btn.disabled = true;
+  try {
+    await doSave();
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function doSave() {
+  clearError();
+  const candidate = normalizeMoney(readForm());
+  const isNew = ctx.mode === 'new';
+  const prevStatus = isNew ? null : ctx.original.status;
+  if (saleEndReasonsFor(candidate.status).length && !candidate.end_reason) {
+    showError(`Choose why the sale was ${descriptor(SALE_STATUS, candidate.status).label.toLowerCase()}.`);
+    return;
+  }
+  if (document.getElementById('xc-rows')) {
+    const { list, error } = readExtraCharges(candidate.extra_charges);
+    if (error) { showError(error); return; }
+    candidate.extra_charges = list;
+  }
+  // Cancelled on a waitlist family's open sale is their back-out: the rest of the form
+  // saves now, and the back-out confirm (after the save) cancels the sale and decides
+  // their place, so they're never left Placed on a cancelled sale.
+  let backOut = null;
+  if (!isNew && editionFlags.waitlist && candidate.status === 'cancelled' && prevStatus !== 'cancelled' && saleRepo.isOpenSale(ctx.original)) {
+    const { backOutEntryFor } = await import('../data/waitlistActions.js');
+    backOut = await backOutEntryFor(ctx.original.id);
+    if (backOut) candidate.status = prevStatus;
+  }
+  try {
+    if (isNew) {
+      // Kennel scope (Multi-Kennel Scope Spec §6): the sale files under the kennel
+      // of the dog being placed, so a kennel-B dog sold while scoped to kennel A
+      // still belongs to B.
+      candidate.kennel_id = await resolveKennelIdForWrite({
+        inheritFrom: ctx.dogsById.get(candidate.dog_id)
+      });
+    }
+    let saved = isNew
+      ? await saleRepo.create(candidate)
+      : await saleRepo.update(ctx.original.id, candidate);
+
+    // --- Post-save prompt sequence: each awaits the previous, all optional
+    // (a Skip never blocks the save that already happened above). ---
+
+    saved = await offerDepositFeeChargeBack(saved, isNew ? null : ctx.original);
+
+    // A transport fee, boarding or an extra just added (Payment Schedule plan D17):
+    // show the schedule and ask whether to adjust it. Never changes it by itself.
+    await askAboutNewFees({ before: isNew ? null : ctx.original, after: saved, savedList: savedSchedules(await saleKennel(saved)) });
+
+    // A stay extra (a training package) or boarding just added: offer the stay and the
+    // pickup the day after it (goHome.stayPickupPlan). Only on a sale still under way.
+    const stays = isOpenSale(saved) ? addedStays(isNew ? null : ctx.original, saved) : null;
+    if (stays) await offerStayAndPickup({ sale: saved, ...stays });
+
+    // Co-own placement convenience (Data Model v3 §5.6): pairs naturally with
+    // adding the buyer to the dog's co_owner_contact_ids — never automatic.
+    if (saved.registration_type === 'co_own') {
+      const dog = await dogRepo.getById(saved.dog_id);
+      if (dog && !(dog.co_owner_contact_ids || []).includes(saved.buyer_contact_id)) {
+        const ok = await confirmModal({
+          title: 'Add buyer as a co-owner?',
+          message: 'This is a co-own placement. Also add the buyer as a co-owner of this dog?',
+          cancelLabel: 'Skip'
+        });
+        if (ok) await dogRepo.update(dog.id, { co_owner_contact_ids: [...(dog.co_owner_contact_ids || []), saved.buyer_contact_id] });
+      }
+    }
+
+    // Fires only on the transition INTO delivered. In Pro this offers to mark the
+    // sold dog's ownership External/Co-owned (External also flips status to
+    // external_reference). Lite has no external ownership, and its dogs leave the
+    // program by DEPARTURE (archive) instead (cap spec §5) — so Lite runs the
+    // "remove from program" prompt here, which also archives sold puppies.
+    if (saved.status === 'delivered' && prevStatus !== 'delivered') {
+      if (editionFlags.externalOwnership) await promptOwnershipUpdate(saved);
+      else await promptDepartOnDelivery(saved);
+    }
+
+    // Any new sale → offer to update the dog's disposition, defaulting to Placed.
+    if (isNew) {
+      await promptDisposition(saved, {
+        title: 'Update this dog’s disposition?',
+        message: 'A sale was just recorded for this dog.',
+        defaultValue: 'placed'
+      });
+    }
+
+    // Editing a sale into Returned/Cancelled/Voided → settle the pup first (record
+    // its death, or set its disposition back — Available, or Health hold for a
+    // health reason), then, for a waitlist family's lost pup, offer to put them back
+    // in line (Waitlist Spec §16.11). The pup goes first so a dead or held pup is
+    // never offered to anyone.
+    if (backOut) {
+      const { backOutDialog } = await import('../assets/waitlistUI.js');
+      const done = await backOutDialog({ entryId: backOut.id });
+      saved = await saleRepo.getById(saved.id);
+      if (!done) await alertModal({ title: 'Not cancelled', message: 'The sale wasn\'t cancelled: they\'re a waitlist family, so a back-out is recorded through that confirm. Your other changes are saved.' });
+    } else if (!isNew && RELEASED_SALE_STATUSES.includes(saved.status) && prevStatus !== saved.status) {
+      await promptReleasedPup(saved, { onError: showError });
+      if (editionFlags.waitlist && restoresFamily(saved)) {
+        const { restoreLostPupDialog } = await import('../assets/waitlistUI.js');
+        await restoreLostPupDialog({ saleId: saved.id, asStatus: prevStatus });
+      }
+    }
+
+    // All three deferred-pickup fields set → offer to schedule a boarding event.
+    const hasDeferred = saved.deferred_boarding_amount != null && saved.deferred_boarding_amount !== ''
+      && !!saved.deferred_boarding_frequency && !!saved.deferred_boarding_duration_days;
+    if (hasDeferred) {
+      const ok = await confirmModal({
+        title: 'Schedule a boarding event?',
+        message: 'This sale has a deferred pickup boarding rate. Schedule a boarding event for it?',
+        cancelLabel: 'Skip'
+      });
+      if (ok) {
+        await openEventFormAwait({
+          subjectType: 'dog', subjectId: saved.dog_id,
+          prefill: { event_type: 'boarding', title: 'Deferred pickup boarding' }
+        });
+      }
+    }
+
+    // Soft-suggestion prompt (Stage4.5 Addendum §D4) — only on the transition
+    // INTO a prompt-worthy status, so re-saving an already-delivered sale
+    // doesn't re-nag.
+    if (PLACEMENT_PROMPT_STATUSES.includes(saved.status) && prevStatus !== saved.status) {
+      const ok = await confirmModal({
+        title: 'Log a scheduled pickup for this placement?',
+        confirmLabel: 'Log', cancelLabel: 'Skip'
+      });
+      if (ok) {
+        await openEventFormAwait({
+          subjectType: 'dog', subjectId: saved.dog_id,
+          prefill: { event_type: 'placement', related_contact_id: saved.buyer_contact_id, title: 'Puppy pickup' }
+        });
+      }
+    }
+
+    // The sale that finished the litter: delivered (or released) with no pup left
+    // Available or Undecided and no other sale open → offer to close the litter
+    // right here, where she's looking (data/litterCheckin.js litterCloseDue, the
+    // same rule as Today's nudge and Kels's check-in). Only on the transition.
+    if (TERMINAL_SALE_STATUSES.includes(saved.status) && prevStatus !== saved.status) {
+      await promptCloseLitter(saved);
+    }
+
+    // Finish: navigate (new) or re-render in place (edit).
+    if (isNew) { location.href = `sale.html?id=${encodeURIComponent(saved.id)}`; return; }
+    ctx.original = saved;
+    ctx.mode = 'view';
+    await loadRefs();
+    ctx.original = await saleRepo.getById(saved.id);
+    renderAll();
+  } catch (e) {
+    showError(e.message || String(e));
+  }
+}
+
+async function promptCloseLitter(sale) {
+  const dog = await dogRepo.getById(sale.dog_id);
+  const litter = dog?.litter_id ? await litterRepo.getById(dog.litter_id) : null;
+  if (!litter) return;
+  const all = await dogRepo.getByLitter(litter.id);
+  const pups = all.filter((d) => !d.is_archived && d.status !== 'deceased');
+  const sales = (await Promise.all(all.map((d) => saleRepo.getByDog(d.id)))).flat();
+  if (!litterCloseDue(litter, pups, sales)) return;
+  const [dam, sire] = await Promise.all([dogRepo.getById(litter.dam_id), dogRepo.getById(litter.sire_id)]);
+  const name = litterLabel(litter, new Map([dam, sire].filter(Boolean).map((d) => [d.id, d])));
+  const ok = await confirmModal({
+    title: `Close ${name}?`,
+    message: `${sale.status === 'delivered' ? 'That was the last puppy to go home. ' : ''}No puppy is available or undecided, and every sale on the litter is finished. Closing marks the litter done; you can reopen it any time.`,
+    confirmLabel: 'Close the litter',
+    cancelLabel: 'Not now'
+  });
+  if (ok) await litterRepo.update(litter.id, { status: 'closed' });
+}
+
+async function toggleArchive() {
+  const s = ctx.original;
+  const verb = s.is_archived ? 'Unarchive' : 'Archive';
+  const ok = await confirmModal({ title: `${verb} this sale?`, confirmLabel: verb, cancelLabel: 'Cancel' });
+  if (!ok) return;
+  ctx.original = s.is_archived ? await saleRepo.unarchive(s.id) : await saleRepo.archive(s.id);
+  renderAll();
+}
+
+async function doDelete() {
+  const s = ctx.original;
+  const ok = await confirmModal({
+    title: 'Delete this sale?',
+    message: 'Permanently delete this sale? This cannot be undone.',
+    confirmLabel: 'Delete', cancelLabel: 'Cancel', danger: true
+  });
+  if (!ok) return;
+  try {
+    await saleRepo.hardDelete(s.id);
+    location.href = 'sales.html';
+  } catch (e) {
+    if (e instanceof ReferenceBlockedError) { showError(e.message); await renderHeaderActions(); }
+    else showError(e.message || String(e));
+  }
+}
+
+// --- Contracts panel (derived) --------------------------------------------
+async function renderContractsSection() {
+  if (!els.contracts) return;
+  if (!editionFlags.contracts) { els.contracts.innerHTML = ''; return; } // Pro-only in Lite
+  if (ctx.mode !== 'view' || !ctx.original) { els.contracts.innerHTML = ''; return; }
+  const contracts = await contractRepo.getBySale(ctx.original.id);
+  contracts.sort((a, b) => (b.signed_date || b.created_at || '').localeCompare(a.signed_date || a.created_at || ''));
+
+  // Derived governing-contract line (Stage4.5 Addendum §A2) — proves invariant
+  // #8 (the "live contract" is derived, never a stored flag) by exercising
+  // contractRepo.governingContract() somewhere real, not just leaving it unused.
+  const governing = contractRepo.governingContract(contracts);
+  const governingHtml = governing
+    ? `Governing contract: <a href="contract.html?id=${encodeURIComponent(governing.id)}">signed ${esc(fmtDate(governing.signed_date || governing.created_at))}</a>`
+    : 'Governing contract: none signed yet';
+
+  const inner = contracts.length
+    ? `<ul class="linked-list" style="margin:14px 0 0; padding:0; list-style:none;">` + contracts.map((c) => `
+        <li class="row-between" style="padding:8px 0; border-top:1px solid var(--border);">
+          <span>${badge(CONTRACT_TYPE, c.contract_type)} <strong>${esc(c.title || 'Contract')}</strong> ${badge(CONTRACT_STATUS, c.status)}${c.signed_date ? ` <span class="faint">signed ${esc(fmtDate(c.signed_date))}</span>` : ''}</span>
+          <a class="btn btn-sm" href="contract.html?id=${encodeURIComponent(c.id)}">Open →</a>
+        </li>`).join('') + `</ul>`
+    : `<p class="muted" style="margin:14px 0 0;">No contracts attached to this sale yet.</p>`;
+
+  els.contracts.innerHTML = `
+    <section class="card" style="margin-top:16px;">
+      <div class="row-between">
+        <div>
+          <h2 style="margin:0;">Contracts</h2>
+          <p class="muted" style="margin:4px 0 0; font-size:13px;">${governingHtml}</p>
+        </div>
+        <a class="btn btn-sm" href="contract.html?new=1&sale=${encodeURIComponent(ctx.original.id)}">+ Create Contract</a>
+      </div>
+      ${inner}
+    </section>`;
+}
+
+// --- Top-level render ------------------------------------------------------
+function renderTitle() {
+  if (ctx.mode === 'new') {
+    els.title.textContent = 'New Sale';
+    els.subtitle.textContent = 'Choose a dog and buyer, then save.';
+    return;
+  }
+  const s = ctx.original;
+  els.title.innerHTML = `${esc(dogName(s.dog_id) || '—')} → ${esc(contactName(s.buyer_contact_id) || '—')}` + (s.is_archived ? ' <span class="badge badge-gray">Archived</span>' : '');
+  els.subtitle.innerHTML = s.sale_date ? `Sale date ${esc(fmtDate(s.sale_date))}` : '';
+}
+
+function renderAll() {
+  renderTitle();
+  renderProfileActions();
+  renderHeaderActions();
+  if (ctx.mode === 'view') renderView();
+  else renderEdit();
+  renderContractsSection();
+  renderPaymentsSection();
+}
+
+// --- Payments (Payment Schedule plan §5) ----------------------------------------
+// The deposit, each due date, extras on their own dates and the money received, with
+// Record a payment and the schedule editor (assets/paymentScheduleUI.js). Shown while
+// viewing a saved sale; hidden in the form.
+const saleKennel = (s) => (s?.kennel_id ? kennelRepo.getById(s.kennel_id) : null);
+let paymentsDraw = 0;
+async function renderPaymentsSection() {
+  const sec = els.payments;
+  if (!sec) return;
+  const mine = ++paymentsDraw;
+  if (ctx.mode !== 'view' || !ctx.original) { sec.hidden = true; sec.innerHTML = ''; return; }
+  try {
+    const [loaded, kennel] = await Promise.all([getSaleStatement(ctx.original), saleKennel(ctx.original)]);
+    if (mine !== paymentsDraw || ctx.mode !== 'view' || !loaded) return;
+    const firstDraw = !ctx.statement;
+    ctx.statement = loaded.statement;
+    sec.innerHTML = paymentsCardHtml(loaded, { accountsById: ctx.accountsById, finalMethods: kennel?.final_payment_methods || '', editable: !ctx.original.is_archived });
+    sec.hidden = false;
+    wirePaymentsCard(sec, {
+      loaded, savedList: savedSchedules(kennel),
+      accounts: ctx.accounts.filter((a) => a.account_type === 'payment_service'),
+      onChanged: async () => { ctx.original = await saleRepo.getById(ctx.original.id); renderAll(); }
+    });
+    // The view's final payment date reads the statement: draw it again once it's known.
+    if (firstDraw && hasSchedule(ctx.original)) renderView();
+  } catch (e) {
+    sec.hidden = false;
+    sec.innerHTML = `<div class="inline-error">${esc(e.message || String(e))}</div>`;
+  }
+}
+
+async function main() {
+  await loadRefs();
+  const id = param('id');
+  const isNew = param('new');
+
+  if (isNew) {
+    ctx.mode = 'new';
+    ctx.draft = blankSale();
+    const dogId = param('dog');
+    if (dogId && ctx.dogsById.has(dogId)) {
+      ctx.draft.dog_id = dogId;
+      applyExpectedPricing();
+    }
+    renderTitle();
+    renderEdit();
+    renderProfileActions();
+    renderHeaderActions();
+    return;
+  }
+
+  if (!id) { showError('No sale id provided.'); return; }
+  const s = await saleRepo.getById(id);
+  if (!s) { showError('Sale not found. It may have been deleted.'); return; }
+  ctx.original = s;
+  ctx.mode = 'view';
+  // Out-of-scope banner (Multi-Kennel Scope Spec §7). A detail page reached by id
+  // is deliberately NEVER scope-filtered — a direct link, a bookmark, or a click
+  // through from a pedigree must always resolve — so an sale belonging to another
+  // kennel renders in full, with this above it saying whose it is and offering a
+  // one-click switch. Renders nothing in the ordinary in-scope case.
+  renderScopeNotice(document.getElementById('scope-notice'), s, { kind: 'sale' });
+  renderAll();
+  // `&deliver=1` (the "Did Cedar go home?" nudge and Kels, data/goHome.js): open
+  // the form with Delivered chosen, so her Save runs delivery's usual prompts
+  // (ownership or departure, the pickup, closing the litter). Nothing is written
+  // until she saves.
+  if (param('deliver') && isOpenSale(s)) {
+    enterEdit();
+    ctx.draft.status = 'delivered';
+    renderEdit();
+    document.getElementById('f-status')?.dispatchEvent(new Event('change'));
+    showNotice('Marked Delivered below. Check the details, then tap Save.');
+  }
+}
+
+// The open one-time Stripe link on the view (Integrations plan §4): Copy, and
+// Check now (asks Stripe about this sale, whatever the 15-minute wait).
+els.body.addEventListener('click', async (e) => {
+  const copyBtn = e.target.closest('[data-pl-copy]');
+  const checkBtn = e.target.closest('[data-pl-check]');
+  if ((!copyBtn && !checkBtn) || !ctx.original) return;
+  clearError();
+  if (copyBtn) {
+    try { await navigator.clipboard.writeText(ctx.original.payment_link_url); copyBtn.textContent = 'Copied ✓'; } catch { showError('Couldn\'t copy: open the link and copy its address.'); }
+    return;
+  }
+  checkBtn.disabled = true;
+  try {
+    const { checkStripePayments } = await import('../data/stripeLinks.js');
+    const res = await checkStripePayments({ force: true, saleIds: [ctx.original.id] });
+    if (!res || !res.checked) showError('This device can\'t check: connect Stripe on the account this payment is paid via (Accounts page).');
+    ctx.original = await saleRepo.getById(ctx.original.id);
+    if (ctx.mode === 'view') renderAll();
+    if (res && res.checked && !(res.applied || res.review)) showError('Not paid yet.');
+  } catch (err) { showError(err.message || String(err)); } finally { checkBtn.disabled = false; }
+});
+
+main();

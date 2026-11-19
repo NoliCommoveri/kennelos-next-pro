@@ -1,0 +1,2053 @@
+// csvImport.js — the generic CSV match-or-create engine (Build Brief A3/B2,
+// Data Model doc §8). Lives in the data layer: it parses a file (via the
+// vendored PapaParse), classifies every row against existing records as
+// create / update / needs-review in a DRY RUN, and only writes on an explicit
+// commit. The engine is entity-agnostic — each entity contributes a small
+// *mapping* (column names, natural key, normalizers, repo). Stage 2 wires in
+// Dog and Contact; later stages add their own mapping to this same engine
+// rather than rebuilding it.
+//
+// The rule that shapes everything (Data Model §8): a natural key is only valid
+// if it is NON-EMPTY. Keyless / partial-key rows are never auto-matched and
+// never silently created — they land in "needs review," where the user decides.
+import Papa from '../vendor/papaparse.min.mjs';
+import { dogRepo } from './dogRepo.js';
+import { resolveKennelIdForWrite, SCOPED_OWNERSHIP, ownKennels } from './kennelScope.js';
+import { contactRepo } from './contactRepo.js';
+import { kennelRepo, withSeededTests } from './kennelRepo.js';
+import { newCredit } from './receivedCredits.js';
+import { pairingRepo } from './pairingRepo.js';
+import { litterRepo } from './litterRepo.js';
+import { saleRepo } from './saleRepo.js';
+import { HistoryEvent } from './eventRepo.js';
+import { studServiceRepo } from './studServiceRepo.js';
+import { expenseRepo, mileageAmount } from './expenseRepo.js';
+import { waitlistEntryRepo } from './waitlistEntryRepo.js';
+import { waitlistProgramRepo } from './waitlistProgramRepo.js';
+import { formQuestions, isAnswerQuestion, snapshotQuestions, columnsFor, IMPORT_ALIASES } from './waitlistForm.js';
+import { waitlistConfig, kennelBreeds, resolveBreed } from './waitlistRules.js';
+import { todayYMD } from './dateUtils.js';
+import { normReg } from './pedigreeImport.js';
+import { normalizeTitles } from './dogTitles.js';
+import { dogRegKeys, dogRegisteredNames } from './dogSearch.js';
+import { getMyKennelId, getMileageDefaults } from './settings.js';
+import { editionFlags } from './editionConfig.js';
+import {
+  SEX, OWNERSHIP_TYPE, DOG_STATUS, CONTACT_TYPE, PAIRING_TYPE, PAIRING_METHOD, PAIRING_STATUS,
+  LITTER_STATUS, LITTER_DELIVERY_TYPE, REGISTRATION_TYPE, PLACEMENT_PURPOSE, cleanPurposes, SALE_STATUS, eventTypesFor, STUD_SERVICE_DIRECTION, FEE_STRUCTURE, STUD_SERVICE_STATUS,
+  EXPENSE_CATEGORIES, EXPENSE_SUBJECT_TYPES, WAITLIST_PREF_SEX, WAITLIST_OPEN_STATUSES, WAITLIST_READY_TIMING
+} from './vocab.js';
+
+// --- Parsing --------------------------------------------------------------
+// Headers are normalized to lower_snake_case so "Registered Name", "registered
+// name", and "registered_name" all resolve to the same key. Values are trimmed.
+export function parseCsv(fileOrText) {
+  return new Promise((resolve, reject) => {
+    Papa.parse(fileOrText, {
+      header: true,
+      skipEmptyLines: 'greedy',
+      transformHeader: (h) => h.trim().toLowerCase().replace(/\s+/g, '_'),
+      transform: (v) => (typeof v === 'string' ? v.trim() : v),
+      complete: (res) => resolve({ rows: res.data, fields: res.meta.fields || [], errors: res.errors || [] }),
+      error: (err) => reject(err)
+    });
+  });
+}
+
+// --- Shared normalizers ---------------------------------------------------
+// Read a column allowing a few aliases; returns '' when absent/blank.
+function col(row, ...names) {
+  for (const n of names) {
+    const v = row[n];
+    if (v != null && String(v).trim() !== '') return String(v).trim();
+  }
+  return '';
+}
+
+// Coerce free text to a controlled-vocab value. Returns '' (blank), the value,
+// or null (present but unrecognized — the caller decides how loud to be).
+function normEnum(vocab, raw, extra = {}) {
+  if (!raw) return '';
+  const s = raw.trim();
+  const k = s.toLowerCase().replace(/\s+/g, '_');
+  if (extra[k]) return extra[k];
+  const hit = vocab.find((v) => v.value === k || v.label.toLowerCase() === s.toLowerCase());
+  return hit ? hit.value : null;
+}
+
+// Other words for a litter's delivery (normEnum keys: lower-case, spaces → underscores).
+const DELIVERY_ALIASES = {
+  natural_assisted: 'assisted', vaginal: 'natural', planned_c_section: 'c_section_planned', 'planned_c-section': 'c_section_planned',
+  elective_c_section: 'c_section_planned', 'elective_c-section': 'c_section_planned', emergency_c_section: 'c_section_emergency', 'emergency_c-section': 'c_section_emergency'
+};
+
+// Other words for a purpose on an imported application (normEnum keys: lower-case,
+// spaces → underscores). The old placement values read as their purpose.
+const PURPOSE_ALIASES = {
+  companion: 'pet', family_pet: 'pet', pet_home: 'pet', sports: 'performance', agility: 'performance', obedience: 'performance',
+  conformation: 'show', breeding_rights: 'breeding', 'co-own': 'co_own', coown: 'co_own', co_ownership: 'co_own'
+};
+
+// The order a file writes slashed dates in (K2-3): 'mdy' (US, the default), 'dmy'
+// (UK, Australia, most of the world), or 'mixed' (both seen: a date that could be
+// either is left unread). Set by buildPlan for its classify pass only.
+let DATE_ORDER = 'mdy';
+const SLASHED_DATE = /^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$/;
+
+// What a file's slashed dates say about their order: one with a first number over 12
+// ("25/01/2021") is day-first, one with a second over 12 ("1/25/2021") month-first.
+// `ambiguous`: how many could be read either way ("05/01/2021"). `order` null = no
+// date tells (she's asked when any is ambiguous).
+export function detectDateOrder(rows) {
+  let dmy = false, mdy = false, ambiguous = 0;
+  for (const row of rows || []) {
+    for (const v of Object.values(row || {})) {
+      const hit = SLASHED_DATE.exec(String(v ?? '').trim());
+      if (!hit) continue;
+      const a = Number(hit[1]), b = Number(hit[2]);
+      if (a > 12 && b <= 12) dmy = true;
+      else if (b > 12 && a <= 12) mdy = true;
+      else if (a !== b && a >= 1 && b >= 1) ambiguous++;
+    }
+  }
+  return { order: dmy && mdy ? 'mixed' : dmy ? 'dmy' : mdy ? 'mdy' : null, ambiguous };
+}
+
+// Normalize a date to YYYY-MM-DD. Accepts ISO and D/M/YYYY or M/D/YYYY in the
+// file's order (DATE_ORDER). Returns '' (blank), a valid YYYY-MM-DD string, or null
+// (present but unrecognized, or either way round in a file that uses both).
+function normDate(raw) {
+  if (!raw) return '';
+  const s = raw.trim();
+  let y, m, d;
+  let hit = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (hit) { [, y, m, d] = hit; }
+  else if ((hit = s.match(SLASHED_DATE))) {
+    const [a, b] = [Number(hit[1]), Number(hit[2])];
+    const order = DATE_ORDER === 'mixed' ? (a > 12 ? 'dmy' : b > 12 ? 'mdy' : a === b ? 'mdy' : null) : DATE_ORDER;
+    if (!order) return null;
+    [m, d, y] = order === 'dmy' ? [hit[2], hit[1], hit[3]] : [hit[1], hit[2], hit[3]];
+  }
+  else return null;
+  const mm = Number(m), dd = Number(d);
+  if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
+  const ymd = `${y}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+  const check = new Date(`${ymd}T00:00:00`);
+  return Number.isNaN(check.getTime()) ? null : ymd;
+}
+
+// Split a delimited multi-value cell ("breeder; vet") into trimmed parts.
+function splitList(raw) {
+  if (!raw) return [];
+  return raw.split(/[;,|]/).map((s) => s.trim()).filter(Boolean);
+}
+
+// Parse a money / numeric cell tolerantly: strips a leading currency symbol and
+// thousands separators ("$1,234.50" → 1234.5). Returns a finite Number, or null
+// when blank/unparseable (the caller decides how loud to be). Never negative-
+// coerces; a "-5" stays -5 so the repo's own non-negative check can flag it.
+function parseMoney(raw) {
+  if (raw == null || String(raw).trim() === '') return null;
+  const cleaned = String(raw).replace(/[$£€\s,]/g, '');
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Name -> existing Dog lookup shared by the Pairing/Litter mappings to resolve
+// sire/dam relationship columns (Data Model §8, point 2). Same precedence as
+// the Dog mapping's own byName index: registered_name wins ties, call_name
+// fills gaps.
+function buildDogNameIndex(dogs) {
+  const byName = new Map();
+  for (const d of dogs) {
+    if (d.registered_name) byName.set(d.registered_name.trim().toLowerCase(), d);
+    const ck = d.call_name?.trim().toLowerCase();
+    if (ck && !byName.has(ck)) byName.set(ck, d);
+  }
+  return byName;
+}
+
+// Name -> existing Kennel lookup shared by every mapping that can carry a
+// kennel scope (Multi-Kennel Scope Spec §11) — dog, pairing, litter, sale,
+// stud_service. `ownIds` lets classify() tell an outside kennel (fine for an
+// external/leased dog's kennel_name) from one of the user's own (required for
+// every other scoped table, and for an owned/co_owned dog).
+function buildKennelNameIndex(kennels) {
+  const byName = new Map();
+  const ownIds = new Set();
+  for (const k of kennels) {
+    if (k.kennel_name) byName.set(k.kennel_name.trim().toLowerCase(), k);
+    if (k.is_own_kennel) ownIds.add(k.id);
+  }
+  return { byName, ownIds };
+}
+
+// Resolves a `kennel_name` column against EXISTING kennels only (Data Model §8's
+// relationship-column rule: an unresolved name is flagged, never invented, and
+// never auto-created). `requireOwn` rejects a match that isn't one of the
+// user's own kennels — true for every scoped table except an external/leased
+// dog, whose kennel_id may legitimately name someone else's kennel. Returns
+// true when a NAMED kennel failed to resolve, so the caller routes the row to
+// review (same as an unresolved sire/dam) instead of silently falling through
+// to whatever default stampKennelScope() would otherwise stamp at commit.
+function resolveKennelColumn(row, kennelIndex, record, reasons, { requireOwn }) {
+  const raw = col(row, 'kennel_name', 'kennel');
+  if (!raw) return false;
+  const hit = kennelIndex.byName.get(raw.trim().toLowerCase());
+  if (!hit) { reasons.push(`Kennel "${raw}" not found.`); return true; }
+  if (requireOwn && !kennelIndex.ownIds.has(hit.id)) {
+    reasons.push(`Kennel "${raw}" is not one of your own kennels.`);
+    return true;
+  }
+  record.kennel_id = hit.id;
+  return false;
+}
+
+// Composite natural-key string: parts joined by a space. Callers only ever
+// pass resolved dog ids (UUIDs) and YYYY-MM-DD dates here, neither of which
+// contains a space, so distinct combinations never collide. Any blank/nullish
+// part means no valid key (caller must treat the row as keyless).
+function nkParts(...parts) {
+  if (parts.some((p) => p === '' || p == null)) return null;
+  return parts.map((p) => String(p).trim().toLowerCase()).join(' ');
+}
+
+// Natural-key string: name (case-insensitive, trimmed) + exact DOB, joined by a
+// NUL that can't appear in real data, so distinct name/DOB pairs never collide.
+function nk(name, dob) {
+  return `${name.trim().toLowerCase()}\u0000${dob}`;
+}
+
+// =========================================================================
+// Dog mapping
+// =========================================================================
+// Natural key: registered_name + date_of_birth, falling back to
+// call_name + date_of_birth (Data Model §8). A row with no DOB, or with no
+// name at all, cannot form a key → needs review.
+// The ownerships every edition's dog form offers (Lite's form offers only these).
+const LOCAL_OWNERSHIP = new Set(['owned', 'co_owned']);
+
+// Mirrors dogRepo's OWNER_REQUIRED_TYPES: these ownerships need owner_contact_id.
+const DOG_OWNER_REQUIRED = ['external', 'leased_in'];
+
+const DOG_MAPPING = {
+  entity: 'dog',
+  label: 'Dogs',
+  // What this importer's columns point at (other importers' entities), so a
+  // several-file import (data/csvBatch.js) runs those files first.
+  links: ['kennel', 'contact'],
+  // Columns the importer understands (for the on-page template/help).
+  templateHeaders: [
+    'call_name', 'registered_name', 'sex', 'date_of_birth', 'breed',
+    'sire_registered_name', 'dam_registered_name', 'ownership_type', 'status',
+    'owner_name', 'kennel_name', 'breeder_kennel_name', 'color_markings', 'registry', 'registration_number', 'microchip_id',
+    'titles', 'country_of_origin', 'coi_value', 'coi_method', 'coi_source', 'coi_as_of', 'notes'
+  ],
+  requiredForCreate: ['call_name', 'sex', 'breed', 'ownership_type', 'status'],
+
+  async loadExisting() {
+    const [dogs, kennels, contacts] = await Promise.all([
+      // Pedigree-only ancestors too: a row naming one matches it rather than
+      // duplicating it, and sire/dam names resolve onto it.
+      dogRepo.getAll({ includeArchived: true, includePedigreeOnly: true }),
+      kennelRepo.getAll({ includeArchived: true }),
+      contactRepo.getAll({ includeArchived: true })
+    ]);
+    this._kennels = buildKennelNameIndex(kennels);
+    this._allKennels = kennels;
+    this._contactByName = new Map();
+    for (const c of contacts) if (c.name) this._contactByName.set(c.name.trim().toLowerCase(), c);
+    return dogs;
+  },
+
+  // A new dog starts with her kennel's planned tests for its breed, as on the
+  // Dog page (the kennels loadExisting read for the preview).
+  seedRecord(record) {
+    return this._allKennels ? withSeededTests(record, this._allKennels) : record;
+  },
+
+  buildIndex(existing) {
+    const byReg = new Map();   // registered_name+dob -> id
+    const byCall = new Map();  // call_name+dob -> id
+    const byName = new Map();  // any name -> id (for sire/dam resolution)
+    const byRegNo = new Map(); // registration number key (normReg) -> [dogs]
+    for (const d of existing) {
+      // Every number and registered name it holds, additional registrations included.
+      for (const rk of dogRegKeys(d)) { if (!byRegNo.has(rk)) byRegNo.set(rk, []); byRegNo.get(rk).push(d); }
+      const regNames = dogRegisteredNames(d);
+      if (d.date_of_birth) for (const n of regNames) byReg.set(nk(n, d.date_of_birth), d);
+      if (d.call_name && d.date_of_birth) byCall.set(nk(d.call_name, d.date_of_birth), d);
+      for (const n of regNames) { const k = n.toLowerCase(); if (!byName.has(k)) byName.set(k, d); }
+      const ck = d.call_name?.trim().toLowerCase();
+      if (ck && !byName.has(ck)) byName.set(ck, d);
+    }
+    return { byReg, byCall, byName, byRegNo, kennels: this._kennels, contactByName: this._contactByName || new Map() };
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const reg = col(row, 'registered_name', 'reg_name');
+    const call = col(row, 'call_name', 'name');
+    const dobRaw = col(row, 'date_of_birth', 'dob', 'birthdate');
+    const dob = normDate(dobRaw);
+    if (dob === null) reasons.push(`Unrecognized date_of_birth "${dobRaw}".`);
+
+    const sex = normEnum(SEX, col(row, 'sex'), { m: 'male', f: 'female' });
+    if (sex === null) reasons.push(`Unrecognized sex "${col(row, 'sex')}".`);
+    const ownership = normEnum(OWNERSHIP_TYPE, col(row, 'ownership_type', 'ownership'));
+    if (ownership === null) reasons.push(`Unrecognized ownership_type "${col(row, 'ownership_type', 'ownership')}".`);
+    const status = normEnum(DOG_STATUS, col(row, 'status'));
+    if (status === null) reasons.push(`Unrecognized status "${col(row, 'status')}".`);
+
+    // Full create-ready record (only non-blank, recognized fields set).
+    const record = {};
+    if (call) record.call_name = call;
+    if (reg) record.registered_name = reg;
+    if (sex) record.sex = sex;
+    if (dob) record.date_of_birth = dob;
+    const breed = col(row, 'breed');
+    if (breed) record.breed = breed;
+    if (ownership) record.ownership_type = ownership;
+    if (status) record.status = status;
+    // Kennel by name (§11) — required to be one of the user's own kennels only
+    // when the dog's ownership means the app scopes it (owned/co_owned); an
+    // external/leased dog may legitimately name an outside kennel here.
+    const kennelUnresolved = resolveKennelColumn(row, index.kennels, record, reasons, { requireOwn: SCOPED_OWNERSHIP.has(ownership) });
+    // Breeder kennel by name: the kennel that produced the dog, own or outside, so
+    // any kennel on file. Same resolve-or-review rule as every relationship column.
+    let breederKennelUnresolved = false;
+    const breederKennelName = col(row, 'breeder_kennel_name', 'breeder_kennel');
+    if (breederKennelName) {
+      const hit = index.kennels?.byName.get(breederKennelName.toLowerCase());
+      if (hit) record.breeder_kennel_id = hit.id;
+      else { breederKennelUnresolved = true; reasons.push(`Breeder kennel "${breederKennelName}" not found — import it on the Kennels import first.`); }
+    }
+    for (const [key, ...aliases] of [
+      ['color_markings', 'color', 'markings'], ['registry'], ['registration_number', 'reg_number'],
+      ['microchip_id', 'microchip'], ['country_of_origin', 'origin_country'], ['notes']
+    ]) {
+      const v = col(row, key, ...aliases);
+      if (v) record[key] = v;
+    }
+    // Titles held (Dog Titles Field Plan §8 phase 1): abbreviations separated by
+    // spaces or commas, "GCH CH" or "GCH, CH, CGC".
+    const titles = normalizeTitles(col(row, 'titles', 'title').split(/[\s,]+/));
+    if (titles.length) record.titles = titles;
+
+    // Owner (dogRepo: an external or leased-in dog needs owner_contact_id). By
+    // contact name against EXISTING contacts only; an unknown name is flagged.
+    const ownerName = col(row, 'owner_name', 'owner', 'owner_contact_name');
+    let ownerUnresolved = false;
+    if (ownerName) {
+      const hit = index.contactByName.get(ownerName.toLowerCase());
+      if (hit) record.owner_contact_id = hit.id;
+      else { ownerUnresolved = true; reasons.push(`Owner "${ownerName}" not found — add the contact first.`); }
+    }
+
+    // Recorded COI (Stage 5, Build Brief §2.3). Gated on a numeric coi_value:
+    // present+numeric stores { value, method, source, as_of_date } (the last
+    // three null when their columns are blank); present+non-numeric soft-warns
+    // and drops the stray value (row kept), same posture as the end-date-on-
+    // instant warning; absent stores no COI at all (even if method/source were
+    // given). recorded_coi is a plain unindexed field, never an FK.
+    const coiRaw = col(row, 'coi_value', 'coi');
+    if (coiRaw !== '') {
+      const coiNum = Number(coiRaw);
+      if (!Number.isFinite(coiNum)) reasons.push(`Unrecognized coi_value "${coiRaw}" (ignored).`);
+      else {
+        const coiAsOfRaw = col(row, 'coi_as_of', 'coi_as_of_date');
+        const coiAsOf = normDate(coiAsOfRaw);
+        if (coiAsOf === null && coiAsOfRaw) reasons.push(`Unrecognized coi_as_of "${coiAsOfRaw}" (ignored).`);
+        record.recorded_coi = {
+          value: coiNum,
+          method: col(row, 'coi_method') || null,
+          source: col(row, 'coi_source') || null,
+          as_of_date: coiAsOf || null
+        };
+      }
+    }
+
+    // Sire / dam: resolve names against EXISTING dogs (Data Model §8.2). A named
+    // parent that doesn't resolve is flagged (never silently dropped).
+    const unresolved = [];
+    const batchParents = {}; // idField -> row index of the parent in this file
+    for (const [nameCol, idField, roleLabel] of [
+      ['sire_registered_name', 'sire_id', 'Sire'], ['dam_registered_name', 'dam_id', 'Dam']
+    ]) {
+      const pName = col(row, nameCol, nameCol.replace('_registered_name', '_name'));
+      if (!pName) continue;
+      const hit = index.byName.get(pName.toLowerCase());
+      if (hit) { record[idField] = hit.id; continue; }
+      // Not in the app yet: is it a dog on another row of this same file? Then it's
+      // linked by the link pass after every row is written (commitPlan), so one
+      // file can carry a dog and its parents. Still resolve-only: a name that
+      // matches no row, or more than one, is flagged exactly as before.
+      const rowsNamed = (index.batchByName?.get(pName.toLowerCase()) || []).filter((n) => n !== i);
+      if (rowsNamed.length === 1) {
+        batchParents[idField] = rowsNamed[0];
+        reasons.push(`${roleLabel} "${pName}" is row ${rowsNamed[0] + 2} of this file; linked once both are imported.`);
+      } else if (rowsNamed.length > 1) {
+        unresolved.push(`${roleLabel} "${pName}" matches ${rowsNamed.length} rows of this file (rows ${rowsNamed.map((n) => n + 2).join(', ')})`);
+      } else {
+        unresolved.push(`${roleLabel} "${pName}" not found`);
+      }
+    }
+
+    // Natural key → match-or-create. Two keys: name + date of birth, or the
+    // registration number (normReg: "NP888072/07 03-25" and "np88807207" are one
+    // number), the same key Pedigree Import matches on. Pedigrees give a dog's
+    // number but rarely its birth date, so the number alone is enough.
+    const hasName = !!(reg || call);
+    const regNoRaw = col(row, 'registration_number', 'reg_number');
+    const regKey = regNoRaw ? normReg(regNoRaw) : '';
+    const nameDobKey = hasName && !!dob;
+    let status_ = 'create';
+    let match = null;
+    if (!nameDobKey && !regKey) {
+      status_ = 'review';
+      if (!hasName) reasons.push('No registered_name or call_name, and no registration_number — cannot form a natural key.');
+      if (!dob) reasons.push('No date_of_birth or registration_number — cannot form a natural key.');
+    } else {
+      const byNameDob = nameDobKey ? ((reg && index.byReg.get(nk(reg, dob))) || (call && index.byCall.get(nk(call, dob))) || null) : null;
+      const regHits = regKey ? (index.byRegNo?.get(regKey) || []) : [];
+      if (regHits.length > 1) {
+        status_ = 'review';
+        match = byNameDob || regHits[0];
+        reasons.push(`${regHits.length} dogs on file have registration number ${regNoRaw} — choose "Update match" and pick the right one.`);
+      } else if (byNameDob && regHits[0] && regHits[0].id !== byNameDob.id) {
+        status_ = 'review';
+        match = byNameDob;
+        reasons.push(`Name and date of birth match ${byNameDob.registered_name || byNameDob.call_name}, but registration number ${regNoRaw} belongs to ${regHits[0].registered_name || regHits[0].call_name} — pick which dog this is.`);
+      } else {
+        match = byNameDob || regHits[0] || null;
+        status_ = match ? 'update' : 'create';
+      }
+    }
+
+    // An outside dog with no owner given is kept for lineage only (pedigree-only,
+    // as Pedigree Import saves ancestors): no owner or call name needed, off the
+    // Dogs list, not counted against a dog cap. Only ever on a NEW dog: an update
+    // never turns a dog already in the app into a pedigree-only one.
+    // An edition without other people's dogs (Lite: externalOwnership off) takes
+    // only the ownerships its dog form offers. A leased dog never counts toward
+    // Lite's cap, so taking one here would overfill the roster (K13-4), and an
+    // update to leased or external would free a slot the form can't. The one
+    // exception is a new external dog with no owner: it lands pedigree-only below,
+    // an ancestor kept for lineage, which Lite has too.
+    const ownershipRefused = Boolean(ownership && !editionFlags.externalOwnership && !LOCAL_OWNERSHIP.has(ownership)
+      && !(ownership === 'external' && !ownerName && !match));
+    if (ownershipRefused) {
+      delete record.ownership_type;
+      reasons.push(`Ownership "${col(row, 'ownership_type', 'ownership')}" isn't available in this edition: use owned or co_owned.`);
+    }
+    const changes = buildDogChanges(record);
+    // On an update, titles are add-only: the row never drops a title she has.
+    if (match && changes.titles) changes.titles = normalizeTitles([...(match.titles || []), ...changes.titles]);
+    if (!match && ownership === 'external' && !ownerName) {
+      record.pedigree_only = true;
+      if (!record.status) record.status = 'external_reference';
+      reasons.push('No owner given: saved as a pedigree-only dog (kept for lineage, off the Dogs list).');
+    }
+
+    // A create must satisfy the repo's required fields; if not, review it so the
+    // user sees exactly what's missing instead of hitting a commit-time failure.
+    if (status_ === 'create') {
+      const missing = this.requiredForCreate.filter((f) => !record[f] && !(f === 'call_name' && record.pedigree_only && record.registered_name));
+      if (missing.length) { status_ = 'review'; reasons.push(`Missing required field(s) for a new dog: ${missing.join(', ')}.`); }
+    }
+    // Unresolved parents push a create/update row to review (fixable, or apply anyway).
+    if (unresolved.length) { if (status_ !== 'review') status_ = 'review'; reasons.push(unresolved.join('; ') + '.'); }
+    if (kennelUnresolved || ownerUnresolved || breederKennelUnresolved || ownershipRefused) status_ = 'review';
+    // The dog as it would be saved (an update merges onto the match): an
+    // external or leased-in dog with no owner would fail at commit, so say so now.
+    const saved = { ...(match || {}), ...record };
+    if (!saved.pedigree_only && DOG_OWNER_REQUIRED.includes(saved.ownership_type) && !saved.owner_contact_id && !ownerUnresolved) {
+      status_ = 'review';
+      reasons.push(`${saved.ownership_type === 'external' ? 'An external' : 'A leased-in'} dog needs its owner: add an owner_name column naming one of your contacts.`);
+    }
+
+    const display = reg || call || `(row ${i + 2})`;
+    return {
+      index: i, raw: row, entity: 'dog', display,
+      record,                             // create payload
+      changes,                            // update payload (same recognized fields, never pedigree_only)
+      ...(Object.keys(batchParents).length ? { batchParents } : {}),
+      status: status_, match, matchLabel: match ? (match.registered_name || match.call_name) : '',
+      reasons,
+      decision: status_ === 'review' ? 'skip' : status_,
+      decisionTarget: match ? match.id : null
+    };
+  },
+
+  // The keys classify matches on (name + date of birth, the registration number), or
+  // the dog it matched: two rows with one of them are one dog (markRepeatedRows).
+  batchKeys(r) {
+    const rec = r.record || {};
+    const dob = rec.date_of_birth;
+    return [
+      r.match && `id:${r.match.id}`,
+      rec.registered_name && dob && `r:${nk(rec.registered_name, dob)}`,
+      rec.call_name && dob && `c:${nk(rec.call_name, dob)}`,
+      rec.registration_number && `n:${normReg(rec.registration_number)}`
+    ];
+  },
+
+  // Names of the dogs in this file, for sire/dam names that aren't in the app yet.
+  // Same precedence as buildIndex's byName: a registered name wins, a call name
+  // is used only when no row has that registered name.
+  indexBatch(rows, index) {
+    const byReg = new Map();
+    const byCall = new Map();
+    const add = (map, name, i) => {
+      const k = name.toLowerCase();
+      if (!map.has(k)) map.set(k, []);
+      map.get(k).push(i);
+    };
+    rows.forEach((row, i) => {
+      const reg = col(row, 'registered_name', 'reg_name');
+      const call = col(row, 'call_name', 'name');
+      if (reg) add(byReg, reg, i);
+      if (call) add(byCall, call, i);
+    });
+    const batchByName = new Map(byReg);
+    for (const [k, v] of byCall) if (!batchByName.has(k)) batchByName.set(k, v);
+    index.batchByName = batchByName;
+    return index;
+  },
+
+  // After classify: a parent row that itself needs review is linked only if the
+  // user imports it, so say so on the pup's row.
+  finishPlan(plan) {
+    for (const r of plan) {
+      if (!r.batchParents) continue;
+      for (const n of Object.values(r.batchParents)) {
+        if (plan[n]?.status === 'review') r.reasons.push(`Row ${n + 2} needs review; this dog is linked to it only if you import it.`);
+      }
+    }
+    return plan;
+  },
+
+  // Human label for an existing record (used by the "match to existing" picker).
+  describe: (d) => (d.registered_name || d.call_name || '(unnamed dog)') + (d.date_of_birth ? ` — ${d.date_of_birth}` : '') + (d.is_archived ? ' (archived)' : ''),
+
+  repo: dogRepo
+};
+
+// For an update we apply the same recognized fields the create would set (blank
+// CSV cells never overwrite existing data, since they were never added above).
+function buildDogChanges(record) {
+  return { ...record };
+}
+
+// =========================================================================
+// Contact mapping
+// =========================================================================
+// Natural key: name (case-insensitive, trimmed). Nameless → needs review.
+const CONTACT_MAPPING = {
+  entity: 'contact',
+  label: 'Contacts',
+  links: ['kennel'],
+  templateHeaders: ['name', 'contact_type', 'email', 'phone', 'facebook_profile', 'address', 'kennel_name', 'notes'],
+  requiredForCreate: ['name'],
+
+  async loadExisting() {
+    const [contacts, kennels] = await Promise.all([
+      contactRepo.getAll({ includeArchived: true }),
+      kennelRepo.getAll({ includeArchived: true })
+    ]);
+    this._kennels = kennels;
+    return contacts;
+  },
+
+  buildIndex(existing) {
+    const byName = new Map();
+    for (const c of existing) if (c.name) byName.set(c.name.trim().toLowerCase(), c);
+    const kennelByName = new Map();
+    for (const k of this._kennels || []) if (k.kennel_name) kennelByName.set(k.kennel_name.trim().toLowerCase(), k);
+    return { byName, kennelByName };
+  },
+
+  // Its natural key (the name), or the contact it matched (markRepeatedRows).
+  batchKeys(r) {
+    return [r.match && `id:${r.match.id}`, r.record?.name && `n:${r.record.name.trim().toLowerCase()}`];
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const name = col(row, 'name', 'contact_name');
+    const record = {};
+    if (name) record.name = name;
+
+    const typesRaw = splitList(col(row, 'contact_type', 'type', 'types'));
+    if (typesRaw.length) {
+      const types = [];
+      for (const t of typesRaw) {
+        const v = normEnum(CONTACT_TYPE, t);
+        if (v) types.push(v);
+        else reasons.push(`Unrecognized contact_type "${t}" (ignored).`);
+      }
+      if (types.length) record.contact_type = types;
+    }
+    for (const [key, ...aliases] of [['email'], ['phone', 'telephone'], ['facebook_profile', 'facebook', 'fb_profile'], ['address'], ['notes']]) {
+      const v = col(row, key, ...aliases);
+      if (v) record[key] = v;
+    }
+    // Kennel by name → existing kennel only (left blank + flagged if unknown).
+    const kName = col(row, 'kennel_name', 'kennel');
+    if (kName) {
+      const hit = index.kennelByName.get(kName.toLowerCase());
+      if (hit) record.kennel_id = hit.id;
+      else reasons.push(`Kennel "${kName}" not found (left blank).`);
+    }
+
+    let status_ = 'create';
+    let match = null;
+    if (!name) {
+      status_ = 'review';
+      reasons.push('No name — cannot form a natural key.');
+    } else {
+      match = index.byName.get(name.toLowerCase()) || null;
+      status_ = match ? 'update' : 'create';
+    }
+
+    const display = name || `(row ${i + 2})`;
+    return {
+      index: i, raw: row, entity: 'contact', display,
+      record, changes: { ...record },
+      status: status_, match, matchLabel: match ? match.name : '',
+      reasons,
+      decision: status_ === 'review' ? 'skip' : status_,
+      decisionTarget: match ? match.id : null
+    };
+  },
+
+  describe: (c) => (c.name || '(unnamed contact)') + (c.is_archived ? ' (archived)' : ''),
+
+  repo: contactRepo
+};
+
+// =========================================================================
+// Kennel mapping
+// =========================================================================
+// Natural key: kennel_name (case-insensitive, trimmed), the same name rule the
+// kennel card's link offer uses (kennelRepo.findUnlinkedByName). Kennels come
+// first in an import run: a contact's and a dog's kennel columns resolve against
+// existing kennels only, so importing kennels before contacts and dogs is what
+// lets those rows attach to them.
+//
+// A new kennel is always an OUTSIDE kennel (is_own_kennel false), never one of
+// the user's own: an own kennel mints a public identity and joins the kennel
+// scope (Multi-Kennel Scope Spec), which is set up on the Kennels page, not by a
+// file. For the same reason a row never changes is_own_kennel or public_id on a
+// match; it only fills in the identity fields it carries.
+const KENNEL_MAPPING = {
+  entity: 'kennel',
+  label: 'Kennels',
+  links: [],
+  templateHeaders: ['kennel_name', 'prefix', 'location', 'website'],
+  requiredForCreate: ['kennel_name'],
+
+  async loadExisting() {
+    return kennelRepo.getAll({ includeArchived: true });
+  },
+
+  buildIndex(existing) {
+    const byName = new Map(); // name -> [kennel] (two kennels can share a name)
+    for (const k of existing) {
+      const key = k.kennel_name?.trim().toLowerCase();
+      if (!key) continue;
+      if (!byName.has(key)) byName.set(key, []);
+      byName.get(key).push(k);
+    }
+    return { byName };
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const name = col(row, 'kennel_name', 'kennel', 'name');
+    const record = {};
+    if (name) record.kennel_name = name;
+    for (const [key, ...aliases] of [['prefix'], ['location'], ['website', 'url']]) {
+      const v = col(row, key, ...aliases);
+      if (v) record[key] = v;
+    }
+
+    let status_ = 'create';
+    let match = null;
+    if (!name) {
+      status_ = 'review';
+      reasons.push('No kennel_name — cannot form a natural key.');
+    } else {
+      const hits = index.byName.get(name.toLowerCase()) || [];
+      if (hits.length === 1) {
+        match = hits[0];
+        status_ = 'update';
+      } else if (hits.length > 1) {
+        match = hits[0];
+        status_ = 'review';
+        reasons.push(`${hits.length} kennels on file are named "${name}" — choose "Update match" and pick the right one, or create a new one.`);
+      }
+    }
+
+    const display = name || `(row ${i + 2})`;
+    return {
+      index: i, raw: row, entity: 'kennel', display,
+      // A create is always an outside kennel; an update never touches the flag.
+      record: { ...record, is_own_kennel: false }, changes: { ...record },
+      status: status_, match, matchLabel: match ? KENNEL_MAPPING.describe(match) : '',
+      reasons,
+      decision: status_ === 'review' ? 'skip' : status_,
+      decisionTarget: match ? match.id : null
+    };
+  },
+
+  describe: (k) => (k.kennel_name || '(unnamed kennel)') + (k.is_own_kennel ? ' (your kennel)' : '') + (k.is_archived ? ' (archived)' : ''),
+
+  repo: kennelRepo
+};
+
+// =========================================================================
+// Pairing mapping
+// =========================================================================
+// Natural key: sire + dam + planned_date (Stage 3 Brief §5) — all three must
+// resolve/parse, or the row is keyless and goes to needs-review. Sire/dam are
+// relationship columns resolved against EXISTING dogs only (Data Model §8,
+// point 2); an unresolved name is flagged, never silently dropped.
+const PAIRING_MAPPING = {
+  entity: 'pairing',
+  label: 'Pairings',
+  links: ['dog', 'kennel'],
+  templateHeaders: [
+    'sire_registered_name', 'dam_registered_name', 'pairing_type', 'method',
+    'status', 'planned_date', 'expected_due_date', 'kennel_name', 'notes'
+  ],
+  requiredForCreate: ['sire_id', 'dam_id', 'pairing_type', 'status'],
+
+  async loadExisting() {
+    const [pairings, dogs, kennels] = await Promise.all([
+      pairingRepo.getAll({ includeArchived: true }),
+      dogRepo.getAll({ includeArchived: true }),
+      kennelRepo.getAll({ includeArchived: true })
+    ]);
+    this._dogNames = buildDogNameIndex(dogs);
+    this._kennels = buildKennelNameIndex(kennels);
+    return pairings;
+  },
+
+  buildIndex(existing) {
+    const byKey = new Map();
+    for (const p of existing) {
+      const key = nkParts(p.sire_id, p.dam_id, p.planned_date);
+      if (key) byKey.set(key, p);
+    }
+    return { byKey, dogNames: this._dogNames, kennels: this._kennels };
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const unresolved = [];
+    const record = {};
+
+    const sireName = col(row, 'sire_registered_name', 'sire_name');
+    const damName = col(row, 'dam_registered_name', 'dam_name');
+    let sireId = '', damId = '';
+    if (sireName) {
+      const hit = index.dogNames.get(sireName.toLowerCase());
+      if (hit) { sireId = hit.id; record.sire_id = hit.id; }
+      else unresolved.push(`Sire "${sireName}" not found`);
+    }
+    if (damName) {
+      const hit = index.dogNames.get(damName.toLowerCase());
+      if (hit) { damId = hit.id; record.dam_id = hit.id; }
+      else unresolved.push(`Dam "${damName}" not found`);
+    }
+
+    const pairingType = normEnum(PAIRING_TYPE, col(row, 'pairing_type', 'type'));
+    if (pairingType === null) reasons.push(`Unrecognized pairing_type "${col(row, 'pairing_type', 'type')}".`);
+    else if (pairingType) record.pairing_type = pairingType;
+
+    const method = normEnum(PAIRING_METHOD, col(row, 'method'));
+    if (method === null) reasons.push(`Unrecognized method "${col(row, 'method')}" (ignored).`);
+    else if (method) record.method = method;
+
+    const status = normEnum(PAIRING_STATUS, col(row, 'status'));
+    if (status === null) reasons.push(`Unrecognized status "${col(row, 'status')}".`);
+    else if (status) record.status = status;
+
+    const plannedRaw = col(row, 'planned_date');
+    const planned = normDate(plannedRaw);
+    if (planned === null) reasons.push(`Unrecognized planned_date "${plannedRaw}".`);
+    else if (planned) record.planned_date = planned;
+
+    const dueRaw = col(row, 'expected_due_date');
+    const due = normDate(dueRaw);
+    if (due === null) reasons.push(`Unrecognized expected_due_date "${dueRaw}".`);
+    else if (due) record.expected_due_date = due;
+
+    const notes = col(row, 'notes');
+    if (notes) record.notes = notes;
+
+    // Kennel by name (§11) — pairings only ever carry an own-kennel scope.
+    const kennelUnresolved = resolveKennelColumn(row, index.kennels, record, reasons, { requireOwn: true });
+
+    // Natural key → match-or-create.
+    const key = (sireId && damId && planned) ? nkParts(sireId, damId, planned) : null;
+    let status_ = 'create';
+    let match = null;
+    if (!key) {
+      status_ = 'review';
+      if (!sireName) reasons.push('No sire_registered_name — cannot form a natural key.');
+      if (!damName) reasons.push('No dam_registered_name — cannot form a natural key.');
+      if (!planned) reasons.push('No planned_date — cannot form a natural key.');
+    } else {
+      match = index.byKey.get(key) || null;
+      status_ = match ? 'update' : 'create';
+    }
+
+    if (status_ === 'create') {
+      const missing = this.requiredForCreate.filter((f) => !record[f]);
+      if (missing.length) { status_ = 'review'; reasons.push(`Missing required field(s) for a new pairing: ${missing.join(', ')}.`); }
+      if (record.sire_id && record.dam_id && record.sire_id === record.dam_id) {
+        status_ = 'review'; reasons.push('Sire and dam cannot be the same dog.');
+      }
+    }
+    if (unresolved.length) { if (status_ !== 'review') status_ = 'review'; reasons.push(unresolved.join('; ') + '.'); }
+    if (kennelUnresolved) status_ = 'review';
+
+    const display = `${sireName || '?'} × ${damName || '?'}${planned ? ` (${planned})` : ''}`;
+    return {
+      index: i, raw: row, entity: 'pairing', display,
+      record, changes: { ...record },
+      status: status_, match, matchLabel: match ? PAIRING_MAPPING.describe(match) : '',
+      reasons,
+      decision: status_ === 'review' ? 'skip' : status_,
+      decisionTarget: match ? match.id : null
+    };
+  },
+
+  describe: (p) => `${p.pairing_type || 'Pairing'} — ${p.planned_date || 'no date'}` + (p.is_archived ? ' (archived)' : ''),
+
+  repo: pairingRepo
+};
+
+// =========================================================================
+// Litter mapping
+// =========================================================================
+// Natural key: dam + sire + whelp_date (Stage 3 Brief §5). Same relationship-
+// column resolution rule as Pairing above.
+const LITTER_MAPPING = {
+  entity: 'litter',
+  label: 'Litters',
+  links: ['dog', 'kennel'],
+  templateHeaders: [
+    'dam_registered_name', 'sire_registered_name', 'nickname', 'whelp_date',
+    'litter_registration_number', 'puppies_born_total', 'puppies_born_alive',
+    'puppies_born_deceased', 'delivery_type', 'status', 'kennel_name', 'notes'
+  ],
+  requiredForCreate: ['dam_id', 'sire_id', 'status'],
+
+  async loadExisting() {
+    const [litters, dogs, kennels] = await Promise.all([
+      litterRepo.getAll({ includeArchived: true }),
+      dogRepo.getAll({ includeArchived: true }),
+      kennelRepo.getAll({ includeArchived: true })
+    ]);
+    this._dogNames = buildDogNameIndex(dogs);
+    this._kennels = buildKennelNameIndex(kennels);
+    return litters;
+  },
+
+  buildIndex(existing) {
+    const byKey = new Map();
+    for (const l of existing) {
+      const key = nkParts(l.dam_id, l.sire_id, l.whelp_date);
+      if (key) byKey.set(key, l);
+    }
+    return { byKey, dogNames: this._dogNames, kennels: this._kennels };
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const unresolved = [];
+    const record = {};
+
+    const damName = col(row, 'dam_registered_name', 'dam_name');
+    const sireName = col(row, 'sire_registered_name', 'sire_name');
+    let damId = '', sireId = '';
+    if (damName) {
+      const hit = index.dogNames.get(damName.toLowerCase());
+      if (hit) { damId = hit.id; record.dam_id = hit.id; }
+      else unresolved.push(`Dam "${damName}" not found`);
+    }
+    if (sireName) {
+      const hit = index.dogNames.get(sireName.toLowerCase());
+      if (hit) { sireId = hit.id; record.sire_id = hit.id; }
+      else unresolved.push(`Sire "${sireName}" not found`);
+    }
+
+    const whelpRaw = col(row, 'whelp_date');
+    const whelp = normDate(whelpRaw);
+    if (whelp === null) reasons.push(`Unrecognized whelp_date "${whelpRaw}".`);
+    else if (whelp) record.whelp_date = whelp;
+
+    const regNum = col(row, 'litter_registration_number', 'registration_number');
+    if (regNum) record.litter_registration_number = regNum;
+
+    for (const key of ['puppies_born_total', 'puppies_born_alive', 'puppies_born_deceased']) {
+      const raw = col(row, key);
+      if (raw === '') continue;
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0) reasons.push(`Unrecognized ${key} "${raw}" (ignored).`);
+      else record[key] = n;
+    }
+
+    const status = normEnum(LITTER_STATUS, col(row, 'status'));
+    if (status === null) reasons.push(`Unrecognized status "${col(row, 'status')}".`);
+    else if (status) record.status = status;
+
+    const delivery = normEnum(LITTER_DELIVERY_TYPE, col(row, 'delivery_type', 'delivery'), DELIVERY_ALIASES);
+    if (delivery === null) reasons.push(`Unrecognized delivery_type "${col(row, 'delivery_type', 'delivery')}" (ignored).`);
+    else if (delivery) record.delivery_type = delivery;
+
+    const nickname = col(row, 'nickname');
+    if (nickname) record.nickname = nickname;
+
+    const notes = col(row, 'notes');
+    if (notes) record.notes = notes;
+
+    // Kennel by name (§11) — litters only ever carry an own-kennel scope.
+    const kennelUnresolved = resolveKennelColumn(row, index.kennels, record, reasons, { requireOwn: true });
+
+    // Natural key → match-or-create.
+    const key = (damId && sireId && whelp) ? nkParts(damId, sireId, whelp) : null;
+    let status_ = 'create';
+    let match = null;
+    if (!key) {
+      status_ = 'review';
+      if (!damName) reasons.push('No dam_registered_name — cannot form a natural key.');
+      if (!sireName) reasons.push('No sire_registered_name — cannot form a natural key.');
+      if (!whelp) reasons.push('No whelp_date — cannot form a natural key.');
+    } else {
+      match = index.byKey.get(key) || null;
+      status_ = match ? 'update' : 'create';
+    }
+
+    if (status_ === 'create') {
+      const missing = this.requiredForCreate.filter((f) => !record[f]);
+      if (missing.length) { status_ = 'review'; reasons.push(`Missing required field(s) for a new litter: ${missing.join(', ')}.`); }
+    }
+    if (unresolved.length) { if (status_ !== 'review') status_ = 'review'; reasons.push(unresolved.join('; ') + '.'); }
+    if (kennelUnresolved) status_ = 'review';
+
+    const display = `${damName || '?'} × ${sireName || '?'}${whelp ? ` (${whelp})` : ''}`;
+    return {
+      index: i, raw: row, entity: 'litter', display,
+      record, changes: { ...record },
+      status: status_, match, matchLabel: match ? LITTER_MAPPING.describe(match) : '',
+      reasons,
+      decision: status_ === 'review' ? 'skip' : status_,
+      decisionTarget: match ? match.id : null
+    };
+  },
+
+  describe: (l) => `Litter — ${l.whelp_date || 'no date'}` + (l.is_archived ? ' (archived)' : ''),
+
+  repo: litterRepo
+};
+
+// =========================================================================
+// Sale mapping (Stage 4)
+// =========================================================================
+// Natural key: dog + buyer + sale_date (Stage4 Revision v2 §6) — a dateless
+// sale routes to needs-review by design (sale_date is optional on the entity,
+// so this is expected, not a bug). Dog is resolved against EXISTING dogs only
+// (same rule as sire/dam elsewhere). buyer_name is DIFFERENT from every other
+// relationship column in this file: it resolves against Contacts, but an
+// unmatched name is NOT flagged for review — it's created inline as a Contact
+// (never a Buyer — there is no Buyer table, Data Model v3 §5.5) at commit time,
+// via the mapping.prepareRecord hook below.
+const SALE_MAPPING = {
+  entity: 'sale',
+  label: 'Sales',
+  links: ['dog', 'contact', 'kennel'],
+  templateHeaders: [
+    'dog_registered_name', 'buyer_name', 'sale_date', 'registration_type', 'status',
+    'price', 'deposit_amount', 'deposit_date', 'balance_paid_date', 'kennel_name', 'lead_source', 'notes'
+  ],
+  requiredForCreate: ['dog_id', 'registration_type', 'status'],
+
+  async loadExisting() {
+    const [sales, dogs, contacts, kennels] = await Promise.all([
+      saleRepo.getAll({ includeArchived: true }),
+      dogRepo.getAll({ includeArchived: true }),
+      contactRepo.getAll({ includeArchived: true }),
+      kennelRepo.getAll({ includeArchived: true })
+    ]);
+    this._dogNames = buildDogNameIndex(dogs);
+    this._contactsById = new Map(contacts.map((c) => [c.id, c]));
+    this._contactByName = new Map();
+    for (const c of contacts) if (c.name) this._contactByName.set(c.name.trim().toLowerCase(), c);
+    this._kennels = buildKennelNameIndex(kennels);
+    return sales;
+  },
+
+  buildIndex(existing) {
+    const byKey = new Map();
+    for (const s of existing) {
+      const buyerName = (this._contactsById.get(s.buyer_contact_id)?.name || '').trim().toLowerCase();
+      const key = nkParts(s.dog_id, buyerName || null, s.sale_date);
+      if (key) byKey.set(key, s);
+    }
+    return { byKey, dogNames: this._dogNames, contactByName: this._contactByName, kennels: this._kennels };
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const record = {};
+
+    const dogNameRaw = col(row, 'dog_registered_name', 'dog_name');
+    let dogId = '';
+    if (dogNameRaw) {
+      const hit = index.dogNames.get(dogNameRaw.toLowerCase());
+      if (hit) { dogId = hit.id; record.dog_id = hit.id; }
+      else reasons.push(`Dog "${dogNameRaw}" not found.`);
+    }
+
+    const buyerName = col(row, 'buyer_name', 'buyer');
+    let buyerNameKey = '';
+    let toCreateBuyer = '';
+    if (buyerName) {
+      buyerNameKey = buyerName.trim().toLowerCase();
+      const hit = index.contactByName.get(buyerNameKey);
+      if (hit) record.buyer_contact_id = hit.id;
+      else toCreateBuyer = buyerName.trim(); // created inline on commit — never flagged
+    }
+
+    const registrationRaw = col(row, 'registration_type', 'registration');
+    const registrationType = normEnum(REGISTRATION_TYPE, registrationRaw, { unregistered: 'none', 'co-own': 'co_own' });
+    if (registrationType === null) reasons.push(`Unrecognized registration_type "${registrationRaw}".`);
+    else if (registrationType) record.registration_type = registrationType;
+
+    const status = normEnum(SALE_STATUS, col(row, 'status'));
+    if (status === null) reasons.push(`Unrecognized status "${col(row, 'status')}".`);
+    else if (status) record.status = status;
+
+    const saleRaw = col(row, 'sale_date');
+    const saleDate = normDate(saleRaw);
+    if (saleDate === null) reasons.push(`Unrecognized sale_date "${saleRaw}".`);
+    else if (saleDate) record.sale_date = saleDate;
+
+    for (const [key, ...aliases] of [
+      ['deposit_amount'], ['price'], ['lead_source'], ['notes']
+    ]) {
+      const v = col(row, key, ...aliases);
+      if (v) record[key] = key === 'price' || key === 'deposit_amount' ? Number(v) : v;
+    }
+    for (const key of ['deposit_date', 'balance_paid_date']) {
+      const raw = col(row, key);
+      const d = normDate(raw);
+      if (d === null && raw) reasons.push(`Unrecognized ${key} "${raw}" (ignored).`);
+      else if (d) record[key] = d;
+    }
+
+    // Kennel by name (§11) — sales only ever carry an own-kennel scope.
+    const kennelUnresolved = resolveKennelColumn(row, index.kennels, record, reasons, { requireOwn: true });
+
+    // Natural key → match-or-create. Uses the buyer NAME (not id) so a
+    // not-yet-created buyer still matches consistently within this import.
+    const key = (dogId && buyerNameKey && saleDate) ? nkParts(dogId, buyerNameKey, saleDate) : null;
+    let status_ = 'create';
+    let match = null;
+    if (!key) {
+      status_ = 'review';
+      if (!dogNameRaw) reasons.push('No dog_registered_name — cannot form a natural key.');
+      if (!buyerName) reasons.push('No buyer_name — cannot form a natural key.');
+      if (!saleDate) reasons.push('No sale_date — cannot form a natural key.');
+    } else {
+      match = index.byKey.get(key) || null;
+      status_ = match ? 'update' : 'create';
+    }
+
+    if (status_ === 'create') {
+      const missing = this.requiredForCreate.filter((f) => !record[f]);
+      if (missing.length) { status_ = 'review'; reasons.push(`Missing required field(s) for a new sale: ${missing.join(', ')}.`); }
+    }
+    if (!dogId && dogNameRaw) status_ = 'review'; // unresolved dog is always flagged, unlike buyer
+    if (toCreateBuyer) reasons.push(`Buyer "${toCreateBuyer}" not found — will be created as a new Contact.`);
+    if (kennelUnresolved) status_ = 'review';
+
+    const display = `${dogNameRaw || '?'} → ${buyerName || '?'}${saleDate ? ` (${saleDate})` : ''}`;
+    return {
+      index: i, raw: row, entity: 'sale', display,
+      record, changes: { ...record },
+      status: status_, match, matchLabel: match ? SALE_MAPPING.describe(match) : '',
+      reasons,
+      decision: status_ === 'review' ? 'skip' : status_,
+      decisionTarget: match ? match.id : null,
+      _buyerNameToCreate: toCreateBuyer || null
+    };
+  },
+
+  // Runs just before commit writes the row (create or update). The one place a
+  // Sale row differs from every other mapping: an unmatched buyer_name becomes
+  // a real Contact here, never a silent drop and never a "needs review" stall.
+  async prepareRecord(r) {
+    if (!r._buyerNameToCreate) return;
+    const contact = await contactRepo.create({ name: r._buyerNameToCreate, contact_type: ['buyer'] });
+    r.record.buyer_contact_id = contact.id;
+    r.changes.buyer_contact_id = contact.id;
+  },
+
+  describe: (s) => `Sale — ${s.sale_date || 'no date'}` + (s.is_archived ? ' (archived)' : ''),
+
+  repo: saleRepo
+};
+
+// =========================================================================
+// Event mapping (Stage4.5 Addendum §A1.1) — dog-subject only
+// =========================================================================
+// Natural key: dog + event_type + event_date, title as a tiebreak on collision
+// (multiple existing events sharing that same dog/type/date). Pairing/litter
+// subject events are out of scope for this importer (Data Model §8's worked
+// example is dog-only; subject resolution for those has no registered-name key
+// — flagged as a future item, not half-built here).
+const EVENT_MAPPING = {
+  entity: 'event',
+  label: 'Events',
+  links: ['dog', 'contact'],
+  templateHeaders: [
+    'dog_registered_name', 'event_type', 'event_date', 'event_end_date', 'title',
+    'related_contact_name', 'reminder_date', 'details_json', 'notes'
+  ],
+  requiredForCreate: ['subject_id', 'event_type', 'event_date', 'title'],
+
+  async loadExisting() {
+    const [events, dogs, contacts] = await Promise.all([
+      HistoryEvent.getAll({ includeArchived: true }),
+      dogRepo.getAll({ includeArchived: true }),
+      contactRepo.getAll({ includeArchived: true })
+    ]);
+    this._dogNames = buildDogNameIndex(dogs);
+    this._contactByName = new Map();
+    for (const c of contacts) if (c.name) this._contactByName.set(c.name.trim().toLowerCase(), c);
+    return events.filter((e) => e.subject_type === 'dog');
+  },
+
+  buildIndex(existing) {
+    // Multiple events can legitimately share dog+type+date (e.g. two vaccines
+    // logged same day) — the key maps to an ARRAY, resolved by title below.
+    const byKey = new Map();
+    for (const e of existing) {
+      const key = nkParts(e.subject_id, e.event_type, e.event_date);
+      if (!key) continue;
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(e);
+    }
+    return { byKey, dogNames: this._dogNames, contactByName: this._contactByName };
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const record = { subject_type: 'dog' };
+
+    const dogNameRaw = col(row, 'dog_registered_name', 'dog_name');
+    let dogId = '';
+    if (dogNameRaw) {
+      const hit = index.dogNames.get(dogNameRaw.toLowerCase());
+      if (hit) { dogId = hit.id; record.subject_id = hit.id; }
+      else reasons.push(`Dog "${dogNameRaw}" not found.`);
+    }
+
+    const eventTypeRaw = col(row, 'event_type', 'type');
+    const eventType = normEnum(eventTypesFor('dog'), eventTypeRaw);
+    if (eventType === null) reasons.push(`Unrecognized event_type "${eventTypeRaw}" for a dog-subject event.`);
+    else if (eventType) record.event_type = eventType;
+
+    const dateRaw = col(row, 'event_date');
+    const eventDate = normDate(dateRaw);
+    if (eventDate === null) reasons.push(`Unrecognized event_date "${dateRaw}".`);
+    else if (eventDate) record.event_date = eventDate;
+
+    const endRaw = col(row, 'event_end_date');
+    const eventEnd = normDate(endRaw);
+    // event_end_date only belongs on a `span`-duration type (boarding, heat_cycle,
+    // medication). A non-null end on an `instant` type is the soft warning the
+    // eventRepo comment delegates here (Stage4.5 Addendum §C3): note it and drop
+    // the stray value — never a hard block, and instant events stay end-date-free,
+    // matching the UI form that hides the field for instant types.
+    const typeDef = eventType ? eventTypesFor('dog').find((t) => t.value === eventType) : null;
+    if (eventEnd === null && endRaw) reasons.push(`Unrecognized event_end_date "${endRaw}" (ignored).`);
+    else if (eventEnd && typeDef && typeDef.duration === 'instant') {
+      reasons.push(`event_end_date is only for span events; "${eventTypeRaw}" is an instant type — the end date was ignored.`);
+    } else if (eventEnd) record.event_end_date = eventEnd;
+
+    const title = col(row, 'title');
+    if (title) record.title = title;
+
+    const relatedName = col(row, 'related_contact_name');
+    if (relatedName) {
+      const hit = index.contactByName.get(relatedName.toLowerCase());
+      if (hit) record.related_contact_id = hit.id;
+      else reasons.push(`Related contact "${relatedName}" not found — leave the CSV column blank or add the contact first (never auto-created).`);
+    }
+
+    // reminder_date (Stage 5, Build Brief §3.6) — the reminder engine's one
+    // future-dated field. Unparseable → soft-warn, drop the value, keep the row
+    // (same posture as event_end_date above). Blank is normal (most events carry
+    // no reminder). A reminder_date earlier than event_date is only a soft UI
+    // warning, never enforced here.
+    const reminderRaw = col(row, 'reminder_date');
+    const reminderDate = normDate(reminderRaw);
+    if (reminderDate === null && reminderRaw) reasons.push(`Unrecognized reminder_date "${reminderRaw}" (ignored).`);
+    else if (reminderDate) record.reminder_date = reminderDate;
+
+    const detailsRaw = col(row, 'details_json');
+    let detailsError = false;
+    if (detailsRaw) {
+      try {
+        const parsed = JSON.parse(detailsRaw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) record.details = parsed;
+        else { detailsError = true; reasons.push(`details_json is not a JSON object: "${detailsRaw}".`); }
+      } catch (e) {
+        detailsError = true;
+        reasons.push(`Malformed details_json: ${e.message}.`);
+      }
+    } else {
+      record.details = {};
+    }
+
+    const notes = col(row, 'notes');
+    if (notes) record.notes = notes;
+
+    // Natural key → match-or-create; title is the tiebreak when dog+type+date
+    // collides across more than one existing event.
+    const key = (dogId && eventType && eventDate) ? nkParts(dogId, eventType, eventDate) : null;
+    let status_ = 'create';
+    let match = null;
+    if (!key) {
+      status_ = 'review';
+      if (!dogNameRaw) reasons.push('No dog_registered_name — cannot form a natural key.');
+      if (!eventTypeRaw) reasons.push('No event_type — cannot form a natural key.');
+      if (!dateRaw) reasons.push('No event_date — cannot form a natural key.');
+    } else {
+      const candidates = index.byKey.get(key) || [];
+      const sameTitle = (c) => !!title && (c.title || '').trim().toLowerCase() === title.trim().toLowerCase();
+      if (candidates.length === 0) {
+        status_ = 'create';
+      } else if (eventType === 'show' && candidates.length === 1 && !sameTitle(candidates[0])) {
+        // Show double-headers (Show Tracking Spec §8): two shows at one site on
+        // one day are two events, so for `show` the title always takes part in
+        // the match — a lone candidate with a different title is never silently
+        // overwritten (nor silently duplicated): the user decides.
+        status_ = 'review';
+        match = candidates[0];
+        reasons.push('An existing show event for this dog on this date has a different title — if this is a second show the same day, choose Create; if it\'s the same show retitled, choose Update match.');
+      } else if (candidates.length === 1) {
+        match = candidates[0];
+        status_ = 'update';
+      } else {
+        const titleMatches = candidates.filter(sameTitle);
+        if (titleMatches.length === 1) {
+          match = titleMatches[0];
+          status_ = 'update';
+        } else {
+          status_ = 'review';
+          match = candidates[0];
+          reasons.push('Multiple existing events share this dog + type + date, and the title didn\'t uniquely resolve which one to update — choose "Update match" and pick the right one, or create a new one.');
+        }
+      }
+    }
+
+    if (status_ === 'create') {
+      const missing = this.requiredForCreate.filter((f) => !record[f]);
+      if (missing.length) { status_ = 'review'; reasons.push(`Missing required field(s) for a new event: ${missing.join(', ')}.`); }
+    }
+    if (!dogId && dogNameRaw) status_ = 'review'; // unresolved dog is always flagged, never auto-created
+    if (relatedName && !record.related_contact_id) status_ = 'review'; // unresolved contact is always flagged, never auto-created
+    if (detailsError) status_ = 'review';
+
+    const display = `${dogNameRaw || '?'} — ${eventTypeRaw || '?'}${eventDate ? ` (${eventDate})` : ''}`;
+    return {
+      index: i, raw: row, entity: 'event', display,
+      record, changes: { ...record },
+      status: status_, match, matchLabel: match ? EVENT_MAPPING.describe(match) : '',
+      reasons,
+      decision: status_ === 'review' ? 'skip' : status_,
+      decisionTarget: match ? match.id : null
+    };
+  },
+
+  describe: (e) => `${descriptorLabel(eventTypesFor('dog'), e.event_type)} — ${e.event_date || 'no date'}${e.title ? `: ${e.title}` : ''}` + (e.is_archived ? ' (archived)' : ''),
+
+  repo: HistoryEvent
+};
+
+// Small local helper so EVENT_MAPPING.describe doesn't need to import the
+// shared `descriptor()` (would require pulling in badge/label plumbing it
+// doesn't otherwise need) — just the label lookup.
+function descriptorLabel(vocab, value) {
+  return vocab.find((v) => v.value === value)?.label || value || 'Event';
+}
+
+// =========================================================================
+// StudService mapping (Stage4.5 Addendum §A1.2)
+// =========================================================================
+// Natural-key wrinkle, stated plainly: StudService has no date field, so its
+// natural key is our_dog + partner_dog + direction — which collapses REPEAT
+// arrangements between the same pair. Rather than silently overwrite, any
+// existing match is always routed to needs-review as an ambiguous match (the
+// user decides update-vs-create), never auto-treated as an update.
+// Other words for who travels on a stud service row (normEnum keys).
+const STUD_DIRECTION_WORDS = {
+  ours: 'to_partner', our_dog: 'to_partner', we_travel: 'to_partner', to_them: 'to_partner',
+  theirs: 'to_us', their_dog: 'to_us', they_travel: 'to_us', to_us: 'to_us',
+  ai: 'shipped', shipped: 'shipped', 'ai_/_shipped': 'shipped', none: 'shipped', no_one: 'shipped'
+};
+
+const STUD_SERVICE_MAPPING = {
+  entity: 'stud_service',
+  label: 'Stud Services',
+  links: ['dog', 'contact', 'kennel'],
+  templateHeaders: [
+    'direction', 'our_dog_registered_name', 'partner_dog_registered_name',
+    'partner_contact_name', 'fee_amount', 'fee_structure', 'status', 'kennel_name', 'result_notes'
+  ],
+  requiredForCreate: ['direction', 'our_dog_id', 'partner_dog_id', 'partner_contact_id', 'status'],
+
+  async loadExisting() {
+    const [studServices, dogs, contacts, kennels] = await Promise.all([
+      studServiceRepo.getAll({ includeArchived: true }),
+      dogRepo.getAll({ includeArchived: true }),
+      contactRepo.getAll({ includeArchived: true }),
+      kennelRepo.getAll({ includeArchived: true })
+    ]);
+    this._dogNames = buildDogNameIndex(dogs);
+    this._dogsById = new Map(dogs.map((d) => [d.id, d]));
+    this._contactByName = new Map();
+    for (const c of contacts) if (c.name) this._contactByName.set(c.name.trim().toLowerCase(), c);
+    this._kennels = buildKennelNameIndex(kennels);
+    return studServices;
+  },
+
+  buildIndex(existing) {
+    const byKey = new Map();
+    for (const s of existing) {
+      const key = nkParts(s.our_dog_id, s.partner_dog_id);
+      if (!key) continue;
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(s);
+    }
+    return { byKey, dogNames: this._dogNames, contactByName: this._contactByName, dogsById: this._dogsById, kennels: this._kennels };
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const record = {};
+
+    // Who travels (decided 2026-10-15); a few plain words read as one.
+    const direction = normEnum(STUD_SERVICE_DIRECTION, col(row, 'direction', 'who_travels'), STUD_DIRECTION_WORDS);
+    if (direction === null) reasons.push(`Unrecognized "who travels" "${col(row, 'direction', 'who_travels')}".`);
+    else if (direction) record.direction = direction;
+
+    const ourDogName = col(row, 'our_dog_registered_name', 'our_dog_name');
+    let ourDogId = '';
+    if (ourDogName) {
+      const hit = index.dogNames.get(ourDogName.toLowerCase());
+      if (hit) { ourDogId = hit.id; record.our_dog_id = hit.id; }
+      else reasons.push(`Our dog "${ourDogName}" not found.`);
+    }
+
+    const partnerDogName = col(row, 'partner_dog_registered_name', 'partner_dog_name');
+    let partnerDogId = '';
+    if (partnerDogName) {
+      const hit = index.dogNames.get(partnerDogName.toLowerCase());
+      if (hit) { partnerDogId = hit.id; record.partner_dog_id = hit.id; }
+      else reasons.push(`Partner dog "${partnerDogName}" not found — add it (even as an external reference) before importing, or it can be created inline from the Stud Service Detail screen.`);
+    }
+
+    const partnerContactName = col(row, 'partner_contact_name');
+    let toCreateContact = '';
+    if (partnerContactName) {
+      const hit = index.contactByName.get(partnerContactName.trim().toLowerCase());
+      if (hit) record.partner_contact_id = hit.id;
+      else toCreateContact = partnerContactName.trim(); // created inline on commit — never flagged
+    }
+
+    const feeRaw = col(row, 'fee_amount');
+    if (feeRaw !== '') {
+      const n = Number(feeRaw);
+      if (!Number.isFinite(n)) reasons.push(`Unrecognized fee_amount "${feeRaw}" (ignored).`);
+      else record.fee_amount = n;
+    }
+
+    const feeStructure = normEnum(FEE_STRUCTURE, col(row, 'fee_structure'));
+    if (feeStructure === null) reasons.push(`Unrecognized fee_structure "${col(row, 'fee_structure')}" (ignored).`);
+    else if (feeStructure) record.fee_structure = feeStructure;
+
+    const status = normEnum(STUD_SERVICE_STATUS, col(row, 'status'));
+    if (status === null) reasons.push(`Unrecognized status "${col(row, 'status')}".`);
+    else if (status) record.status = status;
+
+    const resultNotes = col(row, 'result_notes');
+    if (resultNotes) record.result_notes = resultNotes;
+
+    // Kennel by name (§11) — a stud service only ever carries an own-kennel
+    // scope (it inherits from OUR dog, never the partner's).
+    const kennelUnresolved = resolveKennelColumn(row, index.kennels, record, reasons, { requireOwn: true });
+
+    // pairing_id is deliberately never set via CSV (Addendum §A1.2) — link it
+    // later from the Stud Service Detail screen.
+
+    const key = (ourDogId && partnerDogId) ? nkParts(ourDogId, partnerDogId) : null;
+    let status_ = 'create';
+    let match = null;
+    if (!key) {
+      status_ = 'review';
+      if (!ourDogName) reasons.push('No our_dog_registered_name — cannot form a natural key.');
+      if (!partnerDogName) reasons.push('No partner_dog_registered_name — cannot form a natural key.');
+    } else {
+      const candidates = index.byKey.get(key) || [];
+      if (candidates.length === 0) {
+        status_ = 'create';
+      } else {
+        // Always ambiguous — a repeat arrangement is indistinguishable from an
+        // update of the existing one by key alone (Addendum §A1.2). Surface it,
+        // don't guess: the user picks "Update match" (and which one) or "Create new".
+        status_ = 'review';
+        match = candidates[0];
+        reasons.push('An existing stud service already matches this dog pair. Is this an update to that arrangement, or a new repeat service? Choose "Update match" (pick the right one if more than one exists) or "Create new".');
+      }
+    }
+
+    if (status_ === 'create') {
+      const missing = this.requiredForCreate.filter((f) => !record[f]);
+      if (missing.length) { status_ = 'review'; reasons.push(`Missing required field(s) for a new stud service: ${missing.join(', ')}.`); }
+    }
+    if (!ourDogId && ourDogName) status_ = 'review';
+    if (!partnerDogId && partnerDogName) status_ = 'review';
+    if (toCreateContact) reasons.push(`Partner contact "${toCreateContact}" not found — will be created as a new Contact.`);
+    if (kennelUnresolved) status_ = 'review';
+
+    const display = `${ourDogName || '?'} × ${partnerDogName || '?'}${direction ? ` (${direction})` : ''}`;
+    return {
+      index: i, raw: row, entity: 'stud_service', display,
+      record, changes: { ...record },
+      status: status_, match, matchLabel: match ? STUD_SERVICE_MAPPING.describe(match) : '',
+      reasons,
+      decision: status_ === 'review' ? 'skip' : status_,
+      decisionTarget: match ? match.id : null,
+      _partnerContactNameToCreate: toCreateContact || null
+    };
+  },
+
+  // The one auto-create in this mapping, mirroring the Sale buyer_name
+  // exception (Addendum §A1.2) — an unmatched partner contact becomes a real
+  // Contact here, never a silent drop and never a "needs review" stall.
+  async prepareRecord(r) {
+    if (!r._partnerContactNameToCreate) return;
+    const contact = await contactRepo.create({ name: r._partnerContactNameToCreate, contact_type: ['breeder'] });
+    r.record.partner_contact_id = contact.id;
+    r.changes.partner_contact_id = contact.id;
+  },
+
+  describe(s) {
+    const ours = this._dogsById?.get(s.our_dog_id);
+    const partner = this._dogsById?.get(s.partner_dog_id);
+    return `${ours?.call_name || '—'} × ${partner?.call_name || '—'} (${s.direction || '?'})` + (s.is_archived ? ' (archived)' : '');
+  },
+
+  repo: studServiceRepo
+};
+
+// =========================================================================
+// Expense mapping (Receipts-app import path)
+// =========================================================================
+// The ledger's external-tool import path: a companion receipts/mileage app (or
+// any spreadsheet) emits one row per cost and this brings it into the Expense
+// ledger with the same dry-run + match-or-create discipline as every other
+// mapping. There is no photo/attachment side (KennelOS stores none, §15) — only
+// the extracted money data crosses over; the image stays in the source app.
+//
+// Subject resolution (polymorphic Expense subject, §21): supports the two
+// subjects an external tool can name — `kennel` (program overhead, the default
+// when the column is blank) resolved by kennel name (or your configured "my
+// kennel" when unnamed), and `dog` resolved by registered/call name. `litter`
+// and `pairing` subjects have no name key, so those rows go to needs-review
+// (log them from the record itself), mirroring the Event importer's dog-only
+// scope.
+//
+// Natural key (idempotent re-import): subject + expense_date + amount +
+// category + vendor. Re-importing the same file updates rather than duplicates.
+// The match index only considers non-archived, NON-event-linked ledger rows, so
+// a re-import can never clobber a cost captured from the event form.
+const EXPENSE_CATEGORY_VALUES = EXPENSE_CATEGORIES.map((c) => c.value);
+const EXPENSE_SUBJECT_VALUES = EXPENSE_SUBJECT_TYPES.map((s) => s.value);
+
+function amtKey(n) {
+  return n == null ? '' : Number(n).toFixed(2);
+}
+
+// The natural-key string for an expense given its resolved parts. Any missing
+// part (no subject, no date, no amount) yields null — a keyless row. Vendor is
+// deliberately allowed to be blank (a mileage/trip row carries none), so this
+// joins directly with a NUL separator rather than via nkParts (which rejects
+// every empty part).
+// When a row carries a `receipt_number`, that IS the key — the same receipt
+// always maps to the same ledger row, so re-import updates it in place even
+// if its amount/date/subject changed.
+function expenseNk(subjectType, subjectId, date, amount, category, vendor, receiptNumber) {
+  const rn = (receiptNumber || '').trim().toLowerCase();
+  if (rn) return `rcpt ${rn}`;
+  if (!subjectType || !subjectId || !date || amount == null) return null;
+  return [subjectType, subjectId, date, amtKey(amount), category || 'other', (vendor || '').trim().toLowerCase()].join(' ');
+}
+
+const EXPENSE_MAPPING = {
+  entity: 'expense',
+  label: 'Expenses',
+  links: ['dog', 'litter', 'pairing', 'kennel'],
+  templateHeaders: [
+    'subject_type', 'subject_name', 'expense_date', 'amount', 'category',
+    'vendor', 'miles', 'mileage_rate', 'receipt_number', 'notes'
+  ],
+  requiredForCreate: ['subject_id', 'expense_date'],
+
+  async loadExisting() {
+    const [expenses, kennels, dogs] = await Promise.all([
+      expenseRepo.getAll({ includeArchived: true }),
+      kennelRepo.getAll({ includeArchived: true }),
+      dogRepo.getAll({ includeArchived: true })
+    ]);
+    this._kennelByName = new Map();
+    this._ownKennels = [];
+    for (const k of kennels) {
+      if (k.kennel_name) this._kennelByName.set(k.kennel_name.trim().toLowerCase(), k);
+      if (k.is_own_kennel && !k.is_archived) this._ownKennels.push(k);
+    }
+    this._kennelById = new Map(kennels.map((k) => [k.id, k]));
+    // Dog name index; a name that resolves to more than one dog is ambiguous
+    // (tracked so classify can flag it instead of guessing).
+    this._dogByName = new Map();
+    this._dogAmbiguous = new Set();
+    for (const d of dogs) {
+      for (const nm of [d.registered_name, d.call_name]) {
+        const key = nm?.trim().toLowerCase();
+        if (!key) continue;
+        if (this._dogByName.has(key) && this._dogByName.get(key).id !== d.id) this._dogAmbiguous.add(key);
+        else this._dogByName.set(key, d);
+      }
+    }
+    this._dogById = new Map(dogs.map((d) => [d.id, d]));
+    return expenses;
+  },
+
+  buildIndex(existing) {
+    const byKey = new Map();
+    for (const e of existing) {
+      if (e.is_archived || e.event_id) continue; // only manual/imported ledger rows
+      const key = expenseNk(e.subject_type, e.subject_id, e.expense_date, e.amount, e.category, e.vendor, e.receipt_number);
+      if (key) byKey.set(key, e);
+    }
+    return {
+      byKey,
+      kennelByName: this._kennelByName,
+      ownKennels: this._ownKennels,
+      kennelById: this._kennelById,
+      dogByName: this._dogByName,
+      dogAmbiguous: this._dogAmbiguous,
+      dogById: this._dogById
+    };
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const record = {};
+
+    // --- Subject type (default kennel = program overhead) ---
+    const subjRaw = col(row, 'subject_type', 'subject');
+    let subjectType = subjRaw ? normEnum(EXPENSE_SUBJECT_TYPES, subjRaw) : 'kennel';
+    if (subjectType === null) { reasons.push(`Unrecognized subject_type "${subjRaw}".`); }
+    else record.subject_type = subjectType;
+
+    // --- Subject resolution → subject_id ---
+    const subjectName = col(row, 'subject_name', 'subject_id', 'kennel_name', 'dog_name', 'dog_registered_name');
+    let subjectDisplay = subjectName;
+    if (subjectType === 'kennel') {
+      if (subjectName) {
+        const hit = index.kennelByName.get(subjectName.toLowerCase());
+        if (hit) record.subject_id = hit.id;
+        else reasons.push(`Kennel "${subjectName}" not found.`);
+      } else {
+        // Blank kennel name → the configured "my kennel", else the sole own kennel.
+        const myId = getMyKennelId();
+        const mine = myId ? index.kennelById.get(myId) : null;
+        if (mine) { record.subject_id = mine.id; subjectDisplay = mine.kennel_name; }
+        else if (index.ownKennels.length === 1) { record.subject_id = index.ownKennels[0].id; subjectDisplay = index.ownKennels[0].kennel_name; }
+        else reasons.push('No subject_name and no single "my kennel" to default to — name the kennel in subject_name.');
+      }
+    } else if (subjectType === 'dog') {
+      if (subjectName) {
+        const key = subjectName.toLowerCase();
+        if (index.dogAmbiguous.has(key)) reasons.push(`Dog "${subjectName}" matches more than one dog — rename or import from the dog's page.`);
+        else {
+          const hit = index.dogByName.get(key);
+          if (hit) record.subject_id = hit.id;
+          else reasons.push(`Dog "${subjectName}" not found.`);
+        }
+      } else reasons.push('subject_type "dog" needs a subject_name.');
+    } else if (subjectType === 'litter' || subjectType === 'pairing') {
+      reasons.push(`${subjectType} expenses can't be imported from CSV (no name key) — log them from the ${subjectType}'s page.`);
+    }
+
+    // --- Date ---
+    const dateRaw = col(row, 'expense_date', 'date');
+    const expenseDate = normDate(dateRaw);
+    if (expenseDate === null) reasons.push(`Unrecognized expense_date "${dateRaw}".`);
+    else if (expenseDate) record.expense_date = expenseDate;
+
+    // --- Mileage vs flat amount ---
+    // Miles present ⇒ a mileage expense: amount is DERIVED by expenseRepo from
+    // miles × rate, category is forced to `mileage`, and amount is never set here.
+    const miles = parseMoney(col(row, 'miles', 'distance'));
+    const rateRaw = col(row, 'mileage_rate', 'rate', 'rate_per_mile');
+    let effectiveAmount = null; // used only for the natural key
+    if (miles != null) {
+      record.miles = miles;
+      let rate = parseMoney(rateRaw);
+      if (rate == null) rate = getMileageDefaults().rate ?? null;
+      if (rate == null) reasons.push('Mileage row needs a mileage_rate (and no default rate is set).');
+      else record.mileage_rate = rate;
+      record.category = 'mileage';
+      effectiveAmount = mileageAmount(miles, rate);
+    } else {
+      const amount = parseMoney(col(row, 'amount', 'total', 'cost'));
+      if (amount == null) reasons.push('No amount (and no miles) — nothing to record.');
+      else { record.amount = amount; effectiveAmount = amount; }
+      // Category (flat rows only; mileage forced above).
+      const catRaw = col(row, 'category');
+      if (catRaw) {
+        const cat = normEnum(EXPENSE_CATEGORIES, catRaw);
+        if (cat) record.category = cat;
+        else reasons.push(`Unrecognized category "${catRaw}" — defaulted to Other.`); // soft: repo defaults to 'other'
+      }
+    }
+
+    const vendor = col(row, 'vendor', 'merchant', 'payee');
+    if (vendor) record.vendor = vendor;
+    const receiptNo = col(row, 'receipt_number', 'receipt_no', 'receipt', 'receipt_#');
+    if (receiptNo) record.receipt_number = receiptNo;
+    const notes = col(row, 'notes', 'memo', 'description');
+    if (notes) record.notes = notes;
+
+    // --- Natural key → match-or-create ---
+    const key = expenseNk(record.subject_type, record.subject_id, record.expense_date, effectiveAmount, record.category, record.vendor, record.receipt_number);
+    let status_ = 'create';
+    let match = null;
+    if (!key) {
+      status_ = 'review';
+    } else {
+      match = index.byKey.get(key) || null;
+      status_ = match ? 'update' : 'create';
+    }
+    // Any unresolved subject / bad date / missing amount already pushed a reason;
+    // force those rows to review so nothing half-formed is silently created.
+    if (reasons.some((r) => !r.includes('defaulted to Other'))) status_ = 'review';
+
+    const catLabel = EXPENSE_CATEGORIES.find((c) => c.value === (record.category || 'other'))?.label || 'Other';
+    const amtShow = effectiveAmount != null ? `$${Number(effectiveAmount).toFixed(2)}` : '—';
+    const display = `${subjectDisplay || '(no subject)'} · ${catLabel} · ${amtShow}${expenseDate ? ` (${expenseDate})` : ''}`;
+    return {
+      index: i, raw: row, entity: 'expense', display,
+      record, changes: { ...record },
+      status: status_, match, matchLabel: match ? EXPENSE_MAPPING.describe(match) : '',
+      reasons,
+      decision: status_ === 'review' ? 'skip' : status_,
+      decisionTarget: match ? match.id : null
+    };
+  },
+
+  describe(e) {
+    const catLabel = EXPENSE_CATEGORIES.find((c) => c.value === e.category)?.label || e.category || 'Expense';
+    let subj = '';
+    if (e.subject_type === 'kennel') subj = this._kennelById?.get(e.subject_id)?.kennel_name || 'kennel';
+    else if (e.subject_type === 'dog') { const d = this._dogById?.get(e.subject_id); subj = d?.registered_name || d?.call_name || 'dog'; }
+    else subj = e.subject_type || '';
+    return `${subj ? subj + ' · ' : ''}${catLabel} · $${Number(e.amount || 0).toFixed(2)} — ${e.expense_date || 'no date'}` + (e.is_archived ? ' (archived)' : '');
+  },
+
+  repo: expenseRepo
+};
+
+// =========================================================================
+// Waitlist application mapping (Waitlist Spec §5.1, W1d)
+// =========================================================================
+// Each row is an application, e.g. a Google Form export, landing as an `applied`
+// entry on one of your own kennels' lists. Natural key: EMAIL (applicants are
+// people you've never recorded, so there's no name+date key to lean on).
+//  - no email or no name → needs review (keyless; never silently created);
+//  - email matches a still-`applied` entry on that kennel → update (refresh the
+//    answers while it's still under review);
+//  - email matches an approved / on-the-list entry → needs review, default Skip
+//    (they're already on the list; don't touch a live family from an old row).
+// Contacts are NOT matched here: approval offers the match (Spec §5.2), the same
+// "offered, never automatic" rule.
+// The columns each question reads come from waitlistForm.js: her own form's
+// imported column (`source_header`, Spec §15.1) first, then the built-in aliases,
+// so a Google Form export lines up with the questions she imported from it.
+const WAITLIST_MAPPING = {
+  entity: 'waitlist',
+  label: 'Waitlist applications',
+  links: ['kennel', 'dog'],
+  templateHeaders: ['name', 'email', 'phone', 'location', 'applied_date', 'pref_sex', 'pref_breed', 'pref_purposes', 'pref_colors', 'ready_timing', 'program', 'heard_from', 'household', 'other_pets', 'experience', 'about', 'kennel_name', 'already_paid', 'already_paid_date', 'notes'],
+  requiredForCreate: ['name', 'email'],
+
+  async loadExisting() {
+    const [entries, own, programs, contacts, dogs] = await Promise.all([
+      waitlistEntryRepo.getAll(),
+      ownKennels(),
+      waitlistProgramRepo.getAll(),
+      contactRepo.getAll({ includeArchived: true }),
+      dogRepo.getAll()
+    ]);
+    this._own = own;
+    // Each kennel's breeds: a breed preference must be one of them (never free text).
+    this._breedsByKennel = new Map(own.map((k) => [k.id, kennelBreeds(k, dogs)]));
+    this._formByKennel = new Map(own.map((k) => [k.id, formQuestions(waitlistConfig(k))]));
+    this._programs = programs;
+    this._contactsById = new Map(contacts.map((c) => [c.id, c]));
+    // The import page sets `preferredKennelId` from its kennel picker; otherwise
+    // the active/sole kennel, like every other import.
+    this._defaultKennelId = this.preferredKennelId || await resolveKennelIdForWrite();
+    // The review picker offers still-open runs only.
+    return entries.filter((e) => WAITLIST_OPEN_STATUSES.includes(e.status));
+  },
+
+  buildIndex(existing) {
+    const lc = (v) => String(v ?? '').trim().toLowerCase();
+    const byKennelEmail = new Map();
+    for (const e of existing) {
+      const contact = e.contact_id ? this._contactsById.get(e.contact_id) : null;
+      for (const email of [e.application && e.application.email, contact && contact.email].map(lc).filter(Boolean)) {
+        byKennelEmail.set(`${e.kennel_id}|${email}`, e);
+      }
+    }
+    const kennelByName = new Map(this._own.map((k) => [lc(k.kennel_name), k]));
+    const programByKey = new Map(this._programs.map((p) => [`${p.kennel_id}|${lc(p.name)}`, p]));
+    return { byKennelEmail, kennelByName, programByKey };
+  },
+
+  classify(row, index, i) {
+    const reasons = [];
+    const record = { status: 'applied' };
+
+    // Kennel first (a named own kennel, else the active/sole kennel): its form
+    // decides which columns hold which answers.
+    const kName = col(row, 'kennel_name', 'kennel');
+    if (kName) {
+      const hit = index.kennelByName.get(kName.toLowerCase());
+      if (hit) record.kennel_id = hit.id;
+      else reasons.push(`"${kName}" isn't one of your kennels.`);
+    } else if (this._defaultKennelId) {
+      record.kennel_id = this._defaultKennelId;
+    }
+    const form = (this._formByKennel && this._formByKennel.get(record.kennel_id)) || formQuestions({});
+    const colsFor = (id) => {
+      const question = form.find((x) => x.id === id);
+      return question ? columnsFor(question) : (IMPORT_ALIASES[id] || [id]);
+    };
+
+    // Answers, keyed by question id, with the wording they were imported under.
+    const application = {};
+    for (const question of form.filter(isAnswerQuestion)) {
+      const v = col(row, ...columnsFor(question));
+      if (!v) continue;
+      application[question.id] = question.type === 'checkboxes' ? v.split(/,\s+|;\s*/).map((x) => x.trim()).filter(Boolean) : v;
+    }
+    const name = application.name || '';
+    const email = application.email || '';
+    record.application = application;
+    record.application_questions = snapshotQuestions(form);
+
+    // Applied date: a Google Form "Timestamp" carries a time — keep the date part.
+    const rawDate = col(row, 'applied_date', 'timestamp', 'date', 'submitted');
+    if (rawDate) {
+      const d = normDate(rawDate.split(/[ T]/)[0]);
+      if (d) record.applied_date = d;
+      else reasons.push(`Unrecognized applied_date "${rawDate}" (left blank).`);
+    }
+
+    const sexRaw = col(row, ...colsFor('pref_sex'));
+    if (sexRaw) {
+      const v = normEnum(WAITLIST_PREF_SEX, sexRaw, { either: 'any', no_preference: 'any', none: 'any', boy: 'male', girl: 'female' });
+      if (v) record.pref_sex = v;
+      else reasons.push(`Unrecognized sex preference "${sexRaw}" (left as either).`);
+    }
+    // Breed resolves against that kennel's breeds (case-insensitive) and takes the
+    // kennel's spelling; an unknown one is flagged and left as any, never invented.
+    const breed = col(row, ...colsFor('pref_breed'));
+    if (breed) {
+      const hit = resolveBreed(breed, (this._breedsByKennel && this._breedsByKennel.get(record.kennel_id)) || []);
+      if (hit) record.pref_breed = hit;
+      else reasons.push(`Breed "${breed}" isn't one of this kennel's breeds (left as any). Pick it on their page.`);
+    }
+    // What they're looking for: one or more purposes, comma-separated ("Pet, Show").
+    // Unknown ones are flagged and dropped; the rest are kept.
+    const purposesRaw = col(row, ...colsFor('pref_purposes'));
+    if (purposesRaw) {
+      const purposes = [];
+      for (const part of purposesRaw.split(/[,;\/]/).map((x) => x.trim()).filter(Boolean)) {
+        const v = normEnum(PLACEMENT_PURPOSE, part, PURPOSE_ALIASES);
+        if (v) purposes.push(v);
+        else reasons.push(`Unrecognized purpose "${part}" (left out).`);
+      }
+      if (purposes.length) record.pref_purposes = cleanPurposes(purposes);
+    }
+    // The soonest they can commit (the readiness hold, Spec §15.8). "1", "1 month",
+    // "3 months", "6+ months", "ASAP" all read; anything else is flagged and left blank.
+    const readyRaw = col(row, ...colsFor('ready_timing'));
+    if (readyRaw) {
+      const k = readyRaw.toLowerCase().replace(/\s*months?\b/, '').replace(/\s+/g, '').trim();
+      const v = { asap: 'asap', immediately: 'asap', now: 'asap', '1': '1_month', '3': '3_months', '6': '6_plus_months', '6+': '6_plus_months', '6plus': '6_plus_months' }[k]
+        || normEnum(WAITLIST_READY_TIMING, readyRaw);
+      if (v) record.ready_timing = v;
+      else reasons.push(`Unrecognized "ready to purchase" answer "${readyRaw}" (left blank). Pick it on their page.`);
+    }
+    const colors = splitList(col(row, ...colsFor('pref_colors')));
+    if (colors.length) record.pref_colors = colors;
+    const notes = col(row, 'notes');
+    if (notes) record.notes = notes;
+
+    // Money they'd already paid her (an early deposit): a credit for funds already
+    // received (receivedCredits.js), every use ticked. New applications only.
+    const paidRaw = col(row, 'already_paid', 'amount_paid', 'deposit_paid', 'paid');
+    if (paidRaw) {
+      const amount = parseMoney(paidRaw);
+      const dateRaw = col(row, 'already_paid_date', 'paid_date', 'deposit_date');
+      const date = dateRaw ? normDate(dateRaw) : (record.applied_date || todayYMD());
+      if (!(amount > 0)) reasons.push(`Unrecognized already_paid "${paidRaw}" (left out).`);
+      else if (!date) reasons.push(`Unrecognized already_paid_date "${dateRaw}" (the amount is left out).`);
+      else record.received_credits = [newCredit({ amount, date, note: 'Already paid (imported)' })];
+    }
+
+    // Program by name, on that kennel only (unresolved → flagged, never invented).
+    const progName = col(row, 'program');
+    if (progName && record.kennel_id) {
+      const p = index.programByKey.get(`${record.kennel_id}|${progName.toLowerCase()}`);
+      if (p) record.waitlist_program_id = p.id;
+      else reasons.push(`Program "${progName}" not found on that kennel (left blank).`);
+    }
+
+    let status_ = 'create';
+    let match = null;
+    let decision = 'create';
+    if (!record.kennel_id) {
+      status_ = 'review';
+      reasons.push('No kennel: add a kennel_name column, or switch the app to one kennel.');
+    } else if (!name) {
+      status_ = 'review';
+      reasons.push('No name.');
+    } else if (!email) {
+      status_ = 'review';
+      reasons.push('No email, so it can\'t be checked for duplicates.');
+    } else {
+      match = index.byKennelEmail.get(`${record.kennel_id}|${email.toLowerCase()}`) || null;
+      if (match && match.status === 'applied') status_ = 'update';
+      else if (match) {
+        status_ = 'review';
+        reasons.push(`Already ${match.status === 'active' ? 'on the list' : 'approved'} on this kennel — not changed.`);
+      }
+    }
+    if (status_ === 'review') decision = 'skip';
+    else decision = status_;
+
+    // An update only refreshes the answers and preferences of an application
+    // still under review — never its kennel, status or dates.
+    const changes = match ? {
+      application: { ...(match.application || {}), ...application },
+      application_questions: record.application_questions,
+      ...Object.fromEntries(['pref_sex', 'pref_breed', 'pref_purposes', 'pref_colors', 'ready_timing', 'waitlist_program_id', 'notes']
+        .filter((k) => record[k] !== undefined).map((k) => [k, record[k]]))
+    } : { ...record };
+
+    return {
+      index: i, raw: row, entity: 'waitlist', display: name || email || `(row ${i + 2})`,
+      record, changes,
+      status: status_, match, matchLabel: match ? this.describe(match) : '',
+      reasons,
+      decision,
+      decisionTarget: match ? match.id : null
+    };
+  },
+
+  describe(e) {
+    const contact = e.contact_id && this._contactsById ? this._contactsById.get(e.contact_id) : null;
+    const nm = (contact && contact.name) || (e.application && e.application.name) || '(unnamed)';
+    return `${nm} — ${e.status}${e.application && e.application.email ? ` (${e.application.email})` : ''}`;
+  },
+
+  repo: waitlistEntryRepo
+};
+
+const MAPPINGS = {
+  kennel: KENNEL_MAPPING, dog: DOG_MAPPING, contact: CONTACT_MAPPING, pairing: PAIRING_MAPPING, litter: LITTER_MAPPING,
+  sale: SALE_MAPPING, event: EVENT_MAPPING, stud_service: STUD_SERVICE_MAPPING, expense: EXPENSE_MAPPING,
+  waitlist: WAITLIST_MAPPING
+};
+
+export function getMapping(entity) {
+  const m = MAPPINGS[entity];
+  if (!m) throw new Error(`Unknown import entity "${entity}".`);
+  return m;
+}
+
+// --- Dry-run plan ---------------------------------------------------------
+// Classify every row against current records. Returns { rows, summary, existing,
+// dates }. `dateOrder` ('mdy' | 'dmy'): her answer when the file's dates could be
+// either way round; otherwise the file's own dates decide (detectDateOrder), and
+// month-first is the default. `dates`: { order, detected, ambiguous, ask } for the
+// preview (ask: no date told, and some could be read either way).
+export async function buildPlan(entity, rows, { dateOrder = null } = {}) {
+  const mapping = getMapping(entity);
+  const existing = await mapping.loadExisting();
+  const index = mapping.buildIndex(existing);
+  if (mapping.indexBatch) mapping.indexBatch(rows, index);
+  const detected = detectDateOrder(rows);
+  const order = dateOrder === 'dmy' || dateOrder === 'mdy' ? dateOrder : detected.order || 'mdy';
+  DATE_ORDER = order;
+  let plan;
+  try {
+    plan = rows.map((row, i) => mapping.classify(row, index, i));
+  } finally {
+    DATE_ORDER = 'mdy';
+  }
+  if (mapping.finishPlan) mapping.finishPlan(plan);
+  if (mapping.batchKeys) markRepeatedRows(plan, mapping);
+  if (needsKennelScope(entity)) flagMissingKennel(entity, plan, await resolveKennelIdForWrite());
+  return { rows: plan, summary: summarize(plan), existing,
+    dates: { order, detected: detected.order, ambiguous: detected.ambiguous, ask: !detected.order && detected.ambiguous > 0 } };
+}
+
+// The same record on two rows of one file (K2-2): sorted and re-pasted, or two
+// exports joined. The first row is imported; a later one with the same natural key
+// waits for review, saying which row it repeats, rather than making a second record.
+export function markRepeatedRows(plan, mapping) {
+  const seen = new Map(); // key → first row's index
+  for (const r of plan) {
+    if (r.status !== 'create' && r.status !== 'update') continue;
+    const keys = mapping.batchKeys(r).filter(Boolean);
+    const first = keys.map((k) => seen.get(k)).find((n) => n != null);
+    if (first != null) {
+      r.status = 'review';
+      r.decision = 'skip';
+      r.reasons.push(`The same ${mapping.entity} as row ${first + 2}: only that row is imported. Choose an action to import this one too.`);
+      continue;
+    }
+    for (const k of keys) seen.set(k, r.index);
+  }
+  return plan;
+}
+
+export function summarize(plan) {
+  const s = { create: 0, update: 0, review: 0, skip: 0 };
+  for (const r of plan) {
+    s[r.status] = (s[r.status] || 0) + 1;
+  }
+  return s;
+}
+
+// --- Kennel scope on import -------------------------------------------------
+// The scoped entities (Multi-Kennel Scope Spec §4.1) carry a required kennel_id.
+// Every mapping now resolves its own `kennel_name` column first (§11) — this is
+// only the fallback for a row that left it blank: the active/sole kennel, same
+// default every other write path uses. Dogs are stamped only when the user
+// owns them — an external dog's kennel is somebody else's and stays whatever
+// the CSV said, including nothing.
+const KENNEL_SCOPED_IMPORTS = new Set(['pairing', 'litter', 'sale', 'stud_service']);
+
+const needsKennelScope = (entity) => entity === 'dog' || KENNEL_SCOPED_IMPORTS.has(entity);
+
+// A new record that must carry a kennel but has none (no kennel_name, and no
+// active/sole kennel for stampKennelScope to fall back to: two or more own
+// kennels with "All kennels" showing) would fail at commit, so the preview sends
+// it to review instead. Only creates: an update keeps the matched record's kennel.
+export function flagMissingKennel(entity, plan, defaultKennelId) {
+  if (defaultKennelId) return plan;
+  for (const r of plan) {
+    if (r.status !== 'create' || r.record.kennel_id) continue;
+    if (entity === 'dog' && !SCOPED_OWNERSHIP.has(r.record.ownership_type)) continue;
+    r.status = 'review';
+    r.decision = 'skip';
+    r.reasons.push('No kennel: add a kennel_name column naming one of your kennels, or switch the app to one kennel first.');
+  }
+  return plan;
+}
+
+async function stampKennelScope(entity, record) {
+  if (record.kennel_id) return;
+  const isDog = entity === 'dog';
+  if (!isDog && !KENNEL_SCOPED_IMPORTS.has(entity)) return;
+  if (isDog && !SCOPED_OWNERSHIP.has(record.ownership_type)) return;
+  const kennelId = await resolveKennelIdForWrite();
+  if (kennelId) record.kennel_id = kennelId;
+}
+
+// --- Commit ---------------------------------------------------------------
+// Applies each row's *decision* (create / update / skip). Rows are independent:
+// one failure is recorded and the rest still import.
+export async function commitPlan(entity, plan) {
+  const mapping = getMapping(entity);
+  const result = { created: 0, updated: 0, skipped: 0, failed: [], notes: [] };
+  const written = new Map(); // row index -> saved record id
+  for (const r of plan) {
+    try {
+      // Optional per-mapping hook: mutate r.record/r.changes just before the
+      // write (Sale uses this to create an unmatched buyer as a Contact inline
+      // — the one place a relationship column isn't resolve-or-review).
+      if (mapping.prepareRecord) await mapping.prepareRecord(r);
+      if (r.decision === 'create') {
+        await stampKennelScope(entity, r.record);
+        const saved = await mapping.repo.create(mapping.seedRecord ? mapping.seedRecord(r.record) : r.record);
+        written.set(r.index, saved.id);
+        result.created++;
+      } else if (r.decision === 'update') {
+        const id = r.decisionTarget || r.match?.id;
+        if (!id) throw new Error('No target record to update.');
+        await mapping.repo.update(id, r.changes);
+        written.set(r.index, id);
+        result.updated++;
+      } else {
+        result.skipped++;
+      }
+    } catch (e) {
+      result.failed.push({ index: r.index, display: r.display, message: e.message || String(e) });
+    }
+  }
+  await linkBatchParents(plan, written, mapping.repo, result);
+  return result;
+}
+
+// The link pass (dogs): once every row is written, point each dog at a sire or
+// dam that was another row of the same file. Done last rather than by ordering
+// the writes, so a parent row the user switched from review to Create is linked
+// too. A parent row that wasn't imported (skipped or failed) leaves the dog
+// unlinked and says so; it never blocks the dog itself.
+const PARENT_ROLE = { sire_id: 'sire', dam_id: 'dam' };
+
+async function linkBatchParents(plan, written, repo, result) {
+  const byIndex = new Map(plan.map((r) => [r.index, r]));
+  for (const r of plan) {
+    if (!r.batchParents || !written.has(r.index)) continue;
+    const links = {};
+    for (const [field, n] of Object.entries(r.batchParents)) {
+      const parentId = written.get(n);
+      if (parentId) links[field] = parentId;
+      else result.notes.push({ index: r.index, display: r.display, message: `Not linked to its ${PARENT_ROLE[field]}: row ${n + 2} (${byIndex.get(n)?.display || '?'}) wasn't imported.` });
+    }
+    if (!Object.keys(links).length) continue;
+    try {
+      await repo.update(written.get(r.index), links);
+    } catch (e) {
+      result.notes.push({ index: r.index, display: r.display, message: `Saved, but not linked to its parents: ${e.message || String(e)}` });
+    }
+  }
+}

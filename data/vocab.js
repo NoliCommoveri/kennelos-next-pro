@@ -1,0 +1,1051 @@
+// vocab.js — controlled vocabularies (the enums from the data model) in one place,
+// each value carrying a human label and a badge color class (assets/app.css).
+// Dropdowns and badges both read from here so they never drift apart.
+//
+// The one edition-aware piece is the event-type list (enabledEventTypes /
+// eventTypesFor below): a type carrying `editionFlag` exists only when that flag
+// is on in the edition's config, so every type picker drops it in one place.
+import { editionFlags } from './editionConfig.js';
+
+export const SEX = [
+  { value: 'male',    label: 'Male',    badge: 'badge-blue' },
+  { value: 'female',  label: 'Female',  badge: 'badge-purple' },
+  { value: 'unknown', label: 'Unknown', badge: 'badge-gray' }
+];
+
+export const OWNERSHIP_TYPE = [
+  { value: 'owned',      label: 'Owned',      badge: 'badge-green' },
+  { value: 'co_owned',   label: 'Co-owned',   badge: 'badge-green' },
+  { value: 'external',   label: 'External',   badge: 'badge-gray' },
+  { value: 'leased_in',  label: 'Leased in',  badge: 'badge-amber' },
+  { value: 'leased_out', label: 'Leased out', badge: 'badge-amber' }
+];
+
+export const DOG_STATUS = [
+  { value: 'puppy',              label: 'Puppy',              badge: 'badge-blue' },
+  { value: 'active_breeding',    label: 'Active breeding',    badge: 'badge-green' },
+  { value: 'retired_breeding',   label: 'Retired breeding',   badge: 'badge-amber' },
+  { value: 'pet_home',           label: 'Pet home',           badge: 'badge-neutral' },
+  { value: 'for_sale',           label: 'For Sale',           badge: 'badge-amber' },
+  { value: 'deceased',           label: 'Deceased',           badge: 'badge-gray' },
+  { value: 'external_reference', label: 'External reference', badge: 'badge-gray' }
+];
+
+// A value's place in a vocab list; a missing or unknown value goes after every
+// known one, so nothing drops off a sorted list.
+const rankIn = (vocab, v) => { const i = vocab.findIndex((o) => o.value === v); return i < 0 ? vocab.length : i; };
+const dogListName = (d) => String(d?.call_name || d?.registered_name || '').trim();
+
+// The All dogs roster's order: status in DOG_STATUS order, then sex in SEX order
+// (Male, Female, Unknown), then name A→Z (call name, else registered name). A
+// missing status, sex or name sorts after the rest at its level.
+export function dogListOrder(a, b) {
+  const byStatus = rankIn(DOG_STATUS, a?.status) - rankIn(DOG_STATUS, b?.status);
+  if (byStatus) return byStatus;
+  const bySex = rankIn(SEX, a?.sex) - rankIn(SEX, b?.sex);
+  if (bySex) return bySex;
+  const an = dogListName(a), bn = dogListName(b);
+  if (!an || !bn) return (an ? 0 : 1) - (bn ? 0 : 1);
+  return an.localeCompare(bn, undefined, { sensitivity: 'base' });
+}
+// The Status and Sex columns sort in vocab order too (unset last).
+export const dogStatusOrder = (a, b) => rankIn(DOG_STATUS, a?.status) - rankIn(DOG_STATUS, b?.status);
+export const dogSexOrder = (a, b) => rankIn(SEX, a?.sex) - rankIn(SEX, b?.sex);
+
+// Disposition — the breeder's intent for a dog, orthogonal to `status`
+// (life-stage). Answers "keeping or selling?" for a puppy before any Sale record
+// exists, so it can't be a `status` value (a puppy can't be both `puppy` and
+// `for_sale`) and it isn't a Sale (that's an actual transaction with a buyer).
+// Nullable/unset reads as "undecided". `available` is the single stable filter
+// key a future prospective-families feed selects on. Plain unindexed field on
+// Dog (same posture as recorded_coi) — nothing queries it by key.
+export const DISPOSITION = [
+  { value: 'undecided', label: 'Undecided', badge: 'badge-gray' },
+  { value: 'keeping',   label: 'Keeping',   badge: 'badge-blue' },
+  { value: 'available', label: 'Available', badge: 'badge-green' },
+  { value: 'placed',    label: 'Placed',    badge: 'badge-neutral' },
+  // Not sellable right now for a health reason (failed a health check, came back
+  // with a health problem). Never offered by the waitlist; she changes it if the
+  // pup recovers, or she keeps or places it another way.
+  { value: 'health_hold', label: 'Health hold', badge: 'badge-amber' }
+];
+
+// Foster direction — a per-litter fact (a litter fostered under a caretaker↔owner
+// arrangement, not a permanent ownership fact of any dog, so the same dam can have
+// more than one foster litter). Null/unset means an ordinary, non-foster litter.
+//   foster_in  — an external dam's litter is whelped/raised in OUR care (we sell
+//                the pups and pay the owner their income split).
+//   foster_out — OUR dam's litter is raised elsewhere (the caretaker sells; we
+//                receive our split).
+// A foster puppy is distinguished from a plain "external" dog purely by DERIVATION
+// (its litter's foster_direction) — it stays a normal status='puppy' Dog we manage
+// and sell, never an external_reference. See guide §4.
+export const FOSTER_DIRECTION = [
+  { value: 'foster_in',  label: 'Foster in — external dam',      badge: 'badge-amber' },
+  { value: 'foster_out', label: 'Foster out — raised elsewhere', badge: 'badge-amber' }
+];
+
+// How the foster partner is compensated. Two models (owner picks per litter):
+//   income_split — a percentage of puppy income (`foster_our_share_pct` +
+//                  `foster_split_basis`).
+//   flat_per_pup — a fixed dollar amount per puppy (`foster_flat_fee_per_pup`).
+// Both are DOCUMENTATION only — the actual money is a real `foster_split`
+// ("Foster compensation") Expense either way (§25), so the P&L is model-agnostic.
+export const FOSTER_COMP_MODEL = [
+  { value: 'income_split', label: 'Income split (%)',   badge: 'badge-neutral' },
+  { value: 'flat_per_pup', label: 'Flat fee per pup',   badge: 'badge-neutral' }
+];
+
+// Basis an income-split compensation is computed on (only meaningful when the
+// comp model is `income_split`). Documentation only. Suggest-not-enforce.
+export const FOSTER_SPLIT_BASIS = [
+  { value: 'gross', label: 'Gross puppy income', badge: 'badge-neutral' },
+  { value: 'net',   label: 'Net after expenses', badge: 'badge-neutral' }
+];
+
+// --- Pairing & Litter vocabularies (Data Model doc §5.3–5.4) ---------------
+export const PAIRING_TYPE = [
+  { value: 'planned', label: 'Planned', badge: 'badge-blue' },
+  { value: 'actual',  label: 'Actual',  badge: 'badge-green' }
+];
+
+export const PAIRING_METHOD = [
+  { value: 'natural',     label: 'Natural',        badge: 'badge-neutral' },
+  { value: 'ai_fresh',    label: 'AI — fresh',     badge: 'badge-neutral' },
+  { value: 'ai_chilled',  label: 'AI — chilled',   badge: 'badge-neutral' },
+  { value: 'ai_frozen',   label: 'AI — frozen',    badge: 'badge-neutral' },
+  { value: 'surgical_ai', label: 'Surgical AI',    badge: 'badge-neutral' }
+];
+
+export const PAIRING_STATUS = [
+  { value: 'planned',            label: 'Planned',            badge: 'badge-blue' },
+  { value: 'bred',               label: 'Bred',               badge: 'badge-purple' },
+  { value: 'confirmed_pregnant', label: 'Confirmed pregnant', badge: 'badge-green' },
+  { value: 'not_pregnant',       label: 'Not pregnant',       badge: 'badge-amber' },
+  { value: 'whelped',            label: 'Whelped',            badge: 'badge-green' },
+  { value: 'failed',             label: 'Failed',             badge: 'badge-red' },
+  { value: 'cancelled',          label: 'Cancelled',          badge: 'badge-gray' }
+];
+
+export const LITTER_STATUS = [
+  { value: 'expected', label: 'Expected', badge: 'badge-blue' },
+  { value: 'whelped',  label: 'Whelped',  badge: 'badge-green' },
+  { value: 'weaning',  label: 'Weaning',  badge: 'badge-amber' },
+  { value: 'ready',    label: 'Ready',    badge: 'badge-green' },
+  { value: 'sold',     label: 'Sold',     badge: 'badge-neutral' },
+  { value: 'closed',   label: 'Closed',   badge: 'badge-gray' }
+];
+
+// Pairing statuses that mean no litter is coming, and the litter statuses at or
+// past whelping — the pairing ↔ litter prompts and nudges both read these.
+export const PAIRING_ENDED_STATUSES = ['not_pregnant', 'failed', 'cancelled'];
+export const WHELPED_OR_LATER = ['whelped', 'weaning', 'ready', 'sold', 'closed'];
+
+// How a litter was delivered (Litter.delivery_type, optional). Asked only once the
+// litter is Whelped or later (WHELPED_OR_LATER): the Litter page shows the field from
+// then on and asks for it when a litter first gets there, Kels's Record a new litter
+// asks it at the birth, and the tidy-up raises a whelped litter without it.
+// `short`: the pill on a dog's Litters list, where space is tight.
+export const LITTER_DELIVERY_TYPE = [
+  { value: 'natural',             label: 'Natural',              short: 'Natural',         badge: 'badge-green' },
+  { value: 'assisted',            label: 'Natural, assisted',    short: 'Assisted',        badge: 'badge-blue' },
+  { value: 'c_section_planned',   label: 'Planned C-section',    short: 'Planned C-sec',   badge: 'badge-amber' },
+  { value: 'c_section_emergency', label: 'Emergency C-section',  short: 'Emergency C-sec', badge: 'badge-red' }
+];
+
+// Account (accounts table) — what kind of business account it is. Badge + filter
+// only; nothing branches on it.
+export const ACCOUNT_TYPE = [
+  { value: 'registry',    label: 'Registry / club',     badge: 'badge-purple' },
+  { value: 'marketplace', label: 'Puppy marketplace',   badge: 'badge-green' },
+  { value: 'supplier',    label: 'Supplier / store',    badge: 'badge-blue' },
+  { value: 'health',      label: 'Health / testing lab', badge: 'badge-red' },
+  { value: 'insurance',   label: 'Insurance',           badge: 'badge-amber' },
+  { value: 'software',    label: 'Software / service',  badge: 'badge-neutral' },
+  // A form service (any): the only type that holds pasted contract-form links
+  // (contract_forms, Integrations plan §2.1a, D28), so it's the only one whose form shows that section.
+  { value: 'form_service', label: 'Form service',       badge: 'badge-blue' },
+  // Stripe, Square, PayPal, Venmo…: the only type that holds a payment link and a
+  // Stripe key (Integrations plan §4), and the only one offered as "paid via" for
+  // a sale's deposit or balance, or a waitlist application fee.
+  { value: 'payment_service', label: 'Payment service', badge: 'badge-green' },
+  // Flight nannies and ground transporters (Family Requests plan D8): shared with
+  // families, they show under "Getting your pup home" on the status page of a
+  // family with a picked pup, never with her recommended products.
+  { value: 'transport',   label: 'Transport (flight nanny, ground)', badge: 'badge-blue' },
+  { value: 'other',       label: 'Other',               badge: 'badge-gray' }
+];
+
+export const CONTACT_TYPE = [
+  { value: 'breeder',        label: 'Breeder',        badge: 'badge-green' },
+  { value: 'vet',            label: 'Vet',            badge: 'badge-blue' },
+  { value: 'groomer',        label: 'Groomer',        badge: 'badge-purple' },
+  { value: 'buyer_referrer', label: 'Buyer referrer', badge: 'badge-amber' },
+  { value: 'stud_referrer',  label: 'Stud referrer',  badge: 'badge-amber' },
+  { value: 'co_owner',       label: 'Co-owner',       badge: 'badge-neutral' },
+  { value: 'buyer',          label: 'Buyer',          badge: 'badge-blue' },
+  // Tagged automatically when a contact is picked as a `show` event's handler
+  // (Show Tracking Spec §2.2/§5.6). Harmless in Lite (no Contacts pages there).
+  { value: 'handler',        label: 'Handler',        badge: 'badge-purple' },
+  { value: 'other',          label: 'Other',          badge: 'badge-gray' }
+];
+
+// --- Buyer-view / Sale / Contract / StudService vocabularies (Stage 4,
+// Data Model v3 §5.6–5.9, Stage4 Revision v2) --------------------------------
+// waitlist_status lives on Contact (Buyer merged into Contact, v3 §5.5) — it
+// powers the Buyer-view filter on the Contact List screen.
+export const WAITLIST_STATUS = [
+  { value: 'none',      label: 'None',      badge: 'badge-gray' },
+  { value: 'active',    label: 'Active',    badge: 'badge-blue' },
+  { value: 'fulfilled', label: 'Fulfilled', badge: 'badge-green' }
+];
+
+// --- Waitlist (Waitlist Spec §3–§4) -----------------------------------------
+// One row per family per time on a kennel's list (waitlist_entries). Distinct
+// from Contact.waitlist_status above, which waitlistEntryRepo keeps in step from
+// these entries (Spec §0/§4.1). Pausing and listen-only are flags on an `active`
+// entry, never statuses, so narrowing what a family wants never costs its place.
+export const WAITLIST_ENTRY_STATUS = [
+  { value: 'applied',   label: 'Applied',    badge: 'badge-blue' },
+  { value: 'approved',  label: 'Fee due',    badge: 'badge-amber' },
+  { value: 'active',    label: 'On the list', badge: 'badge-green' },
+  { value: 'placed',    label: 'Placed',     badge: 'badge-neutral' },
+  { value: 'removed',   label: 'Removed',    badge: 'badge-red' },
+  { value: 'withdrawn', label: 'Withdrawn',  badge: 'badge-gray' },
+  { value: 'declined',  label: 'Declined',   badge: 'badge-gray' },
+  { value: 'expired',   label: 'Fee expired', badge: 'badge-gray' }
+];
+
+// Statuses where the family is still in the pipeline (drives Contact.waitlist_status
+// = 'active'). Everything else is a closed run through the list.
+export const WAITLIST_OPEN_STATUSES = ['applied', 'approved', 'active'];
+
+export const WAITLIST_OFFER_OUTCOME = [
+  { value: 'open',        label: 'Open',        badge: 'badge-blue' },
+  { value: 'accepted',    label: 'Accepted',    badge: 'badge-green' },
+  { value: 'passed',      label: 'Passed',      badge: 'badge-amber' },
+  { value: 'no_response', label: 'No response', badge: 'badge-amber' },
+  { value: 'voided',      label: 'Voided',      badge: 'badge-gray' }
+];
+
+// The moments that can offer the next family by themselves (Waitlist Spec §4.6,
+// kennel waitlist_config.auto_offer_on; none by default). Each is an offer on that
+// litter closing: the family who held the turn accepted (deposit in), passed, let
+// the deadline pass without picking, picked a pup but the deposit didn't arrive by
+// the deadline (recorded as no_response, with a pick), or left the list holding it.
+// `restored` isn't a closing: a family whose pup was lost (its sale voided, or
+// returned for a health problem) is back in line (waitlistActions.restoreAfterLostSale).
+export const WAITLIST_AUTO_OFFER_TRIGGER = [
+  { value: 'accepted',    label: 'A family accepts a pup (deposit received)' },
+  { value: 'passed',      label: 'A family passes' },
+  { value: 'no_response', label: 'An offer deadline passes with no response' },
+  { value: 'no_deposit',  label: 'A family picks a pup but the deposit doesn\'t arrive in time' },
+  { value: 'left',        label: 'A family holding a turn leaves the list' },
+  { value: 'restored',    label: 'A family gets their place back after losing their pup' }
+];
+
+export const WAITLIST_REMOVED_REASON = [
+  { value: 'second_pass',         label: 'Second pass',             badge: 'badge-red' },
+  { value: 'no_checkin_response', label: 'No check-in response',    badge: 'badge-red' },
+  { value: 'by_breeder',          label: 'Removed by you',          badge: 'badge-gray' },
+  { value: 'fee_expired',         label: 'Fee not received in time', badge: 'badge-gray' },
+  { value: 'no_ready_answer',     label: 'No answer to the ready check', badge: 'badge-red' }
+];
+
+// What happens when a family doesn't answer "Ready now?" (Waitlist Spec §16.7).
+export const WAITLIST_READY_NO_ANSWER = [
+  { value: 'keep_paused',  label: 'Keep them paused until they answer' },
+  { value: 'unpause',      label: 'Unpause them as normal on the date' },
+  { value: 'remove_after', label: 'Wait, then remove them from the list' }
+];
+
+// Which of a parent's completed health tests waitlist family pages show:
+// Waitlist settings' `parent_tests` (default 'off'), and Dog.waitlist_tests, one
+// dog's own say over it (null = follow the setting). 'normal' = only results
+// flagged Normal (TEST_OUTCOME); an unflagged result counts as not Normal.
+export const PARENT_TESTS_SHOWN = [
+  { value: 'off',    label: "Don't show" },
+  { value: 'normal', label: 'Normal results only' },
+  { value: 'all',    label: 'All results' }
+];
+
+export const WAITLIST_PRIORITY = [
+  { value: 'standard', label: 'Standard',        badge: 'badge-gray' },
+  { value: 'ahead',    label: 'Ahead of standard', badge: 'badge-purple' }
+];
+
+// The icon a waitlist program shows by a family's number on the public list
+// (Waitlist settings "Show program icons on the public list"); tapping it shows
+// the program's description for families. `emoji` stands in for it in the list
+// copied as text. The drawings are in assets/programIcons.js.
+export const WAITLIST_PROGRAM_ICON = [
+  { value: 'star',   label: 'Star',      emoji: '⭐' },
+  { value: 'check',  label: 'Checkmark', emoji: '✅' },
+  { value: 'heart',  label: 'Heart',     emoji: '❤️' },
+  { value: 'ribbon', label: 'Ribbon (cancer support)', emoji: '🎗️' },
+  { value: 'medal',  label: 'Medal (military)', emoji: '🎖️' },
+  { value: 'shield', label: 'Shield',    emoji: '🛡️' },
+  { value: 'paw',    label: 'Paw',       emoji: '🐾' }
+];
+
+export const WAITLIST_LISTEN_MODE = [
+  { value: 'all',      label: 'All litters',            badge: 'badge-gray' },
+  { value: 'selected', label: 'Selected sires & dams only', badge: 'badge-blue' },
+  { value: 'except',   label: 'All except these sires & dams', badge: 'badge-blue' }
+];
+
+// The application's locked "how soon could you buy?" answer (Waitlist Spec §15.8),
+// stored on WaitlistEntry.ready_timing. `hold_months` is the automatic readiness
+// hold: no offers until that many months after the fee was received (or approval,
+// if there's no fee) — the soonest they said they could commit, so a pup is never
+// held back from a family who could take it by then. Her answers (2026-10-07).
+export const WAITLIST_READY_TIMING = [
+  { value: 'asap',          label: 'ASAP',      badge: 'badge-green', hold_months: 0 },
+  { value: '1_month',       label: '1 month',   badge: 'badge-blue',  hold_months: 1 },
+  { value: '3_months',      label: '3 months',  badge: 'badge-amber', hold_months: 3 },
+  { value: '6_plus_months', label: '6+ months', badge: 'badge-gray',  hold_months: 6 }
+];
+
+// A family's sex preference: SEX plus "any" (the default).
+export const WAITLIST_PREF_SEX = [
+  { value: 'any',    label: 'Either',  badge: 'badge-gray' },
+  { value: 'male',   label: 'Male',    badge: 'badge-blue' },
+  { value: 'female', label: 'Female',  badge: 'badge-purple' }
+];
+
+// Answer types for her own application questions (Waitlist Spec §15.1). The
+// locked questions use three more internal types (email, preference, notice)
+// that she can't pick, so they aren't listed here.
+export const WAITLIST_QUESTION_TYPE = [
+  { value: 'short_text',    label: 'Short answer' },
+  { value: 'long_text',     label: 'Paragraph' },
+  { value: 'single_choice', label: 'Multiple choice (pick one)' },
+  { value: 'checkboxes',    label: 'Checkboxes (pick any)' },
+  { value: 'yes_no',        label: 'Yes / no' },
+  { value: 'number',        label: 'Number' },
+  { value: 'date',          label: 'Date' }
+];
+
+export const FEE_CREDIT_POLICY = [
+  { value: 'credited_to_purchase', label: 'Credited to purchase price', badge: 'badge-green' },
+  { value: 'non_refundable',       label: 'Non-refundable',             badge: 'badge-amber' },
+  { value: 'refundable',           label: 'Refundable',                 badge: 'badge-blue' }
+];
+
+// Where a fee credited to the purchase price counts (waitlist_config.fee_credit_toward):
+// off the rest of the price (the balance), or toward the deposit (any of the fee
+// beyond the deposit then comes off the balance).
+export const FEE_CREDIT_TOWARD = [
+  { value: 'balance', label: 'The remaining purchase price' },
+  { value: 'deposit', label: 'The deposit' }
+];
+
+// What a family's credit for funds already received (WaitlistEntry.received_credits)
+// may pay toward, in the order it's used. Every use is ticked on a new credit.
+export const CREDIT_USES = [
+  { value: 'fee',     label: 'Application fee' },
+  { value: 'deposit', label: 'Deposit' },
+  { value: 'price',   label: 'Rest of the purchase price' },
+  { value: 'extras',  label: 'Extras, transport and boarding' }
+];
+
+// Registration rights a pup is planned for (Dog.intended_registration) and sold
+// with (Sale.registration_type). AKC's two: Limited (companion and performance
+// homes) and Full (show and breeding). Co-own is a Full-registration placement
+// the kennel keeps a share of; None is for unregistered dogs.
+export const REGISTRATION_TYPE = [
+  { value: 'limited', label: 'Limited', badge: 'badge-neutral' },
+  { value: 'full',    label: 'Full',    badge: 'badge-purple' },
+  { value: 'co_own',  label: 'Co-own',  badge: 'badge-blue' },
+  { value: 'none',    label: 'None (unregistered)', badge: 'badge-gray' }
+];
+
+// What a family wants a pup for (WaitlistEntry.pref_purposes, a multi-select on
+// the application). Each maps to the registrations that suit it; a family
+// accepts any registration its purposes map to (registrationsForPurposes), and
+// matching compares that set against the pup's intended_registration.
+export const PLACEMENT_PURPOSE = [
+  { value: 'pet',         label: 'Pet / companion',  registrations: ['limited', 'none'] },
+  { value: 'performance', label: 'Performance sports (agility, obedience…)', registrations: ['limited', 'none'] },
+  { value: 'show',        label: 'Show',             registrations: ['full'] },
+  { value: 'breeding',    label: 'Breeding',         registrations: ['full', 'none'] },
+  { value: 'co_own',      label: 'Co-own',           registrations: ['co_own'] }
+];
+
+// The purposes a family picked, cleaned to known values in vocab order. Accepts
+// an array or a comma-separated string (CSV import / hand entry).
+export function cleanPurposes(raw) {
+  const list = Array.isArray(raw) ? raw : String(raw ?? '').split(',');
+  const picked = new Set(list.map((v) => String(v ?? '').trim()));
+  return PLACEMENT_PURPOSE.map((p) => p.value).filter((v) => picked.has(v));
+}
+
+// The registrations a family accepts, in REGISTRATION_TYPE order; null when they
+// picked no purpose (any registration).
+export function registrationsForPurposes(purposes) {
+  const picked = cleanPurposes(purposes);
+  if (!picked.length) return null;
+  const ok = new Set(PLACEMENT_PURPOSE.filter((p) => picked.includes(p.value)).flatMap((p) => p.registrations));
+  return REGISTRATION_TYPE.map((r) => r.value).filter((v) => ok.has(v));
+}
+
+export const SALE_STATUS = [
+  { value: 'deposit_pending', label: 'Deposit Pending', badge: 'badge-blue' },
+  { value: 'deposit_paid',  label: 'Deposit paid',  badge: 'badge-amber' },
+  { value: 'paid_in_full',  label: 'Paid in full',  badge: 'badge-green' },
+  { value: 'delivered',     label: 'Delivered',     badge: 'badge-green' },
+  { value: 'returned',      label: 'Returned',      badge: 'badge-red' },
+  { value: 'cancelled',     label: 'Cancelled',     badge: 'badge-gray' },
+  { value: 'voided',        label: 'Voided',        badge: 'badge-neutral' }
+];
+
+// A sale that ended without the pup going home. `cancelled` is the BUYER backing
+// out (a deposit they paid stays earned, Financials §21); `voided` is the sale
+// falling through on the kennel's side, through no fault of the buyer (the pup
+// died or can't go home): nothing on it counts as income, since any deposit is
+// refunded or carried to another pup. `returned` came back after going home.
+// Every one frees the pup (waitlistRules.isPupAvailable).
+export const RELEASED_SALE_STATUSES = ['returned', 'cancelled', 'voided'];
+
+// Why a voided or returned sale ended (Sale.end_reason; the Sale form requires one
+// for those two statuses). `statuses` says which status each reason belongs to.
+// The reason decides what the Sale page offers next: record the pup's death, put
+// the pup on Health hold, and — for a waitlist family — put them back in line
+// (waitlistRules.restoresFamily).
+export const SALE_END_REASON = [
+  { value: 'pup_died',            label: 'Pup died',                                statuses: ['voided'] },
+  { value: 'failed_health_check', label: 'Failed a health check (can\'t be sold)',  statuses: ['voided'] },
+  { value: 'health_problem',      label: 'Health problem (within the guarantee)',  statuses: ['returned'] },
+  { value: 'buyer_choice',        label: 'Buyer\'s choice',                         statuses: ['returned'] },
+  // A family who backed out and was refunded (Family Requests plan §7, D13): voided, so
+  // the deposit isn't income, but never "put them back in line" (restoresFamily).
+  { value: 'buyer_backed_out',    label: 'Buyer backed out, refunded',             statuses: ['voided'] },
+  { value: 'other',               label: 'Other',                                   statuses: ['voided', 'returned'] }
+];
+export const saleEndReasonsFor = (status) => SALE_END_REASON.filter((r) => r.statuses.includes(status));
+
+// A LOST sale: the pup didn't stay placed through no fault of the buyer — voided
+// (the pup died or can't be sold), or returned for a health problem within the
+// guarantee. What they paid is refunded or carried to another pup, so none of it
+// is this sale's income (incomeView), and a waitlist family can be put back in line
+// (waitlistRules.restoresFamily). A cancelled sale or a buyer's-choice return is not.
+export const isLostSale = (s) => !!s && (s.status === 'voided' || (s.status === 'returned' && s.end_reason === 'health_problem'));
+
+// Statuses that close a sale out. A closed sale no longer makes its buyer a
+// current "family": not in the Companion family package (companion.js), not in
+// its bundle (companionExport.js), and no Companion link request from their
+// status page (waitlistProjection.js). All of them go through isOpenSale (via
+// saleRepo.isOpenSale in the app) so they can't drift. Here, not in saleRepo,
+// so the pure waitlist modules can use it without Dexie.
+export const TERMINAL_SALE_STATUSES = ['delivered', ...RELEASED_SALE_STATUSES];
+export const isOpenSale = (s) => !!s && !s.is_archived && !!s.status && !TERMINAL_SALE_STATUSES.includes(s.status);
+
+export const CONTRACT_TYPE = [
+  { value: 'sale',         label: 'Sale',         badge: 'badge-blue' },
+  // A reservation agreement sent before there's a sale (a pup isn't picked yet): its
+  // buyer, litter, preferred sex and color and deposit are on the contract itself
+  // (contractRepo RESERVATION_FIELDS), so it works with or without the waitlist.
+  { value: 'reservation',  label: 'Reservation',  badge: 'badge-neutral' },
+  { value: 'stud_service', label: 'Stud service', badge: 'badge-purple' },
+  { value: 'co_own',       label: 'Co-own',       badge: 'badge-green' },
+  { value: 'lease',        label: 'Lease',        badge: 'badge-amber' },
+  { value: 'foster',       label: 'Foster',       badge: 'badge-amber' },
+  { value: 'other',        label: 'Other',        badge: 'badge-gray' }
+];
+
+// The kinds of contract form she can save on an Account (Integrations plan §2.1a):
+// her own pasted form links, each tagged with one of these so the Contract page offers
+// the right one. `contractTypes` is the CONTRACT_TYPE(s) it serves. Pet home and
+// breeding rights are both `sale` contracts, told apart by the Sale's registration
+// (`registrations`, which ranks that form first); deposit ranks first while the
+// sale's deposit is still pending. Rows are matched by value, so never rename one.
+export const CONTRACT_FORM_TYPE = [
+  { value: 'pet_home',        label: 'Pet home contract',               badge: 'badge-blue',    contractTypes: ['sale'], registrations: ['limited', 'none', ''] },
+  { value: 'breeding_rights', label: 'Breeding rights contract',        badge: 'badge-purple',  contractTypes: ['sale'], registrations: ['full'] },
+  { value: 'deposit',         label: 'Deposit / reservation agreement', badge: 'badge-neutral', contractTypes: ['sale', 'reservation'], saleStatuses: ['deposit_pending'] },
+  { value: 'co_own',          label: 'Co-ownership contract',           badge: 'badge-green',   contractTypes: ['co_own', 'sale'], registrations: ['co_own'] },
+  { value: 'stud_service',    label: 'Stud service contract',           badge: 'badge-purple',  contractTypes: ['stud_service'] },
+  { value: 'lease',           label: 'Lease agreement',                 badge: 'badge-amber',   contractTypes: ['lease'] },
+  { value: 'foster',          label: 'Foster / guardian home',          badge: 'badge-amber',   contractTypes: ['foster'] },
+  { value: 'other',           label: 'Other',                           badge: 'badge-gray',    contractTypes: ['other'] },
+  // A sale's separate agreements (2026-11-12): offered first only when the sale has
+  // that charge (`addOn`, contractForms.rankForms). An `extra` form is for ONE of her
+  // price-list extras (the row's `extra_list_id`), e.g. one training package.
+  { value: 'transport',       label: 'Transport agreement',             badge: 'badge-blue',    contractTypes: ['sale'], addOn: 'transport' },
+  { value: 'boarding',        label: 'Boarding agreement',              badge: 'badge-amber',   contractTypes: ['sale'], addOn: 'boarding' },
+  { value: 'extra',           label: 'Extra agreement',                 badge: 'badge-green',   contractTypes: ['sale'], addOn: 'extra' }
+];
+
+// Not a locked state machine (Stage4 Revision v2 §7) — moves any direction, no
+// confirmation dialogs. Default on create is 'draft'.
+export const CONTRACT_STATUS = [
+  { value: 'draft',     label: 'Draft',     badge: 'badge-gray' },
+  { value: 'sent',      label: 'Sent',      badge: 'badge-blue' },
+  { value: 'signed',    label: 'Signed',    badge: 'badge-green' },
+  { value: 'declined',  label: 'Declined',  badge: 'badge-red' },
+  { value: 'cancelled', label: 'Cancelled', badge: 'badge-red' },
+  { value: 'void',      label: 'Void',      badge: 'badge-gray' }
+];
+
+// Who travels for a stud service (decided 2026-10-15): our dog to them, their dog
+// to us, or no one (AI / shipped). Which of the two dogs is the stud isn't stored:
+// it's our dog's sex (studRules.ourRole), so either can travel either way.
+export const STUD_SERVICE_DIRECTION = [
+  { value: 'to_partner', label: 'Our dog goes to them',   badge: 'badge-blue' },
+  { value: 'to_us',      label: 'Their dog comes to us',  badge: 'badge-purple' },
+  { value: 'shipped',    label: 'No one travels (AI / shipped)', badge: 'badge-neutral' }
+];
+
+// Our dog's part in a stud service, derived from its sex (studRules.ourRole), for
+// badges and report filters. Never stored.
+export const STUD_SERVICE_ROLE = [
+  { value: 'stud', label: 'Our stud', badge: 'badge-blue' },
+  { value: 'dam',  label: 'Our dam',  badge: 'badge-purple' }
+];
+
+export const FEE_STRUCTURE = [
+  { value: 'flat_fee',       label: 'Flat fee',       badge: 'badge-neutral' },
+  { value: 'pick_of_litter', label: 'Pick of litter', badge: 'badge-neutral' },
+  { value: 'flat_plus_pick', label: 'Flat + pick',    badge: 'badge-neutral' },
+  { value: 'other',          label: 'Other',          badge: 'badge-gray' }
+];
+
+export const STUD_SERVICE_STATUS = [
+  { value: 'arranged', label: 'Arranged', badge: 'badge-blue' },
+  { value: 'in_progress', label: 'In progress', badge: 'badge-amber' },
+  { value: 'completed', label: 'Completed', badge: 'badge-green' },
+  { value: 'failed',    label: 'Failed',    badge: 'badge-red' },
+  { value: 'cancelled', label: 'Cancelled', badge: 'badge-gray' }
+];
+
+// Was this a physical stay or a shipment? Set from `direction` by the repo
+// (shipped → ai, else in_person), never asked. The fine-grained method (natural /
+// ai_chilled / …) lives on the linked Pairing (pairing_id).
+export const STUD_SERVICE_TYPE = [
+  { value: 'in_person', label: 'In person', badge: 'badge-green' },
+  { value: 'ai',        label: 'AI / shipped', badge: 'badge-neutral' }
+];
+
+// Look up the {value,label,badge} descriptor for a value in a vocab list.
+export function descriptor(vocab, value) {
+  return vocab.find((v) => v.value === value) || { value, label: value ?? '—', badge: 'badge-gray' };
+}
+
+// Suggest-not-enforce starter set for boarding's `boarding_reason` (Stage4.5
+// Addendum §C3) — a plain string in `details`, never a validated vocab, so a
+// combobox surfaces these as suggestions without blocking free text.
+export const BOARDING_REASON_SUGGESTIONS = [
+  'Stud service', 'Co-owner rotation', 'Foster', 'Grow-out', 'Owner travel', 'Whelp assist',
+  'With handler / show circuit', 'Training', 'Other'
+];
+
+// Suggest-not-enforce starter set for a recorded COI's `method` (Stage 5, Build
+// Brief §1.5/§2.1) — Dog.recorded_coi.method is free text; a combobox surfaces
+// these without forcing an enum. NOT a validated vocab and never a badge: the
+// value describes how the breeder's lab/registry derived the number, not a state
+// the app owns. No new event types come with it.
+export const COI_METHOD_SUGGESTIONS = ['genomic', 'pedigree', 'registry', 'other'];
+
+// Enforced choice list for the `placement` event type's `Method` field —
+// how the puppy actually travelled to the buyer.
+export const PLACEMENT_METHODS = ['Flight nanny', 'Ground transport', 'Local pickup', 'Other'];
+
+// Payment methods for the invoice/receipt generator (§24). On an invoice these
+// are the *accepted* methods offered to the buyer (a global default lives in
+// settings.js, editable per document); on a receipt one is the method actually
+// used. A suggest-not-enforce set — free text is allowed on the receipt's method
+// field, same posture as the *_SUGGESTIONS lists above.
+export const PAYMENT_METHODS = ['Cash', 'Check', 'Credit/debit card', 'Bank transfer', 'PayPal', 'Venmo', 'Zelle', 'Money order', 'Other'];
+
+// A sale's payment schedule (Sale.payment_schedule, Payment Schedule plan §3.1).
+// When a due date falls: `n` is weeks old (at_weeks) or days before pickup.
+export const SCHEDULE_DUE = Object.freeze([
+  { value: 'at_weeks',      label: 'At an age',          unit: 'weeks old',          needsN: true },
+  { value: 'on_date',       label: 'On a date',          unit: '',                   needsN: false },
+  { value: 'before_pickup', label: 'Before pickup',      unit: 'days before pickup', needsN: true },
+  { value: 'at_pickup',     label: 'At pickup',          unit: '',                   needsN: false }
+]);
+// What a due date covers, besides `all` (every charge but extras on their own
+// dates) and single extras (`extra:<id>`). `price` is the whole purchase price,
+// deposit included.
+export const SCHEDULE_COVERS = Object.freeze([
+  { value: 'price',     label: 'Purchase price' },
+  { value: 'boarding',  label: 'Boarding' },
+  { value: 'extras',    label: 'Extras' },
+  { value: 'transport', label: 'Transport' }
+]);
+// A percent due date: of the TOTAL it covers, counting everything paid so far, or of
+// what REMAINS after the earlier due dates, as new money only.
+export const SCHEDULE_BASIS = Object.freeze([
+  { value: 'total',     label: 'Percent of total' },
+  { value: 'remaining', label: 'Percent of remaining' }
+]);
+// An amount due date: whether money already received (application fee, deposit,
+// credits) can cover it, or only payments recorded on the sale.
+export const SCHEDULE_PRIOR_FUNDS = Object.freeze([
+  { value: 'count',      label: 'Earlier money can cover it' },
+  { value: 'dont_count', label: 'Only new payments cover it' }
+]);
+
+// Invoice/receipt line-item labels, keyed by income component (§24). Deliberately
+// distinct from INCOME_COMPONENTS' Financials-view labels ("Deposits", "Balance"…)
+// — a customer-facing document names the balance "Remaining Purchase Price", etc.
+export const INVOICE_LINE_LABELS = {
+  deposit: 'Deposit',
+  balance: 'Remaining Purchase Price',
+  transport: 'Transport Fee',
+  boarding: 'Boarding Fee',
+  stud_fee: 'Stud Fee',
+  // Never printed as is: each extra charge prints its own name (§21.2).
+  extra: 'Extra Charge'
+};
+
+// Enforced choice list for Sale's `deferred_boarding_frequency` field — the
+// rate period the deferred pickup boarding amount is charged per.
+export const BOARDING_FREQUENCY_OPTIONS = ['Day', 'Week', 'Month'];
+
+// Enforced choice list for the `abnormalities` event type's `Type` field —
+// common canine birth defects a breeder would record at whelping.
+export const ABNORMALITY_TYPES = [
+  'Cleft palate', 'Cleft lip', 'Umbilical hernia', 'Inguinal hernia',
+  'Anasarca (walrus puppy)', 'Swimmer puppy syndrome', 'Hydrocephalus',
+  'Heart murmur', 'Limb deformity', 'Atresia ani (imperforate anus)',
+  'Open fontanelle', 'Cryptorchidism', 'Other'
+];
+
+// --- Show tracking (Show Tracking Spec, Pro) ---------------------------------
+// The `show` event type's vocabularies. One event per dog per show day; the
+// entry lifecycle is a status on that one record, and points/majors/titles are
+// DERIVED from the events (data/showPoints.js) — never stored on the Dog.
+
+// Entry lifecycle (§3). Not a locked state machine — moves any direction, same
+// posture as CONTRACT_STATUS. Only `shown` events count toward points.
+export const SHOW_ENTRY_STATUS = [
+  { value: 'planned',   label: 'Planned',      badge: 'badge-gray' },
+  { value: 'entered',   label: 'Entered',      badge: 'badge-blue' },
+  { value: 'shown',     label: 'Shown',        badge: 'badge-green' },
+  { value: 'absent',    label: 'Absent',       badge: 'badge-amber' },
+  { value: 'scratched', label: 'Scratched',    badge: 'badge-gray' },
+  { value: 'excused',   label: 'Excused / DQ', badge: 'badge-red' }
+];
+
+// Enforced organization list (§4.1). AKC first; UKC/CKC/FCI arrive later as
+// new rows here plus their TITLE_TRACKS rows — no structural change.
+export const SHOW_ORGANIZATIONS = [
+  { value: 'AKC',   label: 'AKC' },
+  { value: 'other', label: 'Other' }
+];
+
+// Requirements per title track (§4.1). The points engine reads these; it never
+// hardcodes a number. A major is a win with points >= majorMin — derived, never
+// a stored flag. `requires` = a title the dog must already hold, and only wins
+// dated AFTER it count (AKC: GCH points only after the dog finishes CH).
+export const TITLE_TRACKS = [
+  { value: 'akc_ch',  label: 'AKC Champion (CH)',        organization: 'AKC', title: 'CH',
+    points: 15, majorMin: 3, majors: 2, distinctMajorJudges: 2, distinctJudges: 3,
+    perShowMax: 5 },
+  { value: 'akc_gch', label: 'AKC Grand Champion (GCH)', organization: 'AKC', title: 'GCH',
+    points: 25, majorMin: 3, majors: 3, distinctMajorJudges: 3, distinctJudges: 4,
+    perShowMax: 5, championDefeats: 3, requires: 'akc_ch' }
+];
+
+// Suggest-not-enforce lists for the show form's Class and Award comboboxes —
+// plain strings in `details`, never validated, same posture as
+// BOARDING_REASON_SUGGESTIONS.
+export const AKC_SHOW_CLASSES = [
+  'Puppy 6–9 Months', 'Puppy 9–12 Months', '12–18 Months', 'Novice',
+  'Bred-by-Exhibitor', 'Amateur-Owner-Handler', 'American-Bred', 'Open',
+  'Best of Breed', 'Veterans'
+];
+export const AKC_SHOW_AWARDS = [
+  '1st', '2nd', '3rd', '4th', 'WD', 'WB', 'RWD', 'RWB', 'BOW', 'BOB', 'BOS',
+  'Select Dog', 'Select Bitch', 'BOB Owner-Handler',
+  'Group 1', 'Group 2', 'Group 3', 'Group 4', 'BIS', 'RBIS'
+];
+
+// --- Event type catalog (Data Model doc §5.2; Stage4.5 Addendum §C3/D1) ----
+// Each type carries a badge color and the type-specific `details` fields shown
+// as a short form (Build Brief B1: one small form per event_type, not a generic
+// key/value editor). `subjects` limits where a type can be logged; at Stage 2
+// only `dog` subjects exist, so pairing/litter-only types are intentionally
+// absent and get added with their tables in later stages.
+//
+// `duration` is 'instant' (a single dated occurrence) or 'span' (has a start —
+// event_date — and an optional open end — event_end_date). Only `boarding`,
+// `heat_cycle`, and `medication` are spans; everything else is instant. This is
+// the field the Location/Status Board deliberately does NOT filter on (Stage4.5
+// Addendum §C4/§C5) — whereabouts is a narrower set than "is a span."
+//
+// `relatedContact: true` means the type carries a top-level related_contact_id
+// (the events.related_contact_id FK, Stage4.5 Addendum §C2) — the person/kennel
+// on the other side of a boarding stay or a placement's buyer. It is NEVER a
+// field inside `details` (details.location stays a plain string; only a real
+// FK belongs at the top level).
+//
+// `relatedContact` may also be a STRING, used as the picker's label (`show`
+// labels it "Handler", `vet_visit`/`surgery` "Vet"); `true` keeps the generic
+// "Related contact" label.
+//
+// A field with `contactFallback: true` holds the related contact's plain-text
+// NAME for surfaces with no contact picker (KennelAssistant's log form) and for
+// events logged before the type had one. The main event form hides it, offers
+// a name-matched contact instead, and drops it once a contact is linked; display
+// code shows it only when no contact is linked.
+//
+// `editionFlag` (optional): the type exists only when `editionFlags[editionFlag]`
+// is on — enabledEventTypes()/eventTypesFor() drop it otherwise, so every type
+// picker (event form, CSV import, Upcoming's filter, the assistant) loses it in
+// one place. EVENT_TYPES itself stays complete, so descriptor()/badge lookups
+// still resolve such an event if one arrives in a backup from another edition.
+//
+// `titleFrom` (optional): a details key whose value auto-fills the title while
+// the user hasn't typed their own (eventForm.js).
+//
+// Field `type` is one of: text | textarea | date | number (optional `step`) |
+// combobox (a free-text input with suggestions — suggest-not-enforce, never a
+// validated enum) | select (enforced choice from `options[]`). Options are
+// plain strings or { value, label } vocab objects (the form stores `value` and
+// shows `label`). A field may carry `default`, applied only when creating an
+// event whose draft has no value for that key (a prefill wins).
+// The contact role a type's related contact is tagged with on save (Show
+// Tracking Spec §2.2): picking someone as a show's handler makes them a
+// Handler, and a vet visit's or surgery's vet a Vet. contactRepo.ensureType is a
+// no-op when the role is already there. Pickers (the event form, Kels's logging
+// forms) list contacts that already carry the role first, and a new contact
+// made there gets it.
+export const RELATED_CONTACT_ROLE = Object.freeze({ show: 'handler', vet_visit: 'vet', surgery: 'vet', screening_test: 'vet' });
+
+// Kels's Add dogs asks each new dog's shots from this fixed checklist, each with
+// how long it's good for: `years` sets the vaccination's `next_due` (and, when
+// she wants a reminder, its `reminder_date`); lifetime has none.
+export const VACCINE_CHECKLIST = ['Rabies', 'DHPP', 'Bordetella', 'Leptospirosis'];
+// The shots Kels's care step (assets/careVisitUI.js: Check in on my dogs, Check in
+// on a litter, Pups are going home) offers as ticks, one `vaccination` per ticked
+// vaccine per ticked dog; an Other box takes any name. Puppy series first.
+export const VACCINE_CHOICES = ['DHPP', 'Parvo', 'Rabies', 'Bordetella', 'Leptospirosis', 'Lyme', 'Canine influenza'];
+// When a shot is next due, from the day it was given (careVisit.nextDueFrom): the
+// weeks for a puppy series, the years for a grown dog's.
+export const VACCINE_NEXT_DUE = [
+  { value: '2w', label: 'In 2 weeks', days: 14 },
+  { value: '3w', label: 'In 3 weeks', days: 21 },
+  { value: '4w', label: 'In 4 weeks', days: 28 },
+  { value: '1y', label: 'In 1 year', months: 12 },
+  { value: '3y', label: 'In 3 years', months: 36 }
+];
+
+// Routine screening tests (`screening_test`): a vet's check that comes back
+// negative or positive, not a breeding clearance, so never one of the health
+// test types (healthTestLog.TEST_TYPES: planned tests, waitlist parent results,
+// Dog Cards). Suggestions only; any name she types is kept.
+export const SCREENING_TESTS = ['Fecal', 'Heartworm', 'Heartworm & tick-borne (4Dx)', 'Giardia', 'Brucellosis', 'Bloodwork', 'Urinalysis'];
+export const SCREENING_RESULTS = ['Negative', 'Positive'];
+export const VACCINE_GOOD_FOR = [
+  { value: '1', label: '1 year', years: 1 },
+  { value: '3', label: '3 years', years: 3 },
+  { value: '5', label: '5 years', years: 5 },
+  { value: 'lifetime', label: 'Lifetime', years: null }
+];
+
+// A completed test's overall flag (genetic_test / ofa_pennhip / breed_specific_test
+// `outcome`), beside her own wording of the result ("Clear", "Grade 2", "N/N").
+// Optional; stored as the label itself. Waitlist family pages can show only the
+// results flagged Normal (waitlist_config.parent_tests, Dog.waitlist_tests).
+export const TEST_OUTCOME = ['Normal', 'Abnormal'];
+// Suggestions for a test's result (genetic_test / breed_specific_test `result`,
+// ofa_pennhip `rating`), shown with every result she's typed on any of the three
+// (healthTestLog.testResultSuggestions). Free text: suggest, never enforce.
+export const TEST_RESULT_SUGGESTIONS = [
+  'Clear', 'Carrier', 'Affected', 'N/N',
+  'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4',
+  'Grade I', 'Grade II', 'Grade III', 'Grade IV', 'Grade V', 'Grade VI'
+];
+const OUTCOME_FIELD = { key: 'outcome', label: 'Normal or abnormal', type: 'select', options: TEST_OUTCOME };
+
+export const EVENT_TYPES = [
+  // Acquisition — an option for the first event on a newly-bought dog's
+  // timeline, never auto-created. `source` is a plain free-text field (the
+  // seller needn't already be a Contact record). The purchase price itself
+  // goes through the event form's existing Cost field, category "New dog
+  // purchase" (EXPENSE_CATEGORIES) — Sales/StudService stay income-only, so
+  // dog acquisitions are tracked purely as an expense, never a Sale.
+  { value: 'acquisition',        label: 'Acquisition',        badge: 'badge-green',   subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'source', label: 'Source / seller', type: 'text' }] },
+  { value: 'vaccination',        label: 'Vaccination',        badge: 'badge-blue',    subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'vaccine', label: 'Vaccine', type: 'text' }, { key: 'lot_number', label: 'Lot #', type: 'text' }, { key: 'next_due', label: 'Next due', type: 'date' }] },
+  { value: 'preventative',       label: 'Preventative',       badge: 'badge-blue',    subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'product', label: 'Product', type: 'text' }, { key: 'dose', label: 'Dose', type: 'text' }] },
+  // panel_name/test_name/joint are `combobox` fields sourced at render time from
+  // the shared test vocabulary (Test Planning Addendum §3: Kennel.preferred_tests
+  // union distinct tokens already seen in events) — see eventForm.js's
+  // TEST_VOCAB_FIELDS. Suggest-not-enforce, same as boarding_reason below.
+  { value: 'genetic_test',       label: 'Genetic test',       badge: 'badge-purple',  subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'panel_name', label: 'Panel', type: 'combobox' }, { key: 'lab', label: 'Lab', type: 'text' }, { key: 'result', label: 'Result', type: 'combobox', options: TEST_RESULT_SUGGESTIONS }, OUTCOME_FIELD] },
+  { value: 'ofa_pennhip',        label: 'OFA / PennHIP',      badge: 'badge-purple',  subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'joint', label: 'Joint', type: 'combobox' }, { key: 'method', label: 'Method', type: 'text' }, { key: 'rating', label: 'Rating', type: 'combobox', options: TEST_RESULT_SUGGESTIONS }, OUTCOME_FIELD] },
+  { value: 'breed_specific_test', label: 'Breed-specific test', badge: 'badge-purple', subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'test_name', label: 'Test', type: 'combobox' }, { key: 'result', label: 'Result', type: 'combobox', options: TEST_RESULT_SUGGESTIONS }, OUTCOME_FIELD] },
+  // A routine screening at the vet (fecal, heartworm, brucellosis...): the vet is
+  // the related contact, as on a vet visit. Kept apart from the three breeding
+  // test types above (see SCREENING_TESTS).
+  { value: 'screening_test',     label: 'Screening test',     badge: 'badge-blue',    subjects: ['dog'], duration: 'instant', relatedContact: 'Vet',
+    fields: [{ key: 'test', label: 'Test', type: 'combobox', options: SCREENING_TESTS }, { key: 'result', label: 'Result', type: 'combobox', options: SCREENING_RESULTS }, OUTCOME_FIELD, { key: 'vet', label: 'Vet', type: 'text', contactFallback: true }] },
+  { value: 'illness',            label: 'Illness',            badge: 'badge-red',     subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'diagnosis', label: 'Diagnosis', type: 'text' }, { key: 'treatment', label: 'Treatment', type: 'textarea' }] },
+  // Span (Stage4.5 Addendum §C5): event_date is the start, event_end_date the
+  // end (retired out of details.end_date — there's no shipped data to migrate).
+  { value: 'medication',         label: 'Medication',         badge: 'badge-blue',    subjects: ['dog'], duration: 'span',
+    fields: [{ key: 'drug', label: 'Drug', type: 'text' }, { key: 'dose', label: 'Dose', type: 'text' }, { key: 'frequency', label: 'Frequency', type: 'text' }] },
+  // Surgery / vet visit: the vet is the top-level related_contact_id (a Contact,
+  // tagged 'vet' on save), picked or created inline like a sale's buyer. The
+  // `vet` details key is its `contactFallback` — the plain-text name, kept for
+  // events logged where no picker exists (KennelAssistant) or before the link
+  // existed; the main form hides it and clears it once a contact is linked.
+  { value: 'surgery',            label: 'Surgery',            badge: 'badge-red',     subjects: ['dog'], duration: 'instant', relatedContact: 'Vet',
+    fields: [{ key: 'procedure', label: 'Procedure', type: 'text' }, { key: 'vet', label: 'Vet', type: 'text', contactFallback: true }, { key: 'outcome', label: 'Outcome', type: 'textarea' }] },
+  { value: 'vet_visit',          label: 'Vet visit',          badge: 'badge-blue',    subjects: ['dog'], duration: 'instant', relatedContact: 'Vet',
+    fields: [{ key: 'reason', label: 'Reason', type: 'text' }, { key: 'vet', label: 'Vet', type: 'text', contactFallback: true }, { key: 'findings', label: 'Findings', type: 'textarea' }] },
+  { value: 'injury',             label: 'Injury',             badge: 'badge-red',     subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'description', label: 'Description', type: 'textarea' }, { key: 'severity', label: 'Severity', type: 'text' }] },
+  { value: 'abnormalities',      label: 'Abnormalities',      badge: 'badge-red',     subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'type', label: 'Type', type: 'select', options: ABNORMALITY_TYPES }] },
+  { value: 'weight_check',       label: 'Weight check',       badge: 'badge-neutral', subjects: ['dog'], duration: 'instant',
+    fields: [
+      { key: 'weight_lbs', label: 'Weight (lbs)', type: 'number' },
+      { key: 'weight_oz', label: 'Weight (oz)', type: 'number', step: '0.1' },
+      { key: 'time_of_day', label: 'AM/PM', type: 'select', options: ['AM', 'PM'] }
+    ] },
+  { value: 'milestone',          label: 'Milestone',          badge: 'badge-green',   subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'description', label: 'Description', type: 'text' }] },
+  { value: 'title_earned',       label: 'Title earned',       badge: 'badge-green',   subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'title_abbreviation', label: 'Title', type: 'text' }, { key: 'organization', label: 'Organization', type: 'text' }] },
+  // Span (Stage4.5 Addendum §C5): event_date is the cycle start (retired out of
+  // details.cycle_start), event_end_date the (optional) end.
+  { value: 'heat_cycle',         label: 'Heat cycle',         badge: 'badge-amber',   subjects: ['dog'], duration: 'span',
+    fields: [{ key: 'notes', label: 'Notes', type: 'textarea' }] },
+  { value: 'evaluation',         label: 'Evaluation',         badge: 'badge-neutral', subjects: ['dog'], duration: 'instant',
+    fields: [{ key: 'evaluator', label: 'Evaluator', type: 'text' }, { key: 'temperament_notes', label: 'Temperament notes', type: 'textarea' }, { key: 'structure_notes', label: 'Structure notes', type: 'textarea' }] },
+  // Boarding (Stage4.5 Addendum §C3) — a span with a top-level related_contact_id
+  // (the person/kennel the dog is staying with). `location` and `boarding_reason`
+  // stay plain strings in `details`; boarding_reason is suggest-not-enforce, never
+  // a validated vocab. dropoff_time/pickup_time are inert display strings — never
+  // parsed or compared.
+  { value: 'boarding',           label: 'Boarding',           badge: 'badge-amber',   subjects: ['dog'], duration: 'span', relatedContact: true,
+    fields: [
+      { key: 'location', label: 'Location', type: 'text' },
+      { key: 'boarding_reason', label: 'Reason', type: 'combobox', options: BOARDING_REASON_SUGGESTIONS },
+      { key: 'dropoff_time', label: 'Drop-off time', type: 'text' },
+      { key: 'pickup_time', label: 'Pick-up time', type: 'text' },
+      { key: 'notes', label: 'Notes', type: 'textarea' }
+    ] },
+  // Pairing-subject types (Stage 3) — the pairing's timeline is built from these.
+  { value: 'breeding_tie',       label: 'Breeding tie',       badge: 'badge-purple',  subjects: ['pairing'], duration: 'instant',
+    fields: [{ key: 'tie_date', label: 'Tie date', type: 'date' }, { key: 'method', label: 'Method', type: 'text' }] },
+  { value: 'progesterone_test',  label: 'Progesterone test',  badge: 'badge-blue',    subjects: ['pairing'], duration: 'instant',
+    fields: [{ key: 'value', label: 'Value (ng/mL)', type: 'number' }, { key: 'lab', label: 'Lab', type: 'text' }] },
+  { value: 'ultrasound',         label: 'Ultrasound',         badge: 'badge-blue',    subjects: ['pairing'], duration: 'instant',
+    fields: [{ key: 'confirmed', label: 'Confirmed?', type: 'text' }, { key: 'estimated_count', label: 'Estimated count', type: 'number' }] },
+  { value: 'pregnancy_update',   label: 'Pregnancy update',   badge: 'badge-green',   subjects: ['pairing'], duration: 'instant',
+    fields: [{ key: 'note', label: 'Note', type: 'textarea' }] },
+  // Litter-subject type (Stage 3).
+  { value: 'whelping_summary',   label: 'Whelping summary',   badge: 'badge-green',   subjects: ['litter'], duration: 'instant',
+    fields: [{ key: 'total_born', label: 'Total born', type: 'number' }, { key: 'live_born', label: 'Live born', type: 'number' }, { key: 'notes', label: 'Notes', type: 'textarea' }] },
+  // Placement / drop-off (Stage4.5 Addendum §D1) — an instant event; subject_id
+  // is the puppy, related_contact_id is the buyer. No stored link to the Sale
+  // (prompted at the Sale, never tied to it — see saleRepo/sale.js prompt).
+  // placement_time is an inert display string, same posture as boarding's times.
+  { value: 'placement',          label: 'Placement / drop-off', badge: 'badge-green', subjects: ['dog'], duration: 'instant', relatedContact: true,
+    fields: [
+      { key: 'dropoff_method', label: 'Method', type: 'select', options: PLACEMENT_METHODS },
+      { key: 'placement_time', label: 'Drop-off time', type: 'text' },
+      { key: 'location', label: 'Location', type: 'text' },
+      { key: 'notes', label: 'Notes', type: 'textarea' }
+    ] },
+  // Show (Show Tracking Spec §2, Pro-only via `editionFlag: 'shows'`) — one
+  // event per dog per show day. Instant, so upcoming shows land on the Upcoming
+  // page with no extra code. The handler is the top-level related_contact_id;
+  // reminder_date is the "entries close" date. Judge/club are free text with
+  // suggestions from values already logged (eventForm.js LOGGED_VALUE_FIELDS).
+  { value: 'show',               label: 'Show',               badge: 'badge-purple',  subjects: ['dog'], duration: 'instant',
+    relatedContact: 'Handler', editionFlag: 'shows', titleFrom: 'show_name',
+    fields: [
+      { key: 'entry_status', label: 'Entry status', type: 'select', options: SHOW_ENTRY_STATUS, default: 'planned' },
+      { key: 'show_name', label: 'Show', type: 'text' },
+      { key: 'club', label: 'Club', type: 'combobox' },
+      { key: 'organization', label: 'Organization', type: 'select', options: SHOW_ORGANIZATIONS, default: 'AKC' },
+      { key: 'location', label: 'Location', type: 'text' },
+      { key: 'ring', label: 'Ring', type: 'text' },
+      { key: 'ring_time', label: 'Ring time', type: 'text' },
+      { key: 'judge', label: 'Judge', type: 'combobox' },
+      { key: 'class', label: 'Class', type: 'combobox', options: AKC_SHOW_CLASSES },
+      { key: 'placement', label: 'Award', type: 'combobox', options: AKC_SHOW_AWARDS },
+      { key: 'points', label: 'Points', type: 'number' },
+      { key: 'points_toward', label: 'Points toward', type: 'select', options: TITLE_TRACKS },
+      { key: 'defeated_champion', label: 'Defeated a champion of record?', type: 'select', options: ['Yes', 'No'] }
+    ] },
+  { value: 'note',               label: 'Note',               badge: 'badge-gray',    subjects: ['dog', 'pairing', 'litter'], duration: 'instant',
+    fields: [] }
+];
+
+// The event types this edition offers: EVENT_TYPES minus any type whose
+// `editionFlag` is off. Flags are read at CALL time (never cached in a
+// top-level const), so module load order can't matter.
+export function enabledEventTypes() {
+  return EVENT_TYPES.filter((t) => !t.editionFlag || editionFlags[t.editionFlag]);
+}
+
+// Event types loggable against a given subject_type (edition-filtered).
+export function eventTypesFor(subjectType) {
+  return enabledEventTypes().filter((t) => t.subjects.includes(subjectType));
+}
+
+// The KennelAssistant allow-list (§26): the event types the helper app can SEE
+// (assistantSync's feed builder) and LOG (assistant.js's form) — one list so
+// the two can never drift. Lives here (not in either sync module) because both
+// sides import vocab and neither should import the other's database module.
+// Widen/narrow by editing this list.
+export const ASSISTANT_EVENT_TYPES = ['weight_check', 'milestone', 'note', 'preventative', 'medication'];
+
+// --- Financials (the Expense ledger) --------------------------------------
+// The controlled category vocabulary for an Expense. Same shape as every other
+// vocab here (value/label/badge) so dropdowns and badges read from one place.
+export const EXPENSE_CATEGORIES = [
+  { value: 'food',         label: 'Food & nutrition',   badge: 'badge-green' },
+  { value: 'veterinary',   label: 'Veterinary',         badge: 'badge-blue' },
+  { value: 'testing',      label: 'Health testing',     badge: 'badge-purple' },
+  { value: 'registration', label: 'Registration',       badge: 'badge-neutral' },
+  { value: 'supplies',     label: 'Supplies',           badge: 'badge-amber' },
+  { value: 'facility',     label: 'Facility',           badge: 'badge-amber' },
+  { value: 'boarding',     label: 'Boarding & travel',  badge: 'badge-amber' },
+  { value: 'mileage',      label: 'Mileage / travel',   badge: 'badge-amber' },
+  { value: 'stud_fee',     label: 'Stud fee',           badge: 'badge-purple' },
+  { value: 'foster_split', label: 'Foster compensation',  badge: 'badge-purple' },
+  { value: 'dog_purchase', label: 'New dog purchase',   badge: 'badge-red' },
+  { value: 'marketing',    label: 'Marketing',          badge: 'badge-blue' },
+  { value: 'insurance',    label: 'Insurance',          badge: 'badge-neutral' },
+  { value: 'show',         label: 'Shows & handling',   badge: 'badge-purple' },
+  { value: 'other',        label: 'Other',              badge: 'badge-gray' }
+];
+
+// What an Expense can attach to. Polymorphic like the Event, but its own list:
+// events are dog/pairing/litter history; expenses add `kennel` so kennel-wide
+// overhead has a home. There is no `general` subject — program-wide overhead is
+// logged against your own kennel (single canonical home, no null subject_id).
+export const EXPENSE_SUBJECT_TYPES = [
+  { value: 'dog',     label: 'Dog' },
+  { value: 'litter',  label: 'Litter' },
+  { value: 'pairing', label: 'Pairing' },
+  { value: 'kennel',  label: 'Kennel' }
+];
+
+// --- Documents (dog-scoped filed files: pedigree/health test/registration/
+// contract/other) ------------------------------------------------------------
+export const DOC_TYPES = [
+  { value: 'pedigree',     label: 'Pedigree',     badge: 'badge-green' },
+  { value: 'health_test',  label: 'Health test',  badge: 'badge-blue' },
+  { value: 'vet_summary',  label: 'Vet summary',  badge: 'badge-blue' }, // a visit summary, medical record or vaccine history from the vet
+  { value: 'registration', label: 'Registration', badge: 'badge-neutral' },
+  { value: 'contract',     label: 'Contract',     badge: 'badge-purple' },
+  { value: 'other',        label: 'Other',        badge: 'badge-gray' }
+];
+
+// Which optional fields (beyond title/doc_date/notes, which every type shows)
+// appear on the add/edit form for a given doc_type.
+const DOC_FIELDS_BY_TYPE = {
+  pedigree:     ['issuer_or_lab', 'registry', 'registration_number'],
+  health_test:  ['issuer_or_lab', 'result'],
+  vet_summary:  ['issuer_or_lab'],
+  registration: ['issuer_or_lab', 'registry', 'registration_number'],
+  contract:     ['issuer_or_lab'],
+  other:        ['issuer_or_lab']
+};
+
+export function documentFieldsFor(docType) {
+  return DOC_FIELDS_BY_TYPE[docType] || DOC_FIELDS_BY_TYPE.other;
+}
+
+// A small emoji icon per type, for the list when a document has no photo
+// thumbnail (uploaded PDFs).
+const DOC_TYPE_ICON = {
+  pedigree: '🌳',
+  health_test: '🩺',
+  vet_summary: '🏥',
+  registration: '📜',
+  contract: '✍️',
+  other: '📄'
+};
+export function docTypeIcon(value) {
+  return DOC_TYPE_ICON[value] || '📄';
+}
+
+// Suggested default category when a cost is captured from an event, keyed by
+// event_type. Only a starting point — the event form's category dropdown lets
+// the user override before saving. Anything unmapped defaults to 'other'.
+//
+// `veterinary` is reserved for genuine clinical vet care (a dog seen, treated,
+// operated on, or scanned by a vet), NOT used as a lazy catch-all for anything
+// health-adjacent. Events that are stockable products a breeder self-administers
+// (preventative, medication) or a plain observation with no inherent cost
+// (abnormalities) fall through to 'other' rather than mislabel spend as vet care.
+// Diagnostic panels (genetic/OFA/breed/progesterone) map to `testing`.
+const EVENT_TYPE_EXPENSE_CATEGORY = {
+  acquisition: 'dog_purchase',
+  vaccination: 'veterinary', illness: 'veterinary', surgery: 'veterinary',
+  vet_visit: 'veterinary', injury: 'veterinary', ultrasound: 'veterinary', screening_test: 'veterinary',
+  genetic_test: 'testing', ofa_pennhip: 'testing', breed_specific_test: 'testing',
+  progesterone_test: 'testing',
+  boarding: 'boarding',
+  show: 'show'
+};
+
+export function defaultExpenseCategoryFor(eventType) {
+  return EVENT_TYPE_EXPENSE_CATEGORY[eventType] || 'other';
+}
+
+// --- Financials (the Income view) -----------------------------------------
+// Income is DERIVED, never stored: data/incomeView.js reads Sale + outgoing
+// StudService and classifies each money component as earned or anticipated —
+// there is no income table and no `is_earned` field (see §21). These three
+// vocabs give the Income view its badges and its per-component breakdown, in the
+// same value/label/badge shape every other vocab uses, so dropdowns/badges/
+// breakdown all read from one place and never drift.
+
+// The state a cash income component is in. `earned` = money already in hand
+// (a paid deposit, a completed stud fee); `anticipated` = expected but not yet
+// received (an unpaid balance on an open sale). Money that will never arrive —
+// the unpaid remainder of a returned/cancelled sale, a failed stud fee — is
+// simply dropped from both, not carried as a third state (owner decision, §21).
+export const INCOME_STATES = [
+  { value: 'earned',      label: 'Earned',      badge: 'badge-green' },
+  { value: 'anticipated', label: 'Anticipated', badge: 'badge-amber' }
+];
+
+// Where an income row comes from — a Sale placement, an outgoing StudService
+// (incoming stud is money WE pay, so it is an expense, never income), or a
+// received waitlist application fee (Waitlist Spec §5.3, Pro-only).
+export const INCOME_SOURCE_TYPES = [
+  { value: 'sale', label: 'Sale',         badge: 'badge-blue' },
+  { value: 'stud', label: 'Stud service', badge: 'badge-purple' },
+  { value: 'waitlist', label: 'Waitlist fee', badge: 'badge-green' }
+];
+
+// The money components a row breaks into, for the Income summary's per-component
+// breakdown (mirrors the Expenses summary's per-category one). `pick` is a
+// NON-CASH estimate (StudService.pick_value_amount) — surfaced on its own line
+// but kept out of the earned/anticipated cash totals and the Net figure (owner
+// decision, §21).
+export const INCOME_COMPONENTS = [
+  { value: 'deposit',   label: 'Deposits',          badge: 'badge-amber' },
+  { value: 'balance',   label: 'Balance',           badge: 'badge-green' },
+  { value: 'transport', label: 'Transport',         badge: 'badge-blue' },
+  { value: 'boarding',  label: 'Deferred boarding',  badge: 'badge-amber' },
+  // A sale's extra charges (Sale.extra_charges, §21.2): photo packages, a payment
+  // fee charged back… One component per charge, all under this one heading.
+  { value: 'extra',     label: 'Extra charges',     badge: 'badge-blue' },
+  { value: 'stud_fee',  label: 'Stud fees',         badge: 'badge-purple' },
+  { value: 'pick',      label: 'Pick value (est.)', badge: 'badge-neutral' },
+  { value: 'application_fee', label: 'Application fees', badge: 'badge-green' },
+  // A NEGATIVE line: what a sales channel (Good Dog, Stripe…) kept of a sale's
+  // payments (Sale.processing_fee_amount), so earned income is what she actually
+  // received (Integrations plan §5). Never on an invoice or a receivable.
+  { value: 'processing_fee', label: 'Processing fees', badge: 'badge-red' }
+];

@@ -1,0 +1,715 @@
+// syncRegistry.js — the per-table, per-field CLOUD ALLOW-LIST (Cloud Phase 1 plan
+// §5; Waitlist Spec §9 for the three waitlist tables). It is the privacy promise
+// of cloud backup: only what is listed here as `cloud` ever leaves the device.
+//
+// Rule zero: a field NOT listed as cloud is private. The registry lists cloud
+// fields, so the default is safe — a field added later stays on the device until
+// someone deliberately classifies it here. Every record's `id`, `is_archived`,
+// `created_at`, `updated_at` are implicitly cloud.
+//
+// Each table entry:
+//   rows    — the per-row rule: 'all' | 'none' | a predicate (row) => bool |
+//             'referenced' (files: only those a KEPT document points at).
+//   cloud   — the allow-list. A snapshot row is built FROM THIS LIST BY NAME,
+//             never by spreading the source row (same posture as
+//             companionExport.js).
+//   private — the known private fields. Documentation + the coverage test only:
+//             filtering never reads it (rule zero already makes them private).
+//   pending — fields not yet classified by a decision. Treated as private (rule
+//             zero) until someone moves them to `cloud` or `private`. Listed so
+//             the coverage test passes while the open question stays visible.
+//   filtered (optional) — { field: fn(value, row) } for a cloud field whose
+//             CONTENTS are partly private (events.details).
+//   partial (optional) — { field: [keys] } for a cloud field holding an OBJECT
+//             of which only the listed keys are cloud (waitlist_entries.
+//             application: name + email). The rest of the object stays private,
+//             and a restore keeps the device's own copy of those keys.
+//   derived (optional) — keys the snapshot builder adds that the local row
+//             doesn't carry (files: `sha256`, in place of the blob, which is
+//             uploaded separately — plan §4.1 step 4).
+//
+// A second registry to keep current, beside referenceRegistry.js: a NEW FIELD on
+// any table must be classified here, or tests/syncRegistry.test.js fails once it
+// shows up in the sample packet. Pure data + pure functions; no db, no network.
+import { EVENT_TYPES } from './vocab.js';
+
+export const IMPLICIT_CLOUD_FIELDS = Object.freeze(['id', 'is_archived', 'created_at', 'updated_at']);
+
+// Documents whose rows (and files) go to the cloud. contract/other stay local.
+// vet_summary goes (owner decision 2026-11-01: a vet's records, like a health test).
+export const CLOUD_DOC_TYPES = Object.freeze(['health_test', 'vet_summary', 'pedigree', 'registration']);
+
+const ALL = 'all';
+const NONE = 'none';
+const REFERENCED = 'referenced';
+
+export const SYNC_REGISTRY = Object.freeze({
+  dogs: {
+    rows: ALL,
+    cloud: [
+      'call_name', 'registered_name', 'sex', 'breed', 'status', 'ownership_type',
+      'kennel_id', 'breeder_kennel_id', 'sire_id', 'dam_id', 'litter_id',
+      'owner_contact_id', 'co_owner_contact_ids', 'date_of_birth', 'date_of_death',
+      'color_markings', 'registry', 'registration_number', 'microchip_id', 'url',
+      'planned_tests', 'disposition', 'dob_is_estimated', 'recorded_coi',
+      'intended_registration', // Waitlist Spec §9
+      'waitlist_tests', // its say over its health tests on waitlist family pages; a display choice, read by whichever device publishes
+      'photos_online', // its say over showing its url as a photos link on waitlist pages; a display choice like waitlist_tests
+      // Her KennelPort website (KennelPort plan 5.3): this dog has a page on it, and its
+      // coming heats may show (a month only). Display choices like photos_online, read by
+      // whichever device presses Update website.
+      'show_on_website', 'heats_online',
+      // Which of its co-owners a co-owned dog lives with now (empty: with her). Where it
+      // shows on her website comes from it (KennelPort's Co_Owned_Dogs_Plan.md); a contact
+      // id, like co_owner_contact_ids.
+      'lives_with_contact_id',
+      'pedigree_only', // without it a cloud restore would turn every ancestor into a kennel dog
+      'additional_registrations', // the dog's other registries and numbers; the same kind of data as registry/registration_number
+      // Imported, and its Country of origin while ticked (Website Contract Plan C4): facts
+      // about the dog like registry (owner decision 2026-11-13).
+      'imported', 'import_country',
+      // Its titles held ([{ abbr, organization, earned_on }]) and its country of origin,
+      // apart from Imported (Dog Titles Field Plan D2, D8): facts about the dog like
+      // registry; title_earned events already go to the cloud (owner decision 2026-11-14).
+      'titles', 'country_of_origin',
+      // Its Dog Card id (Shared Dogs Plan §3.1): a random kosd1_ id, minted when it first
+      // goes on a card or received with one. Cloud so every device of hers matches the
+      // same dog on the next card.
+      'public_id'
+    ],
+    private: ['notes'],
+    pending: []
+  },
+
+  events: {
+    rows: ALL,
+    cloud: [
+      'subject_type', 'subject_id', 'event_type', 'event_date', 'event_end_date',
+      'title', 'reminder_date', 'reminder_dismissed', 'related_dog_id',
+      'related_contact_id', 'details',
+      // A test or title that came on a Dog Card: `<dog public id>:<the sender's event
+      // id>`, so a card sent again updates it (Shared Dogs Plan §3.5). Random ids only.
+      'shared_ref'
+    ],
+    private: ['notes'],
+    pending: [],
+    filtered: { details: (value, row) => filterEventDetails(row.event_type, value) }
+  },
+
+  kennels: {
+    rows: ALL,
+    cloud: [
+      'kennel_name', 'prefix', 'public_id', 'is_own_kennel', 'location', 'website',
+      // An outside kennel she lets her website name, by name and website, as a
+      // co-owned dog's kennel (KennelPort's Co_Owned_Dogs_Plan.md). A display choice.
+      'name_on_website',
+      // Her puppy portal on KennelPort (End-State guide §35.1; owner decision
+      // 2026-11-04): its address, the one-tap link's key KennelPort derives for her
+      // site (it dies on Unlink), the families it has taken over, and the facts it
+      // sent back that were applied. Cloud so whichever device publishes her waitlist
+      // puts Open your puppy portal on the status page, and Companion and Furever are
+      // off on every device. The key reaches the same server in the projection anyway.
+      'kennelport_portal',
+      'logo_data_url', 'preferred_tests', 'preferred_breeds', 'preferred_test_breeds',
+      'promote_nudge_enabled', 'promote_age_male_months', 'promote_age_female_months',
+      // The name she countersigns e-sign contracts with for this kennel (Integrations
+      // D32; owner decision 2026-11-12: cloud, so every device of hers has it). It
+      // goes to Firma on each send anyway.
+      'esign_signer_name',
+      // Her Furever identity (K14-5; owner decision 2026-11-16: cloud): the key a
+      // family's Furever app files her breeder card under, the name, tagline,
+      // contact and vet on that card, and the kennel pack's Drive pointer. All of
+      // it goes to every family she sends a Furever link anyway; cloud so a resend
+      // from her other device or after a restore doesn't fork the family's card.
+      'furever_identity',
+      // Her own waitlist setup: rules, application form questions, FAQ, fee and
+      // payment instructions. Her business settings, not anyone else's personal
+      // data, so cloud, or a restore couldn't run her waitlist (decided 2026-10-07,
+      // Cloud plan §5.1 decision 1).
+      'waitlist_config',
+      // Which fields her printed Puppy Records show (guide §23). A print setting,
+      // not personal data.
+      'puppy_record_fields',
+      // The kennel's IANA time zone: offer deadlines end at 11:59 pm there (Waitlist
+      // Spec §6.5, W2 Plan §9). A setting, not personal data.
+      'time_zone',
+      // The Payment service account her online application fee is paid through
+      // (Integrations plan §4): an id, like sales_channel_account_id.
+      'waitlist_fee_account_id'
+    ],
+    // Her application form's key pairs (W2 Plan §7): the private halves open every
+    // online application, so they ride the private vault and file backups only.
+    private: ['waitlist_form_keys',
+      // Her extra charges price list (guide §21.2): prices, private like a sale's,
+      // and its groups' rules and payment plans.
+      'extra_charge_list', 'extra_charge_groups',
+      // Her pickup places (Family Requests plan §4): addresses, private.
+      'pickup_locations',
+      // Her saved payment schedules and what she takes for the final payment
+      // (Payment Schedule plan §3.4, D5): private like her price list.
+      'payment_schedules', 'final_payment_methods'],
+    pending: []
+  },
+
+  contacts: {
+    rows: ALL,
+    cloud: ['name', 'contact_type', 'kennel_id', 'waitlist_status'],
+    private: ['email', 'phone', 'facebook_profile', 'address', 'notes', 'companion_note', 'first_contact_source'],
+    pending: []
+  },
+
+  pairings: {
+    rows: ALL,
+    cloud: [
+      'kennel_id', 'sire_id', 'dam_id', 'pairing_type', 'status', 'method',
+      'planned_date', 'last_observed_date', 'expected_due_date',
+      'show_on_website' // shows under Coming up on her KennelPort website (KennelPort plan 5.3); a display choice
+    ],
+    private: ['notes'],
+    pending: []
+  },
+
+  litters: {
+    rows: ALL,
+    cloud: [
+      'kennel_id', 'pairing_id', 'sire_id', 'dam_id', 'status', 'nickname',
+      'whelp_date', 'accept_deposits_date', 'estimated_ready_date',
+      'litter_registration_number', 'puppies_born_total', 'puppies_born_alive',
+      'puppies_born_deceased', 'puppies_born_abnormalities', 'delivery_type', 'foster_direction',
+      'foster_partner_contact_id',
+      'picks_opened_date', // a waitlist date: the auto-offer flow needs it after a restore
+      'photos_url', // the litter's photos link: like a dog's url, and the publishing device shows it on waitlist pages
+      'show_on_website', // this litter and its puppies show on her KennelPort website (KennelPort plan 5.3); a display choice
+      'waitlist_off' // kept off the waitlist (Waitlist Fixes Plan E3, D7: cloud): which litters the waitlist shows; a flag, nothing personal
+    ],
+    // Plan §5: "every price/deposit/foster-money field" — the foster comp model
+    // and split basis are the terms of that money, so they stay with it.
+    private: [
+      'expected_price_male', 'expected_price_female', 'expected_deposit_male',
+      'expected_deposit_female', 'full_reg_surcharge_male', 'full_reg_surcharge_female',
+      'foster_comp_model', 'foster_our_share_pct',
+      'foster_split_basis', 'foster_flat_fee_per_pup', 'foster_split_notes',
+      'feeding_schedule_override', 'notes',
+      // Her pickup times for the litter (Family Requests plan §4): private like her
+      // pickup places, which they point at; and each date's rule (a package needed
+      // first, or her standard boarding).
+      'pickup_slots', 'pickup_date_rules'
+    ],
+    pending: []
+  },
+
+  sales: {
+    rows: ALL,
+    cloud: [
+      'kennel_id', 'dog_id', 'buyer_contact_id', 'status', 'registration_type',
+      'sale_date', 'deposit_date', 'balance_due_date', 'balance_paid_date',
+      // The day she started this family's puppy portal before the contract was
+      // signed (portalFeed.startedEarly): a date she chose, so whichever device sends
+      // the portal feed sends them too.
+      'portal_early_on',
+      // Which channel it went through, and whether its fee was passed on
+      // (Integrations plan §5, D9). The fee itself is money, private like price.
+      'sales_channel_account_id', 'fee_passed_to_buyer',
+      // Which Payment service account the deposit and the balance were paid via
+      // (Integrations plan §4–§5): ids, like the channel.
+      'deposit_paid_via_account_id', 'balance_paid_via_account_id',
+      // Her open one-use Stripe link (Integrations plan §4, D9: payment-link refs are
+      // cloud, so any device can match a payment): the link, Stripe's id for it,
+      // which payment it's for and when it was made. Its amount is private.
+      'payment_link_url', 'payment_link_ref', 'payment_link_component', 'payment_link_date',
+      // A side sale (Side Sale Spec; owner approved 2026-11-08: synced with the rest of
+      // the sale): the waitlist family, the deposit's due date, whether it holds the
+      // pup, and the disposition to put back on a cancel.
+      'side_entry_id', 'side_deposit_due', 'side_holds_pup', 'side_prior_disposition',
+      // When she sent its deposit request (Review sale & send), as an offer row keeps it.
+      'side_request_sent_date'
+    ],
+    private: [
+      'price', 'deposit_amount', 'transport_fee', 'deferred_boarding_amount',
+      'deferred_boarding_frequency', 'deferred_boarding_duration_days',
+      // Set by a pickup date's standard boarding (Family Requests plan §4), so it
+      // can come off again; money-adjacent, private like the charge.
+      'boarding_from_pickup',
+      'invoice_number', 'invoice_notes', 'payment_method', 'payment_reference',
+      'lead_source', 'referred_by_contact_id', 'notes',
+      // Why a voided/returned sale ended, and her note on it (decided 2026-10-08):
+      // health information about the pup, so private like notes.
+      'end_reason', 'end_note',
+      'processing_fee_amount',
+      // What a connected vendor reported that her device didn't apply by itself
+      // (Integrations plan §0): amounts and references, private like the rest.
+      'integration_reviews',
+      // The open link's amount, and each payment's fee as the vendor reported it
+      // (plan §4 → §5): money, private like price and processing_fee_amount.
+      'payment_link_amount', 'processing_fee_reports',
+      // Extra charges (guide §21.2): names and amounts, money like price.
+      'extra_charges',
+      // Its payment schedule and the payments received (Payment Schedule plan §3.1,
+      // §3.2, D5): money, private like price.
+      'payment_schedule', 'payments'
+    ],
+    pending: []
+  },
+
+  stud_services: {
+    rows: ALL,
+    cloud: [
+      'kennel_id', 'direction', 'type', 'our_dog_id', 'partner_dog_id',
+      'partner_contact_id', 'pairing_id', 'status', 'fee_structure', 'pick_status',
+      'sent_date', 'returned_date'
+    ],
+    private: [
+      'fee_amount', 'pick_value_amount', 'result_notes', 'invoice_number',
+      'invoice_notes', 'payment_method', 'payment_reference', 'referred_by_contact_id'
+    ],
+    pending: []
+  },
+
+  contracts: {
+    rows: ALL,
+    cloud: [
+      'kennel_id', 'contract_type', 'status', 'title', 'related_sale_id',
+      'related_stud_service_id', 'related_dog_id', 'related_contact_id',
+      'signed_date', 'lease_start_date', 'lease_end_date',
+      // Sent for signature through one of her contract forms (Integrations plan
+      // §2.1a, D9 / D15): which service, which form (its label then), and when.
+      'esign_provider', 'esign_form_label', 'esign_sent_date',
+      // Firma's id for the signing request (plan §2.3a, D30): an id only, no
+      // buyer details, so any of her devices can show the signed copy.
+      'esign_ref',
+      // She countersigns it, after the buyer (D32), or before (…_first): yes/nos,
+      // so any of her devices shows Countersign / Sign first while it's out.
+      'esign_countersign', 'esign_countersign_first'
+    ],
+    // The link sent carries the prefilled facts in it (buyer's name, email, phone,
+    // address, price), so it's private like those fields.
+    private: ['document_url', 'terms_summary', 'notes', 'esign_url',
+      // What a connected e-sign service reported that wasn't applied (plan §0).
+      'integration_reviews'],
+    // A reservation agreement's details (contractRepo RESERVATION_FIELDS): which
+    // litter, the buyer's preferred sex and color, the deposit. Not yet decided:
+    // device-only until the owner says (the deposit is private like a sale's).
+    pending: ['reservation_litter_id', 'reservation_pref_sex', 'reservation_pref_color', 'reservation_deposit_amount']
+  },
+
+  documents: {
+    rows: (row) => CLOUD_DOC_TYPES.includes(row.doc_type),
+    cloud: [
+      'kennel_id', 'dog_id', 'doc_type', 'file_id', 'title', 'doc_date',
+      'issuer_or_lab', 'result', 'registry', 'registration_number',
+      // Her "can be shared to FurEver" choice (decided 2026-10-11): a flag, no content.
+      'furever_shareable'
+    ],
+    // contract_id only rides contract-type documents, whose whole row stays local.
+    private: ['notes', 'contract_id'],
+    pending: []
+  },
+
+  files: {
+    rows: REFERENCED,
+    cloud: ['mime', 'filename', 'size', 'thumbnail'],
+    private: ['blob'], // never in the snapshot JSON; uploaded to R2 by sha256 instead
+    pending: [],
+    derived: ['sha256']
+  },
+
+  expenses: {
+    rows: NONE, // the whole table is Financials — private
+    cloud: [],
+    private: [
+      'subject_type', 'subject_id', 'amount', 'category', 'expense_date', 'event_id',
+      'miles', 'mileage_rate', 'vendor', 'receipt_number', 'receipt_file_id',
+      'reimbursable', 'reimbursed_date', 'notes', 'account_id', 'stud_service_id'
+    ],
+    pending: []
+  },
+
+  breed_feeding_schedules: {
+    rows: ALL,
+    cloud: ['breed', 'food_brand', 'age_columns', 'weight_rows'],
+    private: ['notes'],
+    pending: []
+  },
+
+  // Decided 2026-10-09: the login details are hers alone — private tier (the
+  // encrypted vault and local backup files only, never plain cloud). The
+  // referral link/code/instructions exist to be handed out, so they're cloud.
+  accounts: {
+    rows: ALL,
+    cloud: [
+      'name', 'account_type', 'website', 'referral_link', 'referral_code', 'referral_instructions',
+      // The channel's published fee rate (Integrations plan §5, D9): a vendor's
+      // public price, not hers. Her own note on it stays private like `notes`.
+      'fee_percent', 'fee_fixed', 'fee_passed_to_buyer_default',
+      // Whether her referral link/code shows to families (Integrations plan §3):
+      // the referral fields are already cloud, made to be handed out.
+      'share_with_families',
+      // Whether it shows on her KennelPort website's Recommended products page
+      // (KennelPort plan 5.3): a display choice like the four record marks.
+      'show_on_website',
+      // Her contract forms (Integrations plan §2.1a, D15): type, her label and the
+      // form's public share link, and for a form once picked through Connect Jotform
+      // (retired, D27/D29) its form id and her field names (field_map). Nothing
+      // about anyone else.
+      'contract_forms',
+      // Whether she signs her next new Firma template (none/first/last, D32): the
+      // choice she made last, a setting, nothing about anyone.
+      'esign_signs_default',
+      // Her own payment link and payment instructions (Integrations plan §4,
+      // Level 0; D9: payment-link refs are cloud): written to be sent to buyers.
+      'payment_link', 'payment_instructions'
+    ],
+    // fee_charge_back (guide §21.2): her own choice to bill the fee back, private by
+    // rule zero (unlike the vendor's published rate above).
+    private: ['username', 'password', 'customer_id', 'notes', 'fee_note', 'fee_charge_back'],
+    pending: []
+  },
+
+  waitlist_entries: {
+    rows: ALL,
+    cloud: [
+      'kennel_id', 'contact_id', 'status', 'waitlist_program_id',
+      // "every date field" (Waitlist Spec §9) — fee_received_date is the position anchor
+      'applied_date', 'approved_date', 'declined_date', 'fee_due_date',
+      'fee_received_date', 'position_anchor_date', 'paused_until', 'removed_date',
+      'withdrawn_date', 'soon_notified_date',
+      // the same-day tie-breaker of the list order (waitlistRules), so cloud for
+      // the reason fee_received_date is: a restore must not re-order the list
+      'fee_received_at',
+      // a family page only, never on the list (Waitlist Fixes Plan E3, D7: cloud):
+      // without it a restore would put the family on the list
+      'off_list',
+      // The Payment service account the application fee was paid via (plan §4): an id.
+      'fee_paid_via_account_id',
+      'pref_sex', 'pref_breed', 'pref_purposes', 'pref_colors',
+      'listen_mode', 'listen_sire_ids', 'listen_dam_ids',
+      'removed_reason', 'placed_sale_id',
+      // The status a family left when she entered their withdrawal: drives the
+      // 7-day undo, so a restore inside the window can still undo it.
+      'withdrawn_from',
+      // When she closed an approved application for an unpaid fee, and that she
+      // marked the fee received by hand: each drives a 7-day undo, kept on restore.
+      'expired_date', 'fee_received_manual',
+      // Decided 2026-10-07 (Cloud plan §5.1, decisions 1 and 2): the readiness
+      // hold and the litters she told a family about are how the list RUNS; the
+      // question wording is her own form; and the applicant's name + email are
+      // what W2's server holds readable anyway (Waitlist Spec §8.1). Only those
+      // two keys of `application` go (see `partial`); every other answer stays private.
+      'ready_timing', 'soon_notified_litter_ids', 'application_questions', 'application',
+      // The family's status-page link token (Waitlist W2 Plan §4, decided 2026-10-08).
+      // The waitlist server already holds every token readable (it serves the page
+      // and puts the link in emails), so cloud backup tells it nothing new; private,
+      // a restore without private backup would change every family's link.
+      'status_token',
+      // 'online_form' when the application came through her online form (W2 step 4).
+      'source',
+      // Her yes to their request to list privately ("A***** K", Spec §15.3). Cloud:
+      // the public list shows it anyway, and a restore without it would put their
+      // full first name back on a public page.
+      'private_listing'
+    ],
+    partial: { application: ['name', 'email'] },
+    // pref_change_*: "private tier like application" (Waitlist Spec §15.9).
+    // The status page's requests and the family's activity and messages (W2 step
+    // 5): private like pref_change_request (W2 Plan §9). Their messages were
+    // sealed so the server can't read them, and a pause request's note may name a
+    // medical situation, like pause_reason.
+    private: [
+      'fee_amount', 'fee_payment_method', 'fee_payment_reference',
+      // Paid online (Integrations plan §4): what the family paid (the fee, plus a
+      // card fee she passes on), what the payment service kept, and a payment that
+      // came before she approved them. Money, private like fee_amount.
+      'fee_paid_amount', 'fee_processing_amount', 'fee_paid_online',
+      'fee_credit_policy', 'pause_reason', 'notes', 'pref_change_log', 'pref_change_request',
+      'pause_request', 'listen_change_request', 'messages',
+      // "Not this litter" with the family's reason (Spec §16.2): private like a pass reason.
+      'prepasses',
+      // The programs she said No to when their answers suggested one (programSuggest.js).
+      'program_suggestions_declined',
+      // "Ready now?" (Spec §16.7): their answer and a not-yet reason, private like pause_reason.
+      'ready_check',
+      // A Companion link request from their status page (Spec §8.3), with their
+      // optional note: private like pause_request.
+      'companion_request',
+      // What they'd paid on a pup they lost, kept for their next one (Spec
+      // §16.11): money, private like fee_amount.
+      'carried_payment',
+      // Credits for funds she'd already received from them outside the app, and
+      // the part of their fee a credit paid (receivedCredits.js): money, private
+      // like fee_amount.
+      'received_credits', 'fee_credit_amount',
+      // A typed invoice / receipt number and notes, kept on the entry while the family
+      // has no sale (Payment Schedule plan D14): private like a sale's.
+      'invoice_number', 'invoice_notes',
+      // Their ask, on the application, to list privately (Spec §15.3): private
+      // like pause_request. What she decided rides private_listing.
+      'private_request',
+      // Extras they asked for or to cancel on their status page (Family Requests
+      // plan §3), with their notes: private like pause_request.
+      'extra_requests',
+      // Pickup (Family Requests plan §4): their pickup requests (an address among
+      // them), where they live and how far, and her choice for them: private.
+      'pickup_requests', 'home_place', 'home_miles', 'home_measured_date', 'own_place_override',
+      // Their request to back out (Family Requests plan §7), with their reason and
+      // note: private like a pass reason.
+      'back_out_request',
+      // Duplicate applications merged into this one (applicationDuplicates.js): the
+      // deleted one's name, dates and any fee moved over as a credit. Private like
+      // the answers it came from.
+      'merged_applications'
+    ],
+    pending: []
+  },
+
+  waitlist_offers: {
+    rows: ALL,
+    cloud: [
+      'entry_id', 'litter_id', 'kennel_id', 'offered_date', 'respond_by_date',
+      'eligible_dog_ids', 'outcome', 'outcome_date', 'chosen_dog_id', 'counts_as_pass',
+      'picked_date', 'sale_id', // §9: "every field except notes"
+      'turn_id', // the turn the row belongs to (Spec §16.1): how the list ran, like outcome
+      // When she sent the family their deposit request (Integrations plan §2.6, D20):
+      // a date, like picked_date.
+      'deposit_request_sent_date',
+      // A lost pup's history (restoreAfterLostSale): when the family went back in
+      // line, the pup they'd had and when they picked / were accepted. Like
+      // chosen_dog_id, picked_date and outcome_date, which it keeps after the pick
+      // is cleared.
+      'restored_date', 'lost_dog_id', 'lost_picked_date', 'lost_accepted_date',
+      // When the family backed out of the pup this offer placed (Family Requests
+      // plan §7): a date, like outcome_date.
+      'backed_out_date'
+    ],
+    // pass_reason: the family's own reason for a pass (Spec §16.5, decided private:
+    // it can name money or health).
+    private: ['notes', 'pass_reason'],
+    pending: []
+  },
+
+  waitlist_programs: {
+    rows: ALL,
+    cloud: [
+      'kennel_id', 'name', 'applicable_on_form', 'priority', 'pause_allowed',
+      'passes_count', 'respond_days_override', 'public_description', 'public_icon'
+    ],
+    private: ['fee_override', 'notes'],
+    pending: []
+  },
+
+  // Her do-not-sell list (owner decision 2026-11-05: private). Like expenses, no row
+  // is readable by the server; live sync and the vault carry it sealed.
+  do_not_sell: {
+    rows: NONE,
+    cloud: [],
+    private: ['name', 'email', 'phone', 'reason', 'added_date', 'contact_id', 'source_entry_id'],
+    pending: []
+  }
+});
+
+export const REGISTRY_TABLES = Object.freeze(Object.keys(SYNC_REGISTRY));
+
+// --- Event details ----------------------------------------------------------
+// Derived from the vocab that already drives the event forms, so it can't
+// drift: a declared key whose field type is `textarea` (free text — treatment,
+// findings, temperament notes, notes/note) is private; every other declared
+// key is cloud; an UNDECLARED key is private. EVENT_TYPES is the complete list
+// (not edition-filtered), so a Pro-only type's keys classify the same in Lite.
+const DETAILS_CLOUD_KEYS = new Map(
+  EVENT_TYPES.map((t) => [
+    t.value,
+    new Set((t.fields || []).filter((f) => f.type !== 'textarea').map((f) => f.key))
+  ])
+);
+
+export function cloudDetailKeys(eventType) {
+  return DETAILS_CLOUD_KEYS.get(eventType) || new Set();
+}
+
+// A NEW object holding only the cloud keys of `details`, or null when the input
+// isn't a plain object.
+export function filterEventDetails(eventType, details) {
+  if (details == null || typeof details !== 'object' || Array.isArray(details)) return null;
+  const allowed = cloudDetailKeys(eventType);
+  const out = {};
+  for (const key of allowed) {
+    if (Object.prototype.hasOwnProperty.call(details, key)) out[key] = details[key];
+  }
+  return out;
+}
+
+// --- Lookups ---------------------------------------------------------------
+function entryFor(table) {
+  const entry = SYNC_REGISTRY[table];
+  if (!entry) throw new Error(`syncRegistry: no entry for table "${table}"`);
+  return entry;
+}
+
+// Every key a snapshot row of `table` may carry: implicit + cloud + derived.
+export function allowedSnapshotKeys(table) {
+  const entry = entryFor(table);
+  return new Set([...IMPLICIT_CLOUD_FIELDS, ...entry.cloud, ...(entry.derived || [])]);
+}
+
+export function isCloudField(table, field) {
+  const entry = SYNC_REGISTRY[table];
+  if (!entry) return false;
+  return IMPLICIT_CLOUD_FIELDS.includes(field) || entry.cloud.includes(field);
+}
+
+// Does the per-row rule keep this row? `ctx.keptFileIds` (a Set) is required
+// for 'referenced' tables (files).
+export function keepsRow(table, row, ctx = {}) {
+  const { rows } = entryFor(table);
+  if (rows === ALL) return true;
+  if (rows === NONE) return false;
+  if (rows === REFERENCED) return !!(ctx.keptFileIds && ctx.keptFileIds.has(row.id));
+  return !!rows(row);
+}
+
+const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
+
+// Only the allowed keys of an object, as a NEW object; null when not an object.
+function pickKeys(value, keys) {
+  if (!isPlainObject(value)) return null;
+  const out = {};
+  for (const k of keys) if (Object.prototype.hasOwnProperty.call(value, k)) out[k] = value[k];
+  return out;
+}
+
+// The cloud keys allowed inside a nested object field, or null when the field
+// isn't nested-filtered. events.details is derived from vocab per event type.
+function nestedCloudKeys(table, field, row) {
+  const entry = entryFor(table);
+  if (entry.partial && entry.partial[field]) return new Set(entry.partial[field]);
+  if (table === 'events' && field === 'details') return cloudDetailKeys(row.event_type);
+  return null;
+}
+
+// A NEW object built by name from the table's implicit + cloud fields. Keys the
+// source row doesn't have are omitted (not written as undefined). `filtered`
+// fields pass through their filter, and `partial` fields keep only their listed
+// keys. Derived keys are NOT added here — the snapshot builder adds them
+// (files' sha256).
+export function projectRow(table, row) {
+  const entry = entryFor(table);
+  const out = {};
+  for (const field of [...IMPLICIT_CLOUD_FIELDS, ...entry.cloud]) {
+    if (!Object.prototype.hasOwnProperty.call(row, field)) continue;
+    const filter = entry.filtered && entry.filtered[field];
+    const partial = entry.partial && entry.partial[field];
+    out[field] = filter ? filter(row[field], row) : partial ? pickKeys(row[field], partial) : row[field];
+  }
+  return out;
+}
+
+// Apply the row rules + projection to a whole `{ table: rows[] }` collection
+// map (the exportAll shape). Tables without a registry entry are dropped —
+// silence is the safe default. Documents are decided before files, because a
+// file goes only if a kept document references it.
+export function filterCollectionsForCloud(collections) {
+  const out = {};
+  const keptDocs = (collections.documents || []).filter((r) => keepsRow('documents', r));
+  const keptFileIds = new Set(keptDocs.map((d) => d.file_id).filter(Boolean));
+  for (const table of REGISTRY_TABLES) {
+    const rows = collections[table];
+    if (!Array.isArray(rows)) continue;
+    out[table] = rows
+      .filter((r) => keepsRow(table, r, { keptFileIds }))
+      .map((r) => projectRow(table, r));
+  }
+  return out;
+}
+
+// --- The positive check before upload (plan §4.1 step 5) ------------------
+export class CloudKeyError extends Error {
+  constructor(table, key, rowId) {
+    super(`Cloud snapshot refused: "${table}" row ${rowId ?? '?'} carries unexpected key "${key}".`);
+    this.name = 'CloudKeyError';
+    this.table = table;
+    this.key = key;
+    this.rowId = rowId;
+  }
+}
+
+// Throws CloudKeyError on the first key a snapshot row may not carry, including
+// inside a nested-filtered object (events.details, waitlist_entries.application).
+// An unknown table throws too.
+export function assertCloudRow(table, row) {
+  if (!SYNC_REGISTRY[table]) throw new CloudKeyError(table, '(table)', row && row.id);
+  const allowed = allowedSnapshotKeys(table);
+  for (const key of Object.keys(row)) {
+    if (!allowed.has(key)) throw new CloudKeyError(table, key, row.id);
+    const nested = nestedCloudKeys(table, key, row);
+    if (!nested || row[key] == null) continue;
+    if (!isPlainObject(row[key])) throw new CloudKeyError(table, key, row.id);
+    for (const k of Object.keys(row[key])) {
+      if (!nested.has(k)) throw new CloudKeyError(table, `${key}.${k}`, row.id);
+    }
+  }
+}
+
+export function assertCloudCollections(collections) {
+  for (const [table, rows] of Object.entries(collections)) {
+    for (const row of rows) assertCloudRow(table, row);
+  }
+}
+
+// --- Restore: overlaying a snapshot row onto a local one (plan §4.3) -------
+// The 'cloud-merge' restore mode. Returns a NEW row: the local row with every
+// implicit + cloud field taken from `snapRow`, and every other (private) field
+// left exactly as it is locally. A cloud field the snapshot row doesn't carry
+// is REMOVED from the result, since the snapshot says it was absent at the
+// source. Nested-filtered objects (events.details, waitlist_entries.
+// application) merge by key: the snapshot's cloud keys, plus the local row's
+// private keys, so a restore never blanks a treatment note or an applicant's
+// answers that only this device has. Derived keys (files' sha256) are never
+// written to a local row.
+export function overlayCloudFields(table, localRow, snapRow) {
+  const entry = entryFor(table);
+  const out = { ...localRow };
+  for (const field of [...IMPLICIT_CLOUD_FIELDS, ...entry.cloud]) {
+    if (Object.prototype.hasOwnProperty.call(snapRow, field)) out[field] = snapRow[field];
+    else delete out[field];
+  }
+  for (const field of entry.cloud) {
+    const cloudKeys = nestedCloudKeys(table, field, out);
+    if (!cloudKeys) continue;
+    const localObj = isPlainObject(localRow[field]) ? localRow[field] : null;
+    const snapObj = isPlainObject(snapRow[field]) ? snapRow[field] : null;
+    if (!localObj && !snapObj) continue;
+    const merged = {};
+    if (localObj) for (const [k, v] of Object.entries(localObj)) if (!cloudKeys.has(k)) merged[k] = v;
+    if (snapObj) for (const [k, v] of Object.entries(snapObj)) if (cloudKeys.has(k)) merged[k] = v;
+    out[field] = merged;
+  }
+  return out;
+}
+
+// A snapshot row as a NEW local row (the "missing local row" case): the
+// snapshot's own fields, minus any derived key. Private fields are simply absent.
+export function snapshotRowToLocal(table, snapRow) {
+  const entry = entryFor(table);
+  const out = { ...snapRow };
+  for (const key of entry.derived || []) delete out[key];
+  return out;
+}
+
+// --- The server's copy (Cloud Phase 2 plan §6.1) ------------------------------
+// Every key a record's cloud part may carry, as plain sorted data:
+// { tables: { [table]: { keys: [...], nested: { [field]: [...] } } },
+//   eventDetails: { [eventType]: [...] } }. The cloud Worker keeps a generated
+// copy (cloud/src/lib/cloudFields.js, from cloud/scripts/cloud-fields.mjs) and
+// drops a record carrying anything else; cloud/tests/cloudFields.test.js fails
+// when the two differ.
+export function cloudFieldManifest() {
+  const tables = {};
+  for (const table of REGISTRY_TABLES) {
+    const entry = SYNC_REGISTRY[table];
+    const nested = {};
+    for (const [field, keys] of Object.entries(entry.partial || {})) nested[field] = [...keys].sort();
+    tables[table] = { keys: [...allowedSnapshotKeys(table)].sort(), nested };
+  }
+  const eventDetails = {};
+  for (const t of EVENT_TYPES) eventDetails[t.value] = [...cloudDetailKeys(t.value)].sort();
+  return { tables, eventDetails };
+}

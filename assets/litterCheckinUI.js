@@ -1,0 +1,732 @@
+// litterCheckinUI.js — Kels's "Check in on a litter" task: the weekly visit with
+// one litter, as a chat on pages/kels.html (assets/kelsChat.js draws it).
+//
+// Kels asks which litter (every one that isn't closed), says where it stands
+// (age, status, each pup's plan), then brings up what's waiting on a decision,
+// one at a time: open picks when the accept-deposits date has come (Pro, with
+// families on the waitlist) or move that date; Weaning from 4 weeks; Ready from
+// the estimated ready date; and Today's litter rules (mark sold, reopen, close).
+// Then "What are we doing first?": weights, health care (the care step,
+// assets/careVisitUI.js: a vet visit, shots, screening tests, deworming,
+// medication, ticked once), or something else (puppy plans, microchips, the
+// dates, the status). Each thing is saved as soon as she approves it, through the repos, so
+// there's no draft to keep; she can stop at any point.
+//
+// The rules and wording helpers are in data/litterCheckin.js. Open picks uses
+// the Litter page's waitlist panel (assets/waitlistPicksPanel.js, Pro-only),
+// imported only when the edition has the waitlist.
+import { KELS_AS_YOU_GO_INTRO } from './kelsChat.js';
+import { dogRepo } from '../data/dogRepo.js';
+import { litterRepo } from '../data/litterRepo.js';
+import { pairingRepo } from '../data/pairingRepo.js';
+import { saleRepo } from '../data/saleRepo.js';
+import { eventRepo } from '../data/eventRepo.js';
+import { waitlistEntryRepo } from '../data/waitlistEntryRepo.js';
+import { inScopeOnly } from '../data/kennelScope.js';
+import { editionFlags } from '../data/editionConfig.js';
+import { DISPOSITION, EVENT_TYPES, PLACEMENT_METHODS, RELATED_CONTACT_ROLE, CONTACT_TYPE, descriptor } from '../data/vocab.js';
+import * as C from '../data/litterCheckin.js';
+import * as H from '../data/goHome.js';
+import { contactRepo } from '../data/contactRepo.js';
+import { addDaysToYMD } from '../data/dateUtils.js';
+import { esc, fmtDate, fmtMoney, todayYMD } from './ui.js';
+import { askKeeperTests } from './keeperTests.js';
+import { careVisit } from './careVisitUI.js';
+
+const pagesPrefix = () => (location.pathname.includes('/pages/') ? '' : 'pages/');
+const litterHref = (l) => `${pagesPrefix()}litter.html?id=${encodeURIComponent(l.id)}`;
+const sexWord = (p) => (p.sex === 'male' ? 'boy' : p.sex === 'female' ? 'girl' : '');
+export const pupName = (p) => p.call_name || p.registered_name || 'Puppy';
+export const pupLine = (p) => `<strong>${esc(pupName(p))}</strong>${sexWord(p) ? ` <span class="faint">${esc(sexWord(p))}</span>` : ''}`;
+// How the care forms (assets/careVisitUI.js) list a litter's pups.
+export const PUP_WHO = Object.freeze({ line: pupLine, one: 'puppy', many: 'puppies' });
+// A message from the waitlist ("\n\n" between paragraphs) as Kels's markup.
+const paragraphs = (text) => String(text || '').split(/\n{2,}/).map((t) => esc(t)).join('<br><br>');
+
+// For Kels's menu: is there a litter to check on, and does one have pups at home?
+export async function checkinState() {
+  const litters = C.checkinLitters(inScopeOnly(await litterRepo.getAll({ includeArchived: false })));
+  return { open: litters.length, withPups: litters.filter((l) => ['whelped', 'weaning', 'ready'].includes(l.status)).length };
+}
+
+// Run the check-in. `litterId` skips "which litter?" (from a litter's page).
+// `handoff(taskId, opts)` starts another of Kels's tasks (an Expected litter's
+// birth); `onExit(reason)` hands the chat back to her menu.
+export async function runCheckinTask(chat, { litterId = null, onExit = () => {}, handoff = null } = {}) {
+  if (!(await chat.intro('Of course, let\'s check in on your litter!', KELS_AS_YOU_GO_INTRO))) return onExit('nevermind');
+  return new Checkin(chat, onExit, handoff).start(litterId);
+}
+
+class Checkin {
+  constructor(chat, onExit, handoff) {
+    Object.assign(this, { chat, onExit, handoff, today: todayYMD(), asked: new Set(), didSomething: false });
+  }
+
+  // --- Records ------------------------------------------------------------------
+
+  async load(litterId) {
+    const [litter, dogs, sales] = await Promise.all([
+      litterRepo.getById(litterId),
+      dogRepo.getAll({ includeArchived: false }),
+      saleRepo.getAll({ includeArchived: false })
+    ]);
+    this.litter = litter;
+    this.dogsById = new Map(dogs.map((d) => [d.id, d]));
+    this.label = C.litterLabel(litter, this.dogsById);
+    this.roster = C.rosterOf(litter.id, dogs);
+    // Every pup's sales, departed (archived) pups included: the close rule counts them.
+    this.sales = C.litterSalesOf(litter.id, await dogRepo.getByLitter(litter.id), sales);
+    this.home = C.homePups(this.roster, this.sales);
+    const perPup = await Promise.all(this.home.map((p) => eventRepo.getForSubject('dog', p.id)));
+    this.eventsByPup = new Map(this.home.map((p, i) => [p.id, perPup[i]]));
+    this.weights = C.lastWeights(perPup.flat());
+    this.waitlistOn = false;
+    if (editionFlags.waitlist) {
+      const entries = await waitlistEntryRepo.getByKennel(litter.kennel_id);
+      this.waitlistOn = entries.some((e) => e.status === 'active');
+    }
+  }
+
+  // --- The visit ----------------------------------------------------------------
+
+  async start(litterId) {
+    const all = C.checkinLitters(inScopeOnly(await litterRepo.getAll({ includeArchived: false })));
+    let litter = litterId ? all.find((l) => l.id === litterId) : null;
+    if (!litter) {
+      if (!all.length) {
+        await this.chat.say('You don\'t have any open litters right now. When one is born, I can help you record it.');
+        return this.onExit('done');
+      }
+      litter = await this.pickLitter(all);
+      if (!litter) return this.onExit('nevermind');
+    } else {
+      await this.chat.say('Let\'s check on this litter.', { typing: 500 });
+    }
+    await this.load(litter.id);
+    if (this.litter.status === 'expected') return this.expected(all);
+    await this.summary();
+    await this.raiseSuggestions();
+    return this.loop();
+  }
+
+  async pickLitter(all) {
+    const dogsById = new Map((await dogRepo.getAll({ includeArchived: false })).map((d) => [d.id, d]));
+    // An Expected litter is due on its breeding's due date; its own whelp date is
+    // a placeholder until the birth (K9-3), shown only when it's still ahead.
+    const pairingsById = new Map((await pairingRepo.getAll({ includeArchived: true })).map((p) => [p.id, p]));
+    const dueOf = (l) => pairingsById.get(l.pairing_id)?.expected_due_date || (l.whelp_date && l.whelp_date >= this.today ? l.whelp_date : null);
+    const counts = new Map();
+    for (const d of dogsById.values()) if (d.litter_id && d.status !== 'deceased') counts.set(d.litter_id, (counts.get(d.litter_id) || 0) + 1);
+    await this.chat.say('<strong>Which litter are we checking on?</strong>', { typing: 700 });
+    const id = await this.chat.choose([
+      ...all.map((l) => {
+        const age = C.ageText(C.ageDays(l, this.today));
+        const bits = [C.statusLabel(l.status)];
+        if (l.status === 'expected') { if (dueOf(l)) bits.push(`due ${fmtDate(dueOf(l))}`); }
+        else if (age) bits.push(age);
+        if (counts.get(l.id)) bits.push(C.plural(counts.get(l.id), 'puppy', 'puppies'));
+        return { label: C.litterLabel(l, dogsById), sub: bits.join(' · '), value: l.id };
+      }),
+      { label: 'Never mind', value: '' }
+    ], { stagger: 200 });
+    return id ? all.find((l) => l.id === id) : null;
+  }
+
+  async expected(all) {
+    await this.chat.say(`<strong>${esc(this.label)}</strong> hasn't been born yet. Did the puppies arrive?`);
+    const pick = await this.chat.choose([
+      ...(this.handoff ? [{ label: 'Yes, record the birth', value: 'birth', primary: true }] : []),
+      ...(all.length > 1 ? [{ label: 'Check on a different litter', value: 'other' }] : []),
+      { label: 'Never mind', value: 'nevermind' }
+    ]);
+    if (pick === 'birth') return this.handoff('record-litter', { litterId: this.litter.id });
+    if (pick === 'other') { this.asked.clear(); return this.start(null); }
+    return this.onExit('nevermind');
+  }
+
+  async summary() {
+    const l = this.litter;
+    const age = C.ageText(C.ageDays(l, this.today));
+    const gone = this.roster.filter((p) => p.status === 'puppy').length - this.home.length;
+    const lines = [`<strong>${esc(this.label)}</strong> is ${age ? esc(age) : 'born'} and marked ${esc(C.statusLabel(l.status))}.`,
+      esc(C.dispositionSummary(this.roster))];
+    if (gone > 0) lines.push(`${C.plural(gone, 'puppy has', 'puppies have')} gone home.`);
+    await this.chat.say(lines.join(' '), { typing: 900 });
+  }
+
+  // Each decision waiting on the litter, once per visit.
+  // Each decision waiting on the litter, then on each puppy's way home
+  // (data/goHome.js), once per visit.
+  async raiseSuggestions() {
+    for (;;) {
+      const next = C.checkinSuggestions({ litter: this.litter, roster: this.roster, sales: this.sales, today: this.today, waitlistOn: this.waitlistOn })
+        .find((s) => !this.asked.has(`${s.id}:${s.status || ''}`));
+      const home = next ? null : this.goHomeIssues().find((x) => !this.asked.has(`gohome:${x.pup.id}:${x.kind}`));
+      if (!next && !home) return;
+      if (next) {
+        this.asked.add(`${next.id}:${next.status || ''}`);
+        await this.safely(() => (next.id === 'open-picks' ? this.offerPicks() : this.offerStatus(next)));
+      } else {
+        this.asked.add(`gohome:${home.pup.id}:${home.kind}`);
+        if (await this.safely(() => this.offerGoHome(home)) === 'left') return;
+      }
+      await this.load(this.litter.id);
+    }
+  }
+
+  goHomeIssues() {
+    return this.home.map((pup) => {
+      const issue = H.goHomeIssue({
+        pup, litter: this.litter, today: this.today,
+        sales: this.sales.filter((x) => x.dog_id === pup.id), events: this.eventsByPup.get(pup.id) || []
+      });
+      return issue ? { ...issue, pup } : null;
+    }).filter(Boolean);
+  }
+
+  // --- A puppy's way home --------------------------------------------------------
+
+  async offerGoHome(x) {
+    const name = esc(pupName(x.pup));
+    const family = esc((x.sale.buyer_contact_id && (await contactRepo.getById(x.sale.buyer_contact_id))?.name) || 'their family');
+    const start = H.defaultStart(x.readyDate, this.today);
+    if (x.kind === 'boarding') {
+      await this.chat.say(`${name}'s sale includes boarding (${esc(H.boardingChargeText(x.sale, fmtMoney))}): ${family} is paying for ${name} to stay after the ready date. Want me to log the boarding?`);
+      return this.logBoarding(x, start);
+    }
+    if (x.kind === 'schedule') {
+      await this.chat.say(`${name} is going home to ${family}, and the litter is ready ${esc(fmtDate(x.readyDate))}. There's no pickup on the calendar yet.`);
+      return this.logPickup(x, start, '<strong>When is the pickup?</strong>');
+    }
+    await this.chat.say(`${name}'s pickup was ${esc(fmtDate(x.pickupDate))}, but the sale to ${family} isn't marked Delivered. Did ${name} go home?`);
+    const pick = await this.chat.choose([
+      { label: 'Yes, mark the sale delivered', value: 'yes', primary: true },
+      { label: 'No, the pickup moved', value: 'moved' },
+      { label: 'Not now', value: 'later' }
+    ]);
+    if (pick === 'moved') return this.logPickup(x, this.today, '<strong>When is the new pickup?</strong>');
+    if (pick === 'yes') return this.deliver(x);
+  }
+
+  // Marks the sale Delivered in the chat, then asks what the Sale page's Delivered
+  // save asks: Pro, how the pup now shows on her roster (goHome.
+  // deliveredOwnershipChanges, the Sale page's rule too); Lite, whether it leaves
+  // the program (archived, permanent). Closing the litter, when that's due, comes
+  // up next with the check-in's other litter questions.
+  async deliver(x) {
+    const name = esc(pupName(x.pup));
+    // Plain text for the choice labels (they're escaped there), escaped for her lines.
+    const familyText = (x.sale.buyer_contact_id && (await contactRepo.getById(x.sale.buyer_contact_id))?.name) || 'Their family';
+    const family = esc(familyText);
+    await saleRepo.update(x.sale.id, { status: 'delivered' });
+    this.didSomething = true;
+    await this.chat.say(`Done, the sale is marked Delivered. Congratulations on ${name}'s new home!`);
+    const pup = await dogRepo.getById(x.pup.id);
+    if (!pup || pup.is_archived) return;
+    if (editionFlags.externalOwnership) {
+      const coOwn = x.sale.registration_type === 'co_own';
+      await this.chat.say(`How should ${name} show on your roster now?`);
+      const choice = await this.chat.choose([
+        { label: `${familyText} owns ${pupName(x.pup)} now`, sub: 'External: kept for pedigrees and history, off your own dogs', value: 'external', primary: !coOwn },
+        { label: 'We co-own', sub: `${familyText} added as a co-owner`, value: 'co_owned', primary: coOwn },
+        { label: 'Leave it as it is', value: '' }
+      ]);
+      const changes = H.deliveredOwnershipChanges(pup, choice, { ownerId: x.sale.buyer_contact_id, buyerId: x.sale.buyer_contact_id, today: this.today });
+      if (!changes) return;
+      await dogRepo.update(pup.id, changes);
+      await this.chat.say(choice === 'external' ? `Updated. ${name} is External now, owned by ${family}.` : `Updated. You and ${family} co-own ${name}.`);
+      return;
+    }
+    await this.chat.say(`Want to take ${name} off your roster? This can't be undone: ${name} leaves your dogs and can't be edited or brought back, but stays in your pedigrees and on this sale for history.`);
+    const pickLite = await this.chat.choose([
+      { label: 'Remove permanently', value: 'archive' },
+      { label: 'Keep on my roster', value: '', primary: true }
+    ]);
+    if (pickLite !== 'archive') return;
+    await dogRepo.archive(pup.id);
+    await this.chat.say(`Done. ${name} is off your roster.`);
+  }
+
+  async logPickup(x, date, title) {
+    const res = await pickupsForm(this.chat, [{ pup: x.pup, sale: x.sale, date }], { title, cancelLabel: 'Not sure yet' });
+    if (!res.done) return;
+    this.didSomething = true;
+    await this.chat.say(`Saved. It's on ${esc(pupName(x.pup))}'s history and your calendar. After that day, I'll ask whether ${esc(pupName(x.pup))} went home.`);
+  }
+
+  async logBoarding(x, start) {
+    const res = await this.chat.form({
+      title: '',
+      html: `<div class="ck-inline">
+          ${field('Boarding starts', `<input id="ck-bstart" type="date" value="${esc(start)}">`)}
+          ${field('Ends (optional)', `<input id="ck-bend" type="date" value="${esc(H.boardingEnd(x.sale, start))}">`)}
+        </div>`,
+      wire: (root) => {
+        const st = root.querySelector('#ck-bstart');
+        const en = root.querySelector('#ck-bend');
+        st.addEventListener('change', () => { en.value = H.boardingEnd(x.sale, st.value) || en.value; });
+      },
+      submitLabel: 'Log boarding',
+      cancelLabel: 'Not now',
+      submit: async (root) => {
+        const a = root.querySelector('#ck-bstart').value;
+        const b = root.querySelector('#ck-bend').value;
+        if (!a) return 'When does the boarding start?';
+        if (b && b < a) return 'The end is before the start.';
+        await eventRepo.create(H.boardingEvent(x.pup, a, b));
+        return { a, b };
+      },
+      reply: (r) => `Boarding from ${fmtDate(r.a)}${r.b ? ` to ${fmtDate(r.b)}` : ''}`
+    });
+    if (!res.done) return;
+    this.didSomething = true;
+    await this.chat.say('Logged. Once it\'s over, I\'ll ask about the pickup.');
+  }
+
+  async offerPicks() {
+    const l = this.litter;
+    const when = l.accept_deposits_date === this.today ? 'today' : `on ${fmtDate(l.accept_deposits_date)}`;
+    await this.chat.say(`You planned to start taking deposits ${esc(when)}, and picks aren't open yet. Want me to open picks for your waitlist?`);
+    const pick = await this.chat.choose([
+      { label: 'Yes, open picks', value: 'open', primary: true },
+      { label: 'Not yet, move the deposit date', value: 'move' },
+      { label: 'Not now', value: 'later' }
+    ]);
+    if (pick === 'open') {
+      const { openPicksFromCheckin } = await import('./waitlistPicksPanel.js');
+      const said = await openPicksFromCheckin(l);
+      if (!said) {
+        await this.chat.say('Okay, picks aren\'t open. You can open them from the Litter page whenever you\'re ready.');
+      } else {
+        this.didSomething = true;
+        await this.chat.say(`<strong>${esc(said.title)}</strong><br>${paragraphs(said.message)}`);
+      }
+    } else if (pick === 'move') {
+      await this.moveDepositDate();
+    }
+  }
+
+  async moveDepositDate() {
+    const res = await this.chat.form({
+      title: '<strong>When do you want to start taking deposits?</strong>',
+      html: field('New date', `<input id="ck-deposit" type="date" min="${esc(addDaysToYMD(this.today, 1))}" value="${esc(C.rescheduleDefault(this.today))}">`),
+      submitLabel: 'Move it',
+      cancelLabel: 'Leave it',
+      submit: async (root) => {
+        const date = root.querySelector('#ck-deposit').value;
+        if (!date) return 'Pick a date.';
+        if (date <= this.today) return 'Pick a day after today, or open picks now.';
+        await litterRepo.update(this.litter.id, { accept_deposits_date: date });
+        return { date };
+      },
+      reply: (r) => `Move it to ${fmtDate(r.date)}`
+    });
+    if (res.done) {
+      this.didSomething = true;
+      await this.chat.say(`Done. I'll ask again on ${esc(fmtDate(res.result.date))}.`);
+    }
+  }
+
+  async offerStatus(s) {
+    const age = C.ageText(C.ageDays(this.litter, this.today));
+    const ask = {
+      weaning: `They're ${esc(age)} and still marked Whelped. Move the litter to Weaning?`,
+      ready: s.reopen
+        ? `A puppy is available again, but the litter is marked ${esc(C.statusLabel(this.litter.status))}. Reopen it to Ready?`
+        : `${this.litter.estimated_ready_date ? `Their estimated ready date was ${esc(fmtDate(this.litter.estimated_ready_date))}` : `They're ${esc(age)}`}. Move the litter to Ready?`,
+      sold: 'Every puppy is placed or being kept. Mark the litter Sold?',
+      closed: 'Every puppy has gone home or is staying with you, and every sale is finished. Close the litter?'
+    }[s.status];
+    await this.chat.say(ask);
+    const verb = s.reopen ? 'Reopen it' : s.status === 'closed' ? 'Close it' : `Move to ${C.statusLabel(s.status)}`;
+    const pick = await this.chat.choose([
+      { label: verb, value: 'yes', primary: true },
+      { label: 'Not yet', value: 'no' }
+    ]);
+    if (pick !== 'yes') return;
+    await this.setStatus(s.status);
+  }
+
+  async setStatus(status) {
+    try {
+      await litterRepo.update(this.litter.id, { status });
+      this.didSomething = true;
+      await this.chat.say(status === 'closed'
+        ? `Closed. That's ${esc(this.label)} all wrapped up. Congratulations!`
+        : `Done. ${esc(this.label)} is now ${esc(C.statusLabel(status))}.`);
+    } catch (e) {
+      await this.chat.say(`Hmm, that didn't save: ${esc(e.message || String(e))}`);
+    }
+  }
+
+  // Every write the visit makes, said and carried on from when it's refused (K11-6):
+  // a refusal (the Demo, a repo's check) ends that one thing, never the visit.
+  async safely(fn) {
+    try {
+      return await fn();
+    } catch (e) {
+      await this.chat.say(`Hmm, that didn't save: ${esc(e.message || String(e))}`);
+      return null;
+    }
+  }
+
+  // --- "What are we doing?" -----------------------------------------------------
+
+  async loop() {
+    let first = true;
+    for (;;) {
+      const hasPups = this.home.length > 0;
+      const last = C.lastWeighedDate(this.weights, this.home);
+      const weighedSub = last ? `Last weighed ${fmtDate(last)} (${C.plural(C.daysBetween(last, this.today), 'day')} ago)` : 'No weights on file yet';
+      await this.chat.say(first ? '<strong>What are we doing first?</strong>' : `<strong>What's next for ${esc(this.label)}?</strong>`, { typing: first ? 700 : 500 });
+      first = false;
+      const pick = await this.chat.choose([
+        ...(hasPups ? [
+          { label: 'Record weights', sub: weighedSub, value: 'weights' },
+          { label: 'Health care', sub: 'A vet visit, shots, tests, deworming, medication', value: 'care' }
+        ] : []),
+        { label: 'Something else', sub: hasPups ? 'Plans, microchips, dates, the litter\'s status' : 'Plans, dates, the litter\'s status', value: 'more' },
+        this.didSomething ? { label: 'That\'s all for now', value: 'done' } : { label: 'Never mind', value: 'nevermind' }
+      ], { stagger: 150 });
+      const what = pick === 'more' ? await this.moreMenu() : pick;
+      if (what === 'done' || what === 'nevermind') return this.finish(what);
+      if (what === 'page') { location.href = litterHref(this.litter); return; }
+      if (what) await this.safely(() => this.run(what));
+      await this.load(this.litter.id);
+      await this.raiseSuggestions();
+    }
+  }
+
+  async moreMenu() {
+    const hasPups = this.home.length > 0;
+    const undecided = this.roster.filter((p) => p.status === 'puppy' && (p.disposition || 'undecided') === 'undecided').length;
+    const unchipped = this.home.filter((p) => !p.microchip_id).length;
+    const l = this.litter;
+    await this.chat.say('Sure. What do you need?', { typing: 400 });
+    const pick = await this.chat.choose([
+      ...(this.roster.some((p) => p.status === 'puppy' && p.disposition !== 'placed')
+        ? [{ label: 'Update puppy plans', sub: undecided ? `${undecided} undecided` : 'Keeping, available, health hold', value: 'plans' }] : []),
+      ...(hasPups ? [{ label: 'Record microchips', sub: unchipped ? `${unchipped} without one` : 'Every puppy has one', value: 'chips' }] : []),
+      { label: 'Change the deposit or ready date', sub: [l.accept_deposits_date ? `Deposits ${fmtDate(l.accept_deposits_date)}` : 'No deposit date', l.estimated_ready_date ? `ready ${fmtDate(l.estimated_ready_date)}` : 'no ready date'].join(' · '), value: 'dates' },
+      { label: 'Change the litter\'s status', sub: `Now ${C.statusLabel(l.status)}`, value: 'status' },
+      { label: 'Open the litter\'s page', value: 'page' },
+      { label: 'Go back', value: '' }
+    ], { stagger: 120 });
+    return pick;
+  }
+
+  async run(what) {
+    if (what === 'weights') return this.weigh();
+    if (what === 'care') return this.care();
+    if (what === 'plans') return this.plans();
+    if (what === 'chips') return this.chips();
+    if (what === 'dates') return this.dates();
+    if (what === 'status') return this.pickStatus();
+  }
+
+  async finish(how) {
+    if (how === 'done') await this.chat.say(`Great work! ${esc(this.label)} is all caught up.`);
+    this.onExit(how === 'done' ? 'done' : 'nevermind');
+  }
+
+  // --- Weights -----------------------------------------------------------------
+
+  async weigh() {
+    const rows = this.home.map((p, i) => {
+      const prev = this.weights.get(p.id);
+      return `<div class="ck-row">
+        <div class="ck-row-name">${pupLine(p)}${prev ? `<span class="field-hint">Last: ${esc(C.fmtOz(prev.oz))} on ${esc(fmtDate(prev.date))}</span>` : '<span class="field-hint">No weight yet</span>'}</div>
+        <label class="ck-unit"><input id="ck-lb-${i}" type="number" min="0" step="1" inputmode="numeric" aria-label="${esc(pupName(p))}: pounds"> lb</label>
+        <label class="ck-unit"><input id="ck-oz-${i}" type="number" min="0" step="0.1" inputmode="decimal" aria-label="${esc(pupName(p))}: ounces"> oz</label>
+      </div>`;
+    }).join('');
+    const res = await this.chat.form({
+      title: '<strong>Let\'s weigh them.</strong><span class="kels-lead">Type each puppy\'s weight in pounds and ounces (either one is fine). Leave a puppy blank to skip them.</span>',
+      html: `<div class="ck-inline">
+          ${field('Date', `<input id="ck-date" type="date" value="${esc(this.today)}" max="${esc(this.today)}">`)}
+          ${field('Time of day', `<select id="ck-time"><option value="">—</option><option>AM</option><option>PM</option></select>`)}
+        </div>${rows}`,
+      submitLabel: 'Save weights',
+      cancelLabel: 'Never mind',
+      submit: async (root) => {
+        const date = root.querySelector('#ck-date').value;
+        if (!date) return 'When did you weigh them? Pick a date.';
+        const time = root.querySelector('#ck-time').value;
+        const entered = [];
+        for (const [i, p] of this.home.entries()) {
+          const oz = C.parseWeight(root.querySelector(`#ck-lb-${i}`).value, root.querySelector(`#ck-oz-${i}`).value);
+          if (oz && oz.error) return `${pupName(p)}: ${oz.error}`;
+          if (oz != null) entered.push({ pup: p, oz, prev: this.weights.get(p.id) || null });
+        }
+        if (!entered.length) return 'Type at least one weight, or tap Never mind.';
+        for (const r of entered) {
+          await eventRepo.create({
+            subject_type: 'dog', subject_id: r.pup.id, event_type: 'weight_check',
+            event_date: date, title: 'Weight check', details: C.weightDetails(r.oz, time)
+          });
+        }
+        return { entered, date };
+      },
+      reply: (r) => `Here are ${C.plural(r.entered.length, 'weight')} for ${fmtDate(r.date)}`
+    });
+    if (!res.done) return;
+    this.didSomething = true;
+    await this.chat.say(this.weightComment(res.result));
+  }
+
+  weightComment({ entered, date }) {
+    const rep = C.weightReport(entered);
+    const since = (r) => (r.prev.date === date ? 'since earlier that day' : `since ${esc(fmtDate(r.prev.date))}`);
+    const parts = [`Saved ${C.plural(entered.length, 'weight')}.`];
+    if (!rep.lost.length && !rep.same.length && rep.gained.length) {
+      parts.push(rep.gained.length === entered.length ? 'Everyone is gaining.' : 'Everyone I could compare is gaining.');
+      if (rep.top) parts.push(`${esc(pupName(rep.top.pup))} gained the most: +${esc(C.fmtOz(rep.top.diff))} ${since(rep.top)}.`);
+    }
+    if (rep.lost.length || rep.same.length) {
+      const watch = [
+        ...rep.lost.map((r) => `${esc(pupName(r.pup))} is down ${esc(C.fmtOz(-r.diff))} ${since(r)}`),
+        ...rep.same.map((r) => `${esc(pupName(r.pup))} hasn't gained ${since(r)}`)
+      ];
+      parts.push(`Heads up: ${watch.join(', and ')}. Worth keeping an eye on.`);
+    }
+    if (rep.first.length && rep.first.length < entered.length) parts.push(`It's the first weight on file for ${esc(rep.first.map((r) => pupName(r.pup)).join(', '))}.`);
+    const skipped = this.home.filter((p) => !entered.some((r) => r.pup.id === p.id));
+    if (skipped.length) parts.push(`No weight for ${esc(skipped.map(pupName).join(', '))} this time.`);
+    return parts.join(' ');
+  }
+
+  // --- Health care: a vet visit, shots, tests, deworming, medication ------------
+  // The care step (assets/careVisitUI.js), every home pup ticked to start.
+
+  async care() {
+    const res = await careVisit(this.chat, {
+      dogs: this.home, ticked: new Set(this.home.map((p) => p.id)), today: this.today, who: PUP_WHO, pups: true,
+      docType: editionFlags.documents ? 'vet_summary' : null
+    });
+    if (!res.kinds.length) return;
+    this.didSomething = true;
+    await this.chat.say('All on each puppy\'s history.');
+  }
+
+  // --- Puppy plans --------------------------------------------------------------
+
+  async plans() {
+    const pups = this.roster.filter((p) => p.status === 'puppy');
+    const choices = DISPOSITION.filter((d) => d.value !== 'placed');
+    const rows = pups.map((p, i) => (p.disposition === 'placed'
+      ? `<div class="gl-plan-row"><span>${pupLine(p)}</span><span class="faint">Placed (from the sale)</span></div>`
+      : `<div class="gl-plan-row"><span>${pupLine(p)}</span>
+          <select id="ck-plan-${i}" aria-label="${esc(pupName(p))}: plan">${choices.map((d) => `<option value="${esc(d.value)}"${d.value === (p.disposition || 'undecided') ? ' selected' : ''}>${esc(d.label)}</option>`).join('')}</select></div>`)).join('');
+    const res = await this.chat.form({
+      title: '<strong>What are your plans for each puppy?</strong><span class="kels-lead">Available puppies can be offered to families. A placed puppy changes on its sale.</span>',
+      html: rows,
+      submitLabel: 'Save plans',
+      submit: async (root) => {
+        const kept = [];
+        let changed = 0;
+        for (const [i, p] of pups.entries()) {
+          const v = root.querySelector(`#ck-plan-${i}`)?.value;
+          if (!v || v === (p.disposition || 'undecided')) continue;
+          const saved = await dogRepo.update(p.id, { disposition: v });
+          if (v === 'keeping') kept.push(saved);
+          changed++;
+        }
+        return { changed, kept };
+      },
+      reply: ({ changed }) => (changed ? `Update ${C.plural(changed, 'puppy', 'puppies')}` : 'Keep them as they are')
+    });
+    if (!res.done) return;
+    if (res.result.changed) this.didSomething = true;
+    await this.chat.say(res.result.changed ? 'Done. Their plans are updated.' : 'Okay, nothing changed.');
+    await askKeeperTests(this.chat, res.result.kept);
+  }
+
+  // --- Microchips ---------------------------------------------------------------
+
+  async chips() {
+    const res = await chipsForm(this.chat, this.home);
+    if (!res.done) return;
+    if (res.result) this.didSomething = true;
+    await this.chat.say(res.result ? 'Saved.' : 'Okay, nothing changed.');
+  }
+
+  // --- Dates and status ------------------------------------------------------------
+
+  async dates() {
+    const l = this.litter;
+    const res = await this.chat.form({
+      title: '<strong>The litter\'s dates</strong>',
+      html: field('Start taking deposits', `<input id="ck-deposits" type="date" value="${esc(l.accept_deposits_date || '')}">`, 'Families see this date. With a waitlist, I\'ll offer to open picks when it comes.')
+        + field('Estimated ready date', `<input id="ck-ready" type="date" value="${esc(l.estimated_ready_date || '')}">`, 'When the puppies can go home.'),
+      submitLabel: 'Save dates',
+      submit: async (root) => {
+        const changes = {};
+        const dep = root.querySelector('#ck-deposits').value;
+        const ready = root.querySelector('#ck-ready').value;
+        if (dep !== (l.accept_deposits_date || '')) changes.accept_deposits_date = dep;
+        if (ready !== (l.estimated_ready_date || '')) changes.estimated_ready_date = ready;
+        if (Object.keys(changes).length) await litterRepo.update(l.id, changes);
+        return Object.keys(changes).length;
+      },
+      reply: (n) => (n ? 'Save the new dates' : 'Keep the dates')
+    });
+    if (!res.done) return;
+    if (res.result) { this.didSomething = true; this.asked.delete('open-picks:'); }
+    await this.chat.say(res.result ? 'Saved.' : 'Okay, nothing changed.');
+  }
+
+  async pickStatus() {
+    await this.chat.say(`It's marked ${esc(C.statusLabel(this.litter.status))}. What should it be?`);
+    const pick = await this.chat.choose([
+      ...C.statusChoices().filter((s) => s.value !== this.litter.status).map((s) => ({ label: s.label, value: s.value })),
+      { label: 'Leave it', value: '' }
+    ]);
+    if (pick) await this.setStatus(pick);
+  }
+}
+
+// --- Forms other tasks use too (Pups are going home, assets/prepPupsUI.js; the care step) ----
+
+// "When's the drop-off?": a row per pup (`rows`: [{ pup, sale, date }]) with the
+// date, an optional time and how the pup goes home (vocab PLACEMENT_METHODS: a
+// Local pickup, else a drop-off). A pup left without a date is skipped. One
+// `placement` event per pup with a date (goHome.pickupEvent). What a family asked
+// for on their status page and she hasn't decided (waitlistActions.pickupWishesFor)
+// fills in the row: their day, time, place and, for one of her times, Local pickup.
+// → chat.form's { done, result: [{ pup, date, method }] }.
+export async function pickupsForm(chat, rows, { title = '<strong>When\'s the drop-off?</strong>', cancelLabel = 'Not now' } = {}) {
+  const many = rows.length > 1;
+  let wishes = new Map();
+  if (editionFlags.waitlist) {
+    try { wishes = await (await import('../data/waitlistActions.js')).pickupWishesFor(rows.map((r) => r.sale).filter(Boolean)); } catch { /* the form opens without them */ }
+  }
+  const today = todayYMD();
+  rows = rows.map((r) => {
+    const w = r.sale ? wishes.get(r.sale.id) : null;
+    return w ? { ...r, date: w.date && w.date >= today ? w.date : r.date, time: w.time, method: w.method, location: w.location, asked: true } : r;
+  });
+  const methods = (pick) => `<option value="">—</option>${PLACEMENT_METHODS.map((m) => `<option${m === pick ? ' selected' : ''}>${esc(m)}</option>`).join('')}`;
+  return chat.form({
+    title: many ? `${title}<span class="kels-lead">Leave a puppy's date blank to skip them.</span>` : title,
+    html: rows.map((r, i) => `${many ? `<p class="gl-q">${pupLine(r.pup)}</p>` : ''}<div class="ck-inline">
+        ${field('Date', `<input id="ck-pickup-${i}" type="date" value="${esc(r.date || '')}" aria-label="${esc(pupName(r.pup))}: date">`)}
+        ${field('Time (optional)', `<input id="ck-time-${i}" type="text" placeholder="e.g. 10am" value="${esc(r.time || '')}" aria-label="${esc(pupName(r.pup))}: time">`)}
+        ${field('How', `<select id="ck-method-${i}" aria-label="${esc(pupName(r.pup))}: how">${methods(r.method || '')}</select>`)}
+      </div>${r.asked ? `<p class="field-hint">Filled in from what they asked for on their status page${r.location ? ` (${esc(r.location)})` : ''}. Their request still waits on their entry for you to approve or decline.</p>` : ''}`).join(''),
+    submitLabel: many ? 'Save' : 'Save date',
+    cancelLabel,
+    submit: async (root) => {
+      const out = rows.map((r, i) => ({ ...r, date: root.querySelector(`#ck-pickup-${i}`).value, time: root.querySelector(`#ck-time-${i}`).value.trim(), method: root.querySelector(`#ck-method-${i}`).value }))
+        .filter((r) => r.date);
+      if (!out.length) return many ? 'Pick a date for at least one puppy.' : 'Pick a date.';
+      for (const r of out) await eventRepo.create(H.pickupEvent(r.pup, r.sale, r.date, r.time, r.method, r.location || ''));
+      return out;
+    },
+    reply: (out) => (many ? `${C.plural(out.length, 'drop-off date')} saved` : `Drop-off on ${fmtDate(out[0].date)}`)
+  });
+}
+
+// Microchip numbers for `pups`. → chat.form's { done, result: how many changed }.
+export function chipsForm(chat, pups) {
+  const rows = pups.map((p, i) => field(pupName(p) + (sexWord(p) ? ` (${sexWord(p)})` : ''), `<input id="ck-chip-${i}" type="text" inputmode="numeric" autocomplete="off" value="${esc(p.microchip_id || '')}">`)).join('');
+  return chat.form({
+    title: '<strong>Microchip numbers</strong><span class="kels-lead">Type or scan each number. Leave one blank if they don\'t have a chip yet.</span>',
+    html: rows,
+    submitLabel: 'Save chips',
+    submit: async (root) => {
+      let changed = 0;
+      for (const [i, p] of pups.entries()) {
+        const v = root.querySelector(`#ck-chip-${i}`).value.trim();
+        if (v === (p.microchip_id || '')) continue;
+        await dogRepo.update(p.id, { microchip_id: v });
+        changed++;
+      }
+      return changed;
+    },
+    reply: (n) => (n ? `Save ${C.plural(n, 'chip number')}` : 'No changes')
+  });
+}
+
+// --- Small HTML helpers -----------------------------------------------------------
+
+// An event's own title, beside the field that names it (a vaccine, a drug…):
+// both are hers to fill in; a blank title takes the name, as on the event form.
+export function titleInput(id, type, nameKey) {
+  const named = (type.fields || []).find((f) => f.key === nameKey);
+  return field('Title (optional)', `<input id="${id}" type="text" autocomplete="off" placeholder="${esc(type.label)}">`,
+    named ? `Shown on the timeline. Leave blank to use the ${named.label.toLowerCase()}.` : 'Shown on the timeline.');
+}
+
+// A type's details fields, with its related contact (a vet, a handler, a
+// boarding host) as a picker of her contacts in place of the plain-text name
+// field (`contactFallback`), as the event form does.
+export function eventFieldsHtml(type, contacts, nameKey) {
+  return `${type.relatedContact ? relatedContactInput(type, contacts) : ''}
+    ${(type.fields || []).filter((f) => !(type.relatedContact && f.contactFallback)).map((f) => eventFieldInput(f, f.key === nameKey)).join('')}`;
+}
+
+const contactLabel = (type) => (typeof type.relatedContact === 'string' ? type.relatedContact : 'Who with');
+
+// Her contacts, those with the type's role (her vets) first, or someone new.
+// `selected`: a contact id to start picked (the care step's vet, carried on).
+export function relatedContactInput(type, contacts, selected = null) {
+  const role = RELATED_CONTACT_ROLE[type.value] || null;
+  const label = contactLabel(type);
+  const opt = (c) => `<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.name)}</option>`;
+  const has = (c) => role && (c.contact_type || []).includes(role);
+  const sorted = [...contacts].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const tagged = sorted.filter(has);
+  const rest = sorted.filter((c) => !has(c));
+  const roleLabel = role ? (CONTACT_TYPE.find((t) => t.value === role)?.label || role) : '';
+  const groups = tagged.length
+    ? `<optgroup label="${esc(roleLabel)}s">${tagged.map(opt).join('')}</optgroup>${rest.length ? `<optgroup label="Other contacts">${rest.map(opt).join('')}</optgroup>` : ''}`
+    : rest.map(opt).join('');
+  return `${field(`${label} (optional)`, `<select id="ck-rc-pick"><option value="">None</option>${groups}<option value="__new">Someone new…</option></select>`)}
+    <div id="ck-rc-new" hidden>${field(`${label}'s name`, '<input id="ck-rc-name" type="text" autocomplete="off">', role ? `I'll add them to your contacts as a ${roleLabel.toLowerCase()}.` : 'I\'ll add them to your contacts.')}</div>`;
+}
+
+export function wireRelatedContact(root) {
+  root.querySelector('#ck-rc-pick')?.addEventListener('change', (e) => {
+    root.querySelector('#ck-rc-new').hidden = e.target.value !== '__new';
+  });
+}
+
+export function relatedContactProblem(root, type) {
+  if (root.querySelector('#ck-rc-pick')?.value !== '__new') return '';
+  return root.querySelector('#ck-rc-name').value.trim() ? '' : `Type the ${contactLabel(type).toLowerCase()}'s name, or pick None.`;
+}
+
+// → the picked contact's id, a new contact's (made with the type's role), or
+// null. A picked one gets the role too (contactRepo.ensureType).
+export async function readRelatedContact(root, type) {
+  const pick = root.querySelector('#ck-rc-pick')?.value || '';
+  if (!pick) return null;
+  const role = RELATED_CONTACT_ROLE[type.value] || null;
+  if (pick === '__new') {
+    const c = await contactRepo.create({ name: root.querySelector('#ck-rc-name').value.trim(), contact_type: role ? [role] : [] });
+    return c.id;
+  }
+  if (role) await contactRepo.ensureType(pick, role);
+  return pick;
+}
+
+export function field(labelText, inputHtml, hint = '') {
+  return `<div class="field gl-field"><label>${esc(labelText)}</label>${inputHtml}${hint ? `<span class="field-hint">${esc(hint)}</span>` : ''}</div>`;
+}
+
+// One details field of an event type (vocab EVENT_TYPES), as an input whose id is
+// `ck-f-<key>` (read back the same way). The litter check-in's care forms and the
+// dog check-in's "Any other events to log?" both use it. A combobox with options
+// suggests them (free text); a select's `default` starts selected.
+export function eventFieldInput(f, isName = false) {
+  const id = `ck-f-${f.key}`;
+  const label = f.contactFallback ? `${f.label} (name)` : f.label;
+  const opt = (o) => (typeof o === 'string' ? { value: o, label: o } : o);
+  let input;
+  if (f.type === 'textarea') input = `<textarea id="${id}" rows="2"></textarea>`;
+  else if (f.type === 'combobox' && (f.options || []).length) input = `<input id="${id}" type="text" list="${id}-dl" autocomplete="off"><datalist id="${id}-dl">${f.options.map(opt).map((o) => `<option value="${esc(o.value)}"></option>`).join('')}</datalist>`;
+  else if (f.type === 'select') input = `<select id="${id}"><option value="">—</option>${(f.options || []).map(opt).map((o) => `<option value="${esc(o.value)}"${f.default === o.value ? ' selected' : ''}>${esc(o.label)}</option>`).join('')}</select>`;
+  else input = `<input id="${id}" type="${f.type === 'date' ? 'date' : f.type === 'number' ? 'number' : 'text'}"${f.step ? ` step="${esc(f.step)}"` : ''}${isName ? ' autocomplete="off"' : ''}>`;
+  return field(label, input);
+}
+

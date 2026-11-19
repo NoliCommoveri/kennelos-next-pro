@@ -1,0 +1,65 @@
+// stud-results-report.js — "Stud Results" (Reports plan, phase 3). One row per stud
+// service, outgoing or incoming: the litter it produced (a litter whose pairing_id
+// is the service's pairing — breedingReports.studResultRows), puppies born, the fee
+// and any pick. Incoming services are your dams bred to outside studs.
+import { loadStudResults } from '../data/reportSources.js';
+import { studResultFigures } from '../data/reportFigures.js';
+import { createReportView } from '../assets/reportView.js';
+import { fmtDate, fmtMoney } from '../assets/ui.js';
+import { STUD_SERVICE_DIRECTION, STUD_SERVICE_ROLE, STUD_SERVICE_STATUS, FEE_STRUCTURE, descriptor } from '../data/vocab.js';
+import { sumOf, rankBy } from '../data/reportMath.js';
+
+const when = (r) => r.service.sent_date || r.service.returned_date || '';
+const fee = (r) => (r.service.fee_amount === '' || r.service.fee_amount == null ? 0 : Number(r.service.fee_amount) || 0);
+
+async function init() {
+  const src = await loadStudResults();
+  const { rows, role } = src;
+  const dogName = new Map(src.dogs.map((d) => [d.id, d.call_name || '—']));
+  const contactName = new Map(src.contacts.map((c) => [c.id, c.name || '—']));
+  const outgoing = (r) => role(r) === 'stud';
+
+  createReportView({
+    mount: document.getElementById('report-mount'),
+    scope: src.scope,
+    csvFilename: `stud-results-${new Date().toISOString().slice(0, 10)}.csv`,
+    search: { placeholder: 'Search dog or partner…', text: (r) => `${dogName.get(r.service.our_dog_id) || ''} ${dogName.get(r.service.partner_dog_id) || ''} ${contactName.get(r.service.partner_contact_id) || ''}` },
+    dateRange: { label: 'Sent', date: src.date },
+    filters: [
+      { id: 'role', label: 'Our dog', options: STUD_SERVICE_ROLE, match: (r, v) => role(r) === v },
+      { id: 'direction', label: 'Who travels', options: STUD_SERVICE_DIRECTION, match: (r, v) => r.service.direction === v },
+      { id: 'status', label: 'Status', options: STUD_SERVICE_STATUS, match: (r, v) => r.service.status === v }
+    ],
+    kpis: (list) => {
+      const f = studResultFigures(list, role);
+      return [
+        { label: 'Services', value: String(f.services), hint: `${f.ourStud} our stud, ${f.services - f.ourStud} our dam` },
+        { label: 'Litters produced', value: String(f.litters) },
+        { label: 'Puppies born', value: String(f.born), hint: f.litters ? `${(f.born / f.litters).toFixed(1)} a litter` : '' },
+        { label: 'Fees earned', value: fmtMoney(f.feesEarned) || '$0.00', hint: 'completed, our stud' }
+      ];
+    },
+    charts: (list) => [{
+      type: 'hbar', title: 'Puppies sired, by our stud', subtitle: 'From the litters our studs\' services produced',
+      rows: rankBy(list.filter((r) => outgoing(r) && r.litter), { key: (r) => r.service.our_dog_id, label: (id) => dogName.get(id) || '—', value: (r) => r.born }),
+      emptyText: 'No litters recorded from our studs\' services yet.'
+    }],
+    columns: [
+      { header: 'Sent', value: (r) => (when(r) ? fmtDate(when(r)) : ''), csv: when },
+      { header: 'Our dog is', value: (r) => role(r) || '', badge: STUD_SERVICE_ROLE, csv: (r) => (role(r) ? descriptor(STUD_SERVICE_ROLE, role(r)).label : '') },
+      { header: 'Who travels', value: (r) => r.service.direction || '', badge: STUD_SERVICE_DIRECTION, csv: (r) => descriptor(STUD_SERVICE_DIRECTION, r.service.direction).label },
+      { header: 'Our dog', value: (r) => dogName.get(r.service.our_dog_id) || '—' },
+      { header: 'Partner dog', value: (r) => dogName.get(r.service.partner_dog_id) || '—' },
+      { header: 'Status', value: (r) => r.service.status || '', badge: STUD_SERVICE_STATUS, csv: (r) => descriptor(STUD_SERVICE_STATUS, r.service.status).label },
+      { header: 'Litter', value: (r) => (r.litter ? (r.litter.whelp_date ? `Whelped ${fmtDate(r.litter.whelp_date)}` : 'Expected') : '') },
+      { header: 'Born', value: (r) => (r.born == null ? '' : String(r.born)), total: (list) => String(sumOf(list, (r) => r.born)) },
+      { header: 'Fee', value: (r) => (fee(r) ? fmtMoney(fee(r)) : ''), csv: (r) => String(fee(r)), className: 'num' },
+      { header: 'Terms', value: (r) => (r.service.fee_structure ? descriptor(FEE_STRUCTURE, r.service.fee_structure).label : '') }
+    ],
+    onRowClick: (r) => { location.href = `stud-service.html?id=${encodeURIComponent(r.service.id)}`; },
+    load: () => Promise.resolve(rows),
+    emptyText: 'No stud services recorded in this range.'
+  });
+}
+
+init();

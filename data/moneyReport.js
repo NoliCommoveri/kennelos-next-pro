@@ -1,0 +1,243 @@
+// moneyReport.js — money in and out by period, for the Profit & Loss by Month
+// report and Year in Review (Reports plan, phase 1). A derived read, like
+// incomeView.js and litterFinances.js: nothing stored.
+//
+// It reads the SAME two sources the Financials Overview does, scoped the same
+// way, so the reports can never disagree with it: income rows from
+// incomeView.getIncomeRows (scoped at the source) and the Expense ledger, each
+// expense scoped through the subject it hangs off (Multi-Kennel Scope Spec §7).
+//
+// P&L is CASH BASIS: earned income is filed under the date its money moved (each
+// component's `when`, incomeView.saleComponentDate), expenses under expense_date.
+// Anticipated income is reported separately, under its due date, never in Net.
+// Non-cash pick value is never money in.
+import { getIncomeRows } from './incomeView.js';
+import { expenseRepo } from './expenseRepo.js';
+import { dogRepo } from './dogRepo.js';
+import { litterRepo } from './litterRepo.js';
+import { pairingRepo } from './pairingRepo.js';
+import { expenseInScope } from './kennelScope.js';
+import { studServiceRepo } from './studServiceRepo.js';
+import { periodKey } from './reportMath.js';
+import { REGISTRATION_TYPE } from './vocab.js';
+
+// The in-scope income rows and expenses, loaded once.
+export async function loadMoney() {
+  const [incomeRows, allExpenses, dogs, litters, pairings, studServices] = await Promise.all([
+    getIncomeRows({ includeArchived: false }),
+    expenseRepo.getAll({ includeArchived: false }),
+    dogRepo.getAll({ includeArchived: true }),
+    litterRepo.getAll({ includeArchived: true }),
+    pairingRepo.getAll({ includeArchived: true }),
+    studServiceRepo.getAll({ includeArchived: true })
+  ]);
+  // The money-total rule (K14-11): an outside dog's cost goes under its stud
+  // service's kennel, or only under All kennels — as on Financials and the hub.
+  const maps = {
+    dog: new Map(dogs.map((d) => [d.id, d])),
+    litter: new Map(litters.map((l) => [l.id, l])),
+    pairing: new Map(pairings.map((p) => [p.id, p])),
+    stud_service: new Map(studServices.map((x) => [x.id, x]))
+  };
+  const expenses = allExpenses.filter((x) => expenseInScope(x, maps));
+  return { incomeRows, expenses };
+}
+
+// Flatten income rows into one dated entry per cash component:
+// { date, amount, state: 'earned' | 'anticipated', component, source_type, row }.
+// PURE.
+export function incomeEntries(incomeRows) {
+  const out = [];
+  for (const r of incomeRows) {
+    for (const c of r.components || []) {
+      if (c.state !== 'earned' && c.state !== 'anticipated') continue; // pick is non-cash
+      out.push({ date: c.when || r.date || '', due: c.due || '', amount: Number(c.amount) || 0, state: c.state, component: c.component, source_type: r.source_type, row: r,
+        ...(c.due_id != null ? { due_id: c.due_id } : {}), ...(c.credited ? { credited: true } : {}) });
+    }
+  }
+  return out;
+}
+
+// One row per period: { period, income (earned), anticipated, expenses, net,
+// cumulative } with every period present. Entries/expenses outside the periods
+// are left out. PURE.
+export function plByPeriod(entries, expenses, periods, granularity = 'month') {
+  const rows = new Map(periods.map((p) => [p, { period: p, income: 0, anticipated: 0, expenses: 0, net: 0, cumulative: 0 }]));
+  for (const e of entries) {
+    const row = rows.get(periodKey(e.date, granularity));
+    if (!row) continue;
+    if (e.state === 'earned') row.income += e.amount;
+    else row.anticipated += e.amount;
+  }
+  for (const x of expenses) {
+    const row = rows.get(periodKey(x.expense_date, granularity));
+    if (row) row.expenses += Number(x.amount) || 0;
+  }
+  let run = 0;
+  for (const row of rows.values()) {
+    row.net = row.income - row.expenses;
+    run += row.net;
+    row.cumulative = run;
+  }
+  return [...rows.values()];
+}
+
+// Totals by key over a date range: earned income by component, expenses by
+// category. PURE. `inRangeFn(ymd)` decides membership.
+export function moneyBreakdown(entries, expenses, inRangeFn) {
+  const income = new Map();
+  const spent = new Map();
+  for (const e of entries) if (e.state === 'earned' && inRangeFn(e.date)) income.set(e.component, (income.get(e.component) || 0) + e.amount);
+  for (const x of expenses) if (inRangeFn(x.expense_date)) spent.set(x.category, (spent.get(x.category) || 0) + (Number(x.amount) || 0));
+  return { income, spent };
+}
+
+// --- Receivables (Reports plan, phase 3) -------------------------------------------------
+
+// How overdue money still owed is, in buckets, in menu order.
+export const AGE_BUCKETS = [
+  { value: 'not_due', label: 'Not due yet' },
+  { value: 'd30',     label: '1–30 days overdue' },
+  { value: 'd60',     label: '31–60 days overdue' },
+  { value: 'd90',     label: '61–90 days overdue' },
+  { value: 'd90plus', label: 'Over 90 days overdue' },
+  { value: 'undated', label: 'No due date' }
+];
+
+const dayMs = (ymd) => Date.UTC(Number(ymd.slice(0, 4)), Number(ymd.slice(5, 7)) - 1, Number(ymd.slice(8, 10)));
+
+// Days past due (negative = not due yet; null = no due date).
+export function daysOverdue(dueYMD, today) {
+  if (!dueYMD) return null;
+  return Math.round((dayMs(today) - dayMs(dueYMD)) / 86400000);
+}
+
+export function ageBucket(dueYMD, today) {
+  const d = daysOverdue(dueYMD, today);
+  if (d == null) return 'undated';
+  if (d <= 0) return 'not_due';
+  if (d <= 30) return 'd30';
+  if (d <= 60) return 'd60';
+  if (d <= 90) return 'd90';
+  return 'd90plus';
+}
+
+// Money still owed to the program: every anticipated income component (a deposit
+// not yet in, what's owed by each of a sale's due dates, a stud fee), aged by its due
+// date (a sale's from its payment schedule: incomeView.ledgerComponents). A sale's
+// components owed by the same due date are ONE row, with its own Due by (Payment
+// Schedule plan §5.2); `components` lists what it's for. One whose due date can't be
+// known yet is "No due date", never aged from the sale date. The part of a charge a
+// family's credit for funds received covers is left out: nothing is owed on it (D21).
+// Plus foster costs fronted and not yet paid back (litterFinances.reimbursablePending,
+// one row per litter, no due date). PURE. `fosterOwed` = [{ litter, amount, label }].
+export function receivableRows(entries, today, fosterOwed = []) {
+  const byDue = new Map();
+  for (const e of entries) {
+    if (e.state !== 'anticipated' || !(e.amount > 0) || e.credited) continue;
+    const id = `${e.source_type}|${e.row.source_id ?? e.row.href}|${e.due_id ?? `c:${e.component}`}|${e.due || ''}`;
+    const had = byDue.get(id);
+    if (had) {
+      had.amount = Math.round((had.amount + e.amount) * 100) / 100;
+      if (!had.components.includes(e.component)) had.components.push(e.component);
+      continue;
+    }
+    byDue.set(id, {
+      due: e.due || '',
+      amount: e.amount,
+      component: e.component,
+      components: [e.component],
+      who: e.row.counterparty,
+      what: e.row.dog,
+      href: e.row.href,
+      source_type: e.source_type,
+      bucket: ageBucket(e.due, today)
+    });
+  }
+  const rows = [...byDue.values()];
+  for (const f of fosterOwed) {
+    if (!(f.amount > 0)) continue;
+    rows.push({ due: '', amount: f.amount, component: 'foster_reimbursable', components: ['foster_reimbursable'], who: f.label, what: f.litterLabel || '', href: `litter.html?id=${encodeURIComponent(f.litter.id)}`, source_type: 'litter', bucket: 'undated' });
+  }
+  return rows.sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
+}
+
+// --- Pricing ------------------------------------------------------------------------------
+
+// One row per placed sale with a price: the sale, its pup and litter, and the price
+// the litter's defaults would have prefilled for that sex and registration
+// (saleDefaults.expectedPricing). PURE; `expectedFor(sale)` is injected.
+export function pricingRows(sales, { dogsById, isPlaced, expectedFor }) {
+  return sales
+    .filter((s) => isPlaced(s) && s.price !== '' && s.price != null && Number.isFinite(Number(s.price)))
+    .map((s) => {
+      const dog = dogsById.get(s.dog_id) || null;
+      const expected = expectedFor(s);
+      return { sale: s, dog, price: Number(s.price), expected: expected == null ? null : Number(expected), diff: expected == null ? null : Number(s.price) - Number(expected) };
+    })
+    .sort((a, b) => (b.sale.sale_date || '').localeCompare(a.sale.sale_date || ''));
+}
+
+// Pups placed with each registration: one row per REGISTRATION_TYPE in vocab order
+// (every one present, so a chart keeps its slots), then "Not set" when any sale has
+// none. `count` sales, `value` the sum of their prices, `priced` how many had one.
+// PURE; callers pass the placed sales.
+export function byRegistration(sales) {
+  const price = (s) => (s.price !== '' && s.price != null && Number.isFinite(Number(s.price)) ? Number(s.price) : null);
+  const row = (value, label, list) => ({
+    value, label, count: list.length,
+    priced: list.filter((s) => price(s) != null).length,
+    total: list.reduce((t, s) => t + (price(s) ?? 0), 0)
+  });
+  const known = new Set(REGISTRATION_TYPE.map((r) => r.value));
+  const rows = REGISTRATION_TYPE.map((r) => row(r.value, r.label, sales.filter((s) => s.registration_type === r.value)));
+  const unset = sales.filter((s) => !known.has(s.registration_type));
+  return unset.length ? [...rows, row('', 'Not set', unset)] : rows;
+}
+
+// "9 Limited · 4 Full · 1 Co-own": the registrations that have sales, in vocab order.
+export function registrationSummary(sales) {
+  return byRegistration(sales).filter((r) => r.count).map((r) => `${r.count} ${r.value === 'none' ? 'Unregistered' : r.label}`).join(' · ');
+}
+
+// Average of `value` per group key: [{ key, avg, count }].
+export function averageBy(rows, key, value) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = key(r);
+    const acc = m.get(k) || { key: k, sum: 0, count: 0 };
+    acc.sum += Number(value(r)) || 0;
+    acc.count += 1;
+    m.set(k, acc);
+  }
+  return [...m.values()].map((a) => ({ key: a.key, avg: a.sum / a.count, count: a.count }));
+}
+
+// --- Breeding-dog return -----------------------------------------------------------------
+
+// Per dam and sire of a litter in `litters`: what their litters' puppies brought in
+// (earned and still anticipated, from the income rows carrying those litter ids —
+// sales and credited application fees), stud fees the dog earned itself (outgoing
+// stud income rows on its id), and its own lifetime costs (expenses on the dog).
+// A litter's income counts for BOTH its parents — this is each dog's view, not a
+// split. PURE.
+export function dogReturnRows({ dogs, litters, incomeRows, expenses, sales, isPlaced }) {
+  const out = [];
+  for (const dog of dogs) {
+    const role = dog.sex === 'female' ? 'dam' : dog.sex === 'male' ? 'sire' : null;
+    if (!role) continue;
+    const mine = litters.filter((l) => (role === 'dam' ? l.dam_id : l.sire_id) === dog.id && l.status !== 'expected');
+    const studRows = incomeRows.filter((r) => r.source_type === 'stud' && r.dog_id === dog.id);
+    if (!mine.length && !studRows.length) continue;
+    const ids = new Set(mine.map((l) => l.id));
+    const pupRows = incomeRows.filter((r) => r.litter_id && ids.has(r.litter_id));
+    const pupIds = new Set(dogs.filter((d) => d.litter_id && ids.has(d.litter_id)).map((d) => d.id));
+    const pupsSold = new Set(sales.filter((s) => isPlaced(s) && pupIds.has(s.dog_id)).map((s) => s.dog_id)).size;
+    const earned = pupRows.reduce((t, r) => t + r.earned, 0);
+    const studFees = studRows.reduce((t, r) => t + r.earned, 0);
+    const anticipated = pupRows.reduce((t, r) => t + r.anticipated, 0) + studRows.reduce((t, r) => t + r.anticipated, 0);
+    const costs = expenses.filter((x) => x.subject_type === 'dog' && x.subject_id === dog.id).reduce((t, x) => t + (Number(x.amount) || 0), 0);
+    out.push({ dog, role, litters: mine.length, pupsSold, earned, studFees, anticipated, costs, net: earned + studFees - costs });
+  }
+  return out.sort((a, b) => b.net - a.net);
+}

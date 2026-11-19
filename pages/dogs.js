@@ -1,0 +1,183 @@
+// dogs.js — Dog List screen. Uses the shared listView component with dog-specific
+// filters, columns, and row navigation.
+import { dogRepo } from '../data/dogRepo.js';
+import { editionFlags } from '../data/editionConfig.js';
+import { contactRepo } from '../data/contactRepo.js';
+import { createListView } from '../assets/listView.js';
+import { dogInScope } from '../data/kennelScope.js';
+import { badge, fmtDate, esc, param, wireActionMenu } from '../assets/ui.js';
+import { websiteLinkOffered } from '../data/kennelportApi.js';
+import { descriptor, SEX, DOG_STATUS, DISPOSITION, OWNERSHIP_TYPE, EVENT_TYPES, dogListOrder, dogStatusOrder, dogSexOrder } from '../data/vocab.js';
+import { eventRepo } from '../data/eventRepo.js';
+import { openEventForm } from '../assets/eventForm.js';
+import { breedingDogs, homeDogs, preventativeGaps } from '../data/dogCare.js';
+import { todayYMD } from '../data/dateUtils.js';
+
+const mount = document.getElementById('dog-list');
+const bucket = param('bucket');
+
+// Compact single-letter badge (M/F/U) — Call name, Sex, and Status are the only
+// columns that stay visible on a narrow screen, so Sex has to fit in that space.
+function sexBadge(sex) {
+  const d = descriptor(SEX, sex);
+  const letter = d.label ? d.label[0].toUpperCase() : '?';
+  return `<span class="badge ${d.badge}" title="${esc(d.label)}">${letter}</span>`;
+}
+
+// DOB ascending (oldest first), undated rows always last regardless of the
+// empty-string-sorts-first quirk of plain string comparison.
+function dobAscUndatedLast(a, b) {
+  if (!a.date_of_birth && !b.date_of_birth) return 0;
+  if (!a.date_of_birth) return 1;
+  if (!b.date_of_birth) return -1;
+  return a.date_of_birth.localeCompare(b.date_of_birth);
+}
+const nameAsc = (a, b) => (a.call_name || '').localeCompare(b.call_name || '');
+const registeredNameAsc = (a, b) => (a.registered_name || '').localeCompare(b.registered_name || '');
+const breedAsc = (a, b) => (a.breed || '').localeCompare(b.breed || '');
+const websiteFirst = (a, b) => Number(Boolean(b.show_on_website)) - Number(Boolean(a.show_on_website));
+const dispositionAsc = (a, b) => (a.disposition || '').localeCompare(b.disposition || '');
+
+// Puppies tab sections: who can still go first, then who's spoken for, the
+// open questions, the ones not sellable right now, and the keepers last. An
+// unset disposition reads as `undecided` (same as the Disposition filter).
+const PUPPY_DISPOSITION_ORDER = ['available', 'placed', 'undecided', 'health_hold', 'keeping'];
+
+const NOT_BREEDING_STATUSES = ['retired_breeding', 'pet_home', 'deceased'];
+
+const BUCKETS = {
+  // Within each disposition section: sex, then name A→Z (dogListOrder — status is
+  // the same for every puppy).
+  puppies: {
+    baseFilter: (d) => d.status === 'puppy',
+    sort: dogListOrder,
+    groupBy: { key: (d) => d.disposition || 'undecided', groups: PUPPY_DISPOSITION_ORDER.map((v) => ({ value: v, label: descriptor(DISPOSITION, v).label })) }
+  },
+  breeding: {
+    baseFilter: (d) => d.status === 'active_breeding',
+    sort: dobAscUndatedLast,
+    groupBy: { key: (d) => d.sex, groups: ['male', 'female', 'unknown'].map((v) => ({ value: v, label: descriptor(SEX, v).label })) }
+  },
+  not_breeding: {
+    baseFilter: (d) => NOT_BREEDING_STATUSES.includes(d.status),
+    sort: dobAscUndatedLast,
+    groupBy: { key: (d) => d.status, groups: NOT_BREEDING_STATUSES.map((v) => ({ value: v, label: descriptor(DOG_STATUS, v).label })) }
+  },
+  external: { baseFilter: (d) => d.status === 'external_reference', sort: nameAsc }
+};
+
+function renderTabs() {
+  document.querySelectorAll('#dogs-bucket-tabs .seg-tab').forEach((tab) => {
+    const tabBucket = new URL(tab.href).searchParams.get('bucket');
+    const isActive = tabBucket === (BUCKETS[bucket] ? bucket : null);
+    tab.classList.toggle('active', isActive);
+    if (isActive) tab.setAttribute('aria-current', 'page'); else tab.removeAttribute('aria-current');
+  });
+}
+
+async function init() {
+  renderTabs();
+  const active = BUCKETS[bucket] || {};
+  // Breed filter options come from the data (free-text breeds already entered).
+  const [breeds, contacts] = await Promise.all([
+    dogRepo.getBreeds(),
+    contactRepo.getAll({ includeArchived: true })
+  ]);
+  const contactName = (id) => contacts.find((c) => c.id === id)?.name || '';
+  const label = (vocab, v) => (v ? descriptor(vocab, v).label : '');
+
+  createListView({
+    mount,
+    baseFilter: active.baseFilter || (() => true),
+    // Active-kennel scope (Multi-Kennel Scope Spec §7). `dogInScope`, not the bare
+    // `inScope`: an external or leased-in dog belongs to somebody else's kennel and
+    // is scope-transparent, so the External bucket keeps showing every outside stud
+    // and foster dam whichever of your own kennels you are viewing.
+    scope: dogInScope,
+    // All dogs (no bucket): status in DOG_STATUS order, then sex, then name (dogListOrder).
+    sort: active.sort || dogListOrder,
+    groupBy: active.groupBy || null,
+    search: {
+      placeholder: 'Search by name…',
+      text: (d) => `${d.call_name || ''} ${d.registered_name || ''}`
+    },
+    filters: [
+      { id: 'status', label: 'Status', options: DOG_STATUS, match: (d, v) => d.status === v },
+      // Disposition — "keeping vs offering". `undecided` matches both the explicit
+      // value and never-set records, so it isn't a hole prospective-family filtering
+      // could fall through.
+      // `?disposition=available` starts on it (Kels links there for "available puppies").
+      { id: 'disposition', label: 'Disposition', options: DISPOSITION, initial: param('disposition'), match: (d, v) => (d.disposition || 'undecided') === v },
+      { id: 'sex', label: 'Sex', options: SEX, match: (d, v) => d.sex === v },
+      { id: 'ownership', label: 'Ownership', options: OWNERSHIP_TYPE, match: (d, v) => d.ownership_type === v },
+      { id: 'breed', label: 'Breed', options: breeds.map((b) => ({ value: b, label: b })), match: (d, v) => d.breed === v }
+    ],
+    // Call name, Sex, Status, and Website stay visible at every width;
+    // Registered name, Breed, DOB, and Disposition collapse behind the row's
+    // "more details" toggle on phones so the table never forces horizontal scroll.
+    // Website (a ✓ when the dog shows on her KennelPort website) only where the
+    // website link is offered, as on the dog page.
+    columns: [
+      { header: 'Call name', sortable: true, sortFn: nameAsc, cell: (d) => `<strong>${esc(d.call_name)}</strong>` },
+      { header: 'Registered name', sortable: true, sortFn: registeredNameAsc, collapse: true, cell: (d) => d.registered_name ? esc(d.registered_name) : '<span class="faint">—</span>' },
+      { header: 'Sex', sortable: true, sortFn: dogSexOrder, cell: (d) => sexBadge(d.sex) },
+      { header: 'Registry', collapse: true, cell: (d) => d.registry ? esc(d.registry) : '<span class="faint">—</span>' },
+      { header: 'Breed', sortable: true, sortFn: breedAsc, collapse: true, cell: (d) => esc(d.breed || '—') },
+      { header: 'DOB', sortable: true, sortFn: dobAscUndatedLast, collapse: true, cell: (d) => d.date_of_birth ? esc(fmtDate(d.date_of_birth)) : '<span class="faint">—</span>' },
+      { header: 'Status', sortable: true, sortFn: dogStatusOrder, cell: (d) => badge(DOG_STATUS, d.status) },
+      { header: 'Disposition', sortable: true, sortFn: dispositionAsc, collapse: true, cell: (d) => d.disposition ? esc(descriptor(DISPOSITION, d.disposition).label) : '<span class="faint">—</span>' },
+      ...(websiteLinkOffered() ? [{ header: 'Website', className: 'col-center', sortable: true, sortFn: websiteFirst, cell: (d) => d.show_on_website ? '<span title="Shown on website" aria-label="Shown on website">✓</span>' : '' }] : [])
+    ],
+    onRowClick: (d) => { location.href = `dog.html?id=${encodeURIComponent(d.id)}`; },
+    load: (o) => dogRepo.getAll(o),
+    emptyText: BUCKETS[bucket] ? 'No dogs in this bucket yet.' : 'No dogs yet. Click “+ Add Dog” to create the first record.',
+    // Roster's CSV export (Navigation Consolidation Plan v1 §3/§6) — same column
+    // set as roster.html, now available directly from the Dogs hub.
+    csv: {
+      filename: `dogs-${new Date().toISOString().slice(0, 10)}.csv`,
+      columns: [
+        { header: 'Call name', value: (d) => d.call_name || '' },
+        { header: 'Registered name', value: (d) => d.registered_name || '' },
+        { header: 'Registry', value: (d) => d.registry || '' },
+        { header: 'Sex', value: (d) => label(SEX, d.sex) },
+        { header: 'Breed', value: (d) => d.breed || '' },
+        { header: 'DOB', value: (d) => d.date_of_birth || '' },
+        { header: 'Status', value: (d) => label(DOG_STATUS, d.status) },
+        { header: 'Disposition', value: (d) => label(DISPOSITION, d.disposition) },
+        { header: 'Ownership', value: (d) => label(OWNERSHIP_TYPE, d.ownership_type) },
+        { header: 'Owner', value: (d) => contactName(d.owner_contact_id) }
+      ]
+    }
+  });
+}
+
+// "Log events for several dogs" (More ▾): one event form listing the dogs at home (dogCare.homeDogs),
+// one event saved per ticked dog (eventForm's cascade, as a litter's "Log event for
+// whole litter"). Only active breeding dogs start ticked. Today's preventatives
+// nudge opens it with ?logEvent=preventative, ticking only the active breeding
+// dogs still missing this month's; &from=today goes back after.
+async function openLogSeveral(type = null) {
+  const dogs = homeDogs((await dogRepo.getAll()).filter(dogInScope));
+  if (!dogs.length) return;
+  const known = type && EVENT_TYPES.some((t) => t.value === type) ? type : null;
+  const selected = known === 'preventative'
+    ? preventativeGaps(dogs, await eventRepo.getAll(), todayYMD()).map((d) => d.id)
+    : breedingDogs(dogs).map((d) => d.id);
+  const back = () => { if (param('from') === 'today') location.href = 'today.html'; };
+  const label = (d) => `${d.call_name || 'Unnamed'}${d.sex ? ` (${descriptor(SEX, d.sex).label[0]})` : ''}${d.status !== 'active_breeding' ? ` · ${descriptor(DOG_STATUS, d.status).label}` : ''}`;
+  openEventForm({
+    subjectType: 'dog',
+    cascadeTitle: 'Log events for several dogs',
+    cascadeTargets: dogs.map((d) => ({ id: d.id, label: label(d) })),
+    cascadeSelected: selected,
+    prefill: known ? { event_type: known } : null,
+    onSaved: back
+  });
+}
+wireActionMenu(document.getElementById('dogs-more'));
+document.getElementById('btn-log-several')?.addEventListener('click', () => openLogSeveral());
+// Dog Cards (Shared Dogs Plan §3): Pro only; the page itself is dropped from Lite.
+const dogCardBtn = document.getElementById('btn-dog-card');
+if (dogCardBtn && editionFlags.dogCards) dogCardBtn.hidden = false;
+
+init().then(() => { if (param('logEvent')) openLogSeveral(param('logEvent')); });

@@ -1,0 +1,61 @@
+// receivables-report.js — "Receivables" (Reports plan, phase 3): money still owed to
+// the program. What's owed by each due date (a deposit not yet in, each of a sale's
+// payment schedule due dates, a stud fee), one row each (moneyReport.receivableRows), plus
+// foster costs fronted and not yet paid back (litterFinances.reimbursablePending).
+// Aged into buckets from today. Pure math in data/moneyReport.js.
+import { AGE_BUCKETS, daysOverdue } from '../data/moneyReport.js';
+import { loadReceivables } from '../data/reportSources.js';
+import { receivableFigures, OVERDUE_BUCKETS as OVERDUE } from '../data/reportFigures.js';
+import { createReportView } from '../assets/reportView.js';
+import { fmtDate, fmtMoney } from '../assets/ui.js';
+import { todayYMD } from '../data/dateUtils.js';
+import { INCOME_COMPONENTS, descriptor } from '../data/vocab.js';
+import { sumOf } from '../data/reportMath.js';
+import { SERIES_COLORS } from '../assets/chartView.js';
+
+const money = (v) => fmtMoney(Math.round((Number(v) || 0) * 100) / 100);
+const WHAT = [...INCOME_COMPONENTS.filter((c) => c.value !== 'pick'), { value: 'foster_reimbursable', label: 'Foster costs owed back' }];
+
+async function init() {
+  const today = todayYMD();
+  const { rows } = await loadReceivables(today);
+
+  createReportView({
+    mount: document.getElementById('report-mount'),
+    csvFilename: `receivables-${today}.csv`,
+    search: { placeholder: 'Search who or which pup…', text: (r) => `${r.who} ${r.what}` },
+    filters: [
+      { id: 'bucket', label: 'Age', options: AGE_BUCKETS, match: (r, v) => r.bucket === v },
+      { id: 'what', label: 'For', options: WHAT, match: (r, v) => r.components.includes(v) }
+    ],
+    kpis: (list) => {
+      const f = receivableFigures(list);
+      const soon = list.filter((r) => r.due && r.due >= today && daysOverdue(r.due, today) >= -30);
+      return [
+        { label: 'Owed to you', value: money(f.owed), hint: `${f.count} item${f.count === 1 ? '' : 's'}` },
+        { label: 'Overdue', value: money(f.overdue), hint: `${f.overdueCount} item${f.overdueCount === 1 ? '' : 's'}` },
+        { label: 'Due in 30 days', value: money(sumOf(soon, (r) => r.amount)) },
+        { label: 'Foster owed back', value: money(sumOf(list.filter((r) => r.component === 'foster_reimbursable'), (r) => r.amount)) }
+      ];
+    },
+    charts: (list) => [{
+      type: 'hbar', title: 'How overdue', sort: false, format: money, color: SERIES_COLORS[1],
+      rows: AGE_BUCKETS.map((b) => ({ label: b.label, value: sumOf(list.filter((r) => r.bucket === b.value), (r) => r.amount), note: `${list.filter((r) => r.bucket === b.value).length} items` })),
+      emptyText: 'Nothing is owed to you.'
+    }],
+    columns: [
+      { header: 'Due', value: (r) => (r.due ? fmtDate(r.due) : ''), csv: (r) => r.due },
+      { header: 'From', value: (r) => r.who },
+      { header: 'Pup / litter', value: (r) => r.what },
+      { header: 'For', value: (r) => r.components.map((c) => descriptor(WHAT, c).label).join(', ') },
+      { header: 'Amount', value: (r) => money(r.amount), csv: (r) => String(r.amount), className: 'num', total: (list) => money(sumOf(list, (r) => r.amount)) },
+      { header: 'Age', value: (r) => descriptor(AGE_BUCKETS, r.bucket).label, className: 'num',
+        tone: (r) => (r.bucket === 'd90plus' || r.bucket === 'd90' ? 'badge-red' : OVERDUE.includes(r.bucket) ? 'badge-amber' : null) }
+    ],
+    onRowClick: (r) => { if (r.href) location.href = r.href; },
+    load: () => Promise.resolve(rows),
+    emptyText: 'Nothing is owed to you.'
+  });
+}
+
+init();

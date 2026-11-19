@@ -1,0 +1,402 @@
+// cloudApi.js — the ONLY module that talks to the cloud server (Cloud Phase 1
+// plan §3.1, §6.1). A thin fetch wrapper: base URL, bearer token, JSON, timeouts,
+// and typed errors. One function per route, matching cloud/src/api.js.
+//
+// Errors (all extend CloudError):
+//   CloudUnavailableError — this edition has no server (cloudUrl null).
+//   CloudOfflineError     — no network, a timeout, the server's 503
+//                           {maintenance: true}, or an unexpected 5xx. Retry
+//                           later; never shown as a failure (plan §6.1).
+//   CloudAuthError        — 401: the session expired or was revoked. The app
+//                           asks for a new code; local data is untouched.
+//   CloudErasedError      — 401 device_erased: the owner erased this device from
+//                           another one (plan §2.5). A CloudAuthError too, so
+//                           every caller already stops; the handler registered
+//                           with setErasedHandler does the erasing.
+//   CloudAccountDeletedError — 401 account_deleted: the account was deleted on
+//                           purpose (by its owner on another device, or by
+//                           support at her request). A CloudAuthError too.
+//                           Carries `erase`: true when the device is to wipe
+//                           itself for a fresh start. The handler registered
+//                           with setAccountDeletedHandler acts on it.
+//   CloudConflictError    — 409: another device is backing up this program, or
+//                           this device's base is stale (plan §3.4). Carries
+//                           `backingDevice` and `latestSnapshotId`.
+//   CloudRequestError     — any other refusal, with the server's `code`
+//                           (bad_email, invalid_code, too_many_attempts,
+//                           rate_limited, email_unavailable, email_failed,
+//                           missing_files, vault_required, no_vault, …) and
+//                           its extra fields. (The vault's 409s, vault_exists
+//                           and vault_key_stale, arrive as CloudConflictError
+//                           with that `code`.)
+//
+// Bodies are never logged (plan §6.4): no email, code, token or record leaves
+// this module except in the request itself.
+import { cloudBaseUrl } from './cloudConfig.js';
+
+export class CloudError extends Error {
+  constructor(message, { status = null, code = null, extra = {} } = {}) {
+    super(message);
+    this.name = 'CloudError';
+    this.status = status;
+    // A body's own `code` (e.g. Firma's reason behind esign_refused) is the
+    // provider's, kept as providerCode: it never replaces the Worker's code.
+    const { code: providerCode, ...rest } = extra || {};
+    Object.assign(this, rest);
+    this.code = code;
+    if (providerCode != null) this.providerCode = providerCode;
+  }
+}
+export class CloudUnavailableError extends CloudError {
+  constructor() { super('Cloud backup is not available in this edition.', { code: 'unavailable' }); this.name = 'CloudUnavailableError'; }
+}
+export class CloudOfflineError extends CloudError {
+  constructor(message = 'Could not reach cloud backup.', opts) { super(message, opts); this.name = 'CloudOfflineError'; }
+}
+export class CloudAuthError extends CloudError {
+  constructor(opts) { super('Cloud sign-in has expired. Sign in again.', opts); this.name = 'CloudAuthError'; }
+}
+export class CloudErasedError extends CloudAuthError {
+  constructor(opts) { super(opts); this.name = 'CloudErasedError'; }
+}
+export class CloudAccountDeletedError extends CloudAuthError {
+  constructor(opts) { super(opts); this.name = 'CloudAccountDeletedError'; this.erase = opts?.extra?.erase === true; }
+}
+export class CloudConflictError extends CloudError {
+  constructor(opts) { super('Another device is backing up this program.', opts); this.name = 'CloudConflictError'; }
+}
+export class CloudRequestError extends CloudError {
+  constructor(opts) { super(`Cloud request refused (${opts.code || opts.status}).`, opts); this.name = 'CloudRequestError'; }
+}
+
+export const JSON_TIMEOUT_MS = 30 * 1000;
+export const UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+
+async function readError(res) {
+  let body = null;
+  try { body = await res.json(); } catch { /* not JSON */ }
+  const code = body && typeof body.error === 'string' ? body.error : null;
+  const extra = body && typeof body === 'object' ? { ...body } : {};
+  delete extra.error;
+  const opts = { status: res.status, code, extra };
+  if (res.status === 401) {
+    // Support's helper device whose access ended wipes its copy exactly as an
+    // erased device does (docs/KennelOS_Assisted_Setup_Plan.md §7).
+    if (code === 'device_erased' || code === 'helper_removed') return new CloudErasedError(opts);
+    if (code === 'account_deleted') return new CloudAccountDeletedError(opts);
+    return new CloudAuthError(opts);
+  }
+  if (res.status === 409) return new CloudConflictError(opts);
+  if (res.status === 503 && body && body.maintenance) return new CloudOfflineError('Cloud backup is in maintenance.', opts);
+  if (res.status >= 500 && (!code || code === 'internal')) return new CloudOfflineError(`Cloud backup answered ${res.status}.`, opts);
+  return new CloudRequestError(opts);
+}
+
+// One request. `json` sends a JSON body; `body` sends a Blob as-is. Returns the
+// Response for the caller to read (ok statuses only); everything else throws.
+async function send(path, { method = 'GET', token = null, json, body, contentType, timeoutMs = JSON_TIMEOUT_MS, okStatuses = [], keepalive = false } = {}) {
+  const base = cloudBaseUrl();
+  if (!base) throw new CloudUnavailableError();
+  const headers = {};
+  if (token) headers.authorization = `Bearer ${token}`;
+  let payload;
+  if (json !== undefined) {
+    headers['content-type'] = 'application/json';
+    payload = JSON.stringify(json);
+  } else if (body !== undefined) {
+    headers['content-type'] = contentType || body.type || 'application/octet-stream';
+    payload = body;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    // keepalive: a request that should outlive the page (a preview discarded as she leaves).
+    res = await globalThis.fetch(`${base}${path}`, { method, headers, body: payload, signal: controller.signal, ...(keepalive ? { keepalive: true } : {}) });
+  } catch {
+    throw new CloudOfflineError(); // network down, DNS, CORS-blocked, or the timeout
+  } finally {
+    clearTimeout(timer);
+  }
+  if (res.ok || okStatuses.includes(res.status)) return res;
+  const err = await readError(res);
+  if (err instanceof CloudErasedError && erasedHandler) {
+    const handler = erasedHandler;
+    queueMicrotask(() => { Promise.resolve(handler(token)).catch(() => {}); });
+  }
+  if (err instanceof CloudAccountDeletedError && accountDeletedHandler) {
+    const handler = accountDeletedHandler;
+    queueMicrotask(() => { Promise.resolve(handler(token, err.erase)).catch(() => {}); });
+  }
+  throw err;
+}
+
+// Whatever request first hears device_erased hands its token to this handler
+// (cloudDevices.js registers it), so the erase happens from any call site, not
+// only the check-in. The token is passed because callers drop it on any 401.
+let erasedHandler = null;
+export function setErasedHandler(fn) { erasedHandler = fn; }
+
+// The same for account_deleted (cloudDevices.js registers it): (token, erase).
+let accountDeletedHandler = null;
+export function setAccountDeletedHandler(fn) { accountDeletedHandler = fn; }
+
+const getJson = async (path, opts) => (await send(path, opts)).json();
+
+// --- Auth (no token) -----------------------------------------------------------
+export const startSignIn = (email) => getJson('/auth/start', { method: 'POST', json: { email } });
+
+// → { token, programId, deviceId }
+export const verifyCode = ({ email, code, deviceId, deviceLabel }) =>
+  getJson('/auth/verify', { method: 'POST', json: { email, code, deviceId, deviceLabel } });
+
+// --- Auth (token) --------------------------------------------------------------
+export const signOut = (token) => getJson('/auth/signout', { method: 'POST', token, json: {} });
+// `reauth` = { email, code } when this sign-in is older than 15 minutes (plan §2.5).
+export const signOutOthers = (token, reauth = {}) => getJson('/auth/signout-others', { method: 'POST', token, json: reauth });
+
+// --- Program -------------------------------------------------------------------
+// → { programId, thisDeviceId, backingDevice: {id,label,lastPushAt}|null, latestSnapshotId, latestSnapshot }
+export const getProgram = (token) => getJson('/program', { token });
+export const takeOverBacking = (token) => getJson('/program/backing-device', { method: 'POST', token, json: {} });
+export const deleteAccount = (token, reauth = {}) => getJson('/account', { method: 'DELETE', token, json: { ...reauth, confirm: 'DELETE' } });
+
+// --- The Pro license link (License Link Plan §5) ---------------------------------
+// → { pro, plan, until, source, lapsed, linkedEmails }
+export const getEntitlement = (token) => getJson('/account/entitlement', { token });
+// A code to `email` (a Pro purchase made with another address). Always {ok:true}
+// for a well-formed address; 400 own_email for the account's own.
+export const startLicenseLink = (token, email) => getJson('/account/license-links/start', { method: 'POST', token, json: { email } });
+// → the new entitlement
+export const verifyLicenseLink = (token, { email, code }) =>
+  getJson('/account/license-links/verify', { method: 'POST', token, json: { email, code } });
+export const removeLicenseLinks = (token, reauth = {}) => getJson('/account/license-links', { method: 'DELETE', token, json: reauth });
+
+// --- Devices (plan §2.5) ------------------------------------------------------
+// → { ok, notices: [{ id, level, message, until }] }
+export const checkIn = (token, { licenseInstanceId = null } = {}) =>
+  getJson('/devices/check-in', { method: 'POST', token, json: { licenseInstanceId } });
+// → { devices: [{ id, label, lastSeenAt, status, licenseInstanceId, erase, thisDevice, backing }] }
+export const listDevices = (token) => getJson('/devices', { token });
+// `reauth` = { email, code } when this sign-in is older than 15 minutes
+// (otherwise CloudRequestError 'reauth_required').
+export const eraseDevice = (token, deviceId, reauth = {}) =>
+  getJson(`/devices/${encodeURIComponent(deviceId)}/erase`, { method: 'POST', token, json: reauth });
+export const cancelErase = (token, deviceId) =>
+  getJson(`/devices/${encodeURIComponent(deviceId)}/erase`, { method: 'DELETE', token });
+export const ackErase = (token, { licenseReleased = false } = {}) =>
+  getJson('/devices/erase-ack', { method: 'POST', token, json: { licenseReleased } });
+export const markLicenseReleased = (token, deviceId) =>
+  getJson(`/devices/${encodeURIComponent(deviceId)}/license-released`, { method: 'POST', token, json: {} });
+
+// --- Files (content-addressed) ------------------------------------------------
+export async function hasFile(token, sha256) {
+  const res = await send(`/files/${sha256}`, { method: 'HEAD', token, okStatuses: [404] });
+  return res.status === 200;
+}
+
+export const putFile = (token, sha256, blob, mime) =>
+  send(`/files/${sha256}`, { method: 'PUT', token, body: blob, contentType: mime, timeoutMs: UPLOAD_TIMEOUT_MS }).then((r) => r.json());
+
+export const getFile = (token, sha256) =>
+  send(`/files/${sha256}`, { token, timeoutMs: UPLOAD_TIMEOUT_MS }).then((r) => r.blob());
+
+// --- Snapshots ----------------------------------------------------------------
+// Step one: { base_snapshot_id, size, counts, files: [sha256…] } → { snapshotId }
+export const createSnapshot = (token, description) =>
+  getJson('/snapshots', { method: 'POST', token, json: description });
+
+// Step two: the gzipped envelope.
+export const uploadSnapshotBody = (token, snapshotId, gzBlob) =>
+  send(`/snapshots/${snapshotId}/body`, { method: 'PUT', token, body: gzBlob, contentType: 'application/gzip', timeoutMs: UPLOAD_TIMEOUT_MS })
+    .then((r) => r.json());
+
+// → { snapshots: [{ id, createdAt, size, counts, deviceId, deviceLabel }] }, newest first
+export const listSnapshots = (token) => getJson('/snapshots', { token });
+
+export const getSnapshot = (token, snapshotId) =>
+  send(`/snapshots/${snapshotId}`, { token, timeoutMs: UPLOAD_TIMEOUT_MS }).then((r) => r.blob());
+
+// With the private vault on: the encrypted vault part, uploaded BEFORE the body
+// (Private Vault Plan §6.1). `bytes` is a Uint8Array or Blob.
+export const uploadSnapshotVault = (token, snapshotId, bytes) =>
+  send(`/snapshots/${snapshotId}/vault`, {
+    method: 'PUT', token, body: bytes instanceof Blob ? bytes : new Blob([bytes]),
+    contentType: 'application/octet-stream', timeoutMs: UPLOAD_TIMEOUT_MS
+  }).then((r) => r.json());
+
+export const getSnapshotVault = (token, snapshotId) =>
+  send(`/snapshots/${snapshotId}/vault`, { token, timeoutMs: UPLOAD_TIMEOUT_MS }).then((r) => r.blob());
+
+// --- The private vault (Private Vault Plan §6.1, §6.4) ---------------------------
+// → { enabled, keyId?, createdAt?, wraps: [{ id, kind, label, createdAt, credentialId?, prfSalt? }] }
+export const getVault = (token) => getJson('/vault', { token });
+// → the same shape as getVault. 409 'vault_exists' when another device got there first.
+export const enableVault = (token, { keyId, recoveryWrap }) =>
+  getJson('/vault', { method: 'POST', token, json: { keyId, recoveryWrap } });
+// `reauth` = { email, code } when this sign-in is older than 15 minutes.
+export const disableVault = (token, reauth = {}) => getJson('/vault', { method: 'DELETE', token, json: reauth });
+// → { id, kind, keyId, wrapped, credentialId?, prfSalt? }
+export const getVaultWrap = (token, wrapId) => getJson(`/vault/wraps/${encodeURIComponent(wrapId)}`, { token });
+export const addVaultWrap = (token, wrap) => getJson('/vault/wraps', { method: 'POST', token, json: wrap });
+export const replaceRecoveryWrap = (token, { keyId, wrapped }, reauth = {}) =>
+  getJson('/vault/wraps/recovery', { method: 'PUT', token, json: { keyId, wrapped, ...reauth } });
+export const removeVaultWrap = (token, wrapId, reauth = {}) =>
+  getJson(`/vault/wraps/${encodeURIComponent(wrapId)}`, { method: 'DELETE', token, json: reauth });
+
+// Unlocking from another device (Private Vault Plan §5.3). The new device asks:
+// → { pairingId, expiresAt }. 429 'too_many_pairings' / 'rate_limited'.
+// `autoCode`: an assisted program's automatic pairing (the server keeps it only
+// when the program allows; docs/KennelOS_Assisted_Setup_Plan.md).
+export const createPairing = (token, { publicKey, label = null, autoCode = undefined }) =>
+  getJson('/vault/pairings', { method: 'POST', token, json: { publicKey, label, ...(autoCode ? { autoCode } : {}) } });
+// An unlocked device lists what it can approve:
+// → { pairings: [{ id, deviceLabel, publicKey, createdAt, expiresAt }] }
+export const listPairings = (token) => getJson('/vault/pairings', { token });
+export const approvePairing = (token, pairingId, { approverKey, wrapped, keyId }) =>
+  getJson(`/vault/pairings/${encodeURIComponent(pairingId)}/approve`, { method: 'POST', token, json: { approverKey, wrapped, keyId } });
+// The asking device polls: → { status: 'waiting', expiresAt } or
+// { status: 'approved', approverKey, wrapped, keyId } (once: the row goes as it's read).
+export const pollPairing = (token, pairingId) => getJson(`/vault/pairings/${encodeURIComponent(pairingId)}`, { token });
+
+// Handoff codes (Private Vault Plan §5.4): an unlocked device leaves a one-hour
+// wrap; another device signed in to the account shows the code's proof and gets
+// it, once. → { handoffId, expiresAt } / { keyId, wrapped }; 404 'not_found' for
+// a wrong, used or expired code.
+export const createHandoff = (token, { keyId, wrapped, proof }) =>
+  getJson('/vault/handoffs', { method: 'POST', token, json: { keyId, wrapped, proof } });
+export const redeemHandoff = (token, proof) =>
+  getJson('/vault/handoffs/redeem', { method: 'POST', token, json: { proof } });
+
+// --- Live sync (Cloud Phase 2 plan §6.1) ------------------------------------------
+// enable → { enabled, seq, keyId }; 409 'vault_required'. disable (fresh
+// sign-in, like signout-others). push → { seq, accepted, superseded, dropped }.
+// pull → { records, seq, more, through }; 410 'resync_required' (a
+// CloudRequestError with status 410). Every route but disable: 403 'pro_required'.
+export const enableSync = (token) => getJson('/sync/enable', { method: 'POST', token, json: {} });
+export const disableSync = (token, reauth = {}) => getJson('/sync', { method: 'DELETE', token, json: reauth });
+export const syncHead = (token) => getJson('/sync/head', { token });
+export const pushSync = (token, records) => getJson('/sync/push', { method: 'POST', token, json: { records } });
+export const pullSync = (token, since, limit = 500) =>
+  getJson(`/sync/pull?since=${encodeURIComponent(since)}&limit=${encodeURIComponent(limit)}`, { token });
+export const syncCursor = (token, seq) => getJson('/sync/cursor', { method: 'POST', token, json: { seq } });
+
+// The account-recovery check (Cloud Phase 1 plan §2.7): an unlocked device saves
+// it once; with no device signed in, the recovery code proves the account. The
+// three /recover routes take no token. 400 'no_match' when the check isn't the
+// account's (or it has none saved yet).
+export const saveRecoveryCheck = (token, { keyId, check }) =>
+  getJson('/vault/check', { method: 'PUT', token, json: { keyId, check } });
+export const getRecoveryWrap = (email) => getJson('/recover/wrap', { method: 'POST', json: { email } });
+export const checkRecovery = (email, check) => getJson('/recover/check', { method: 'POST', json: { email, check } });
+export const requestRecoveryEmail = ({ email, check, newEmail, code }) =>
+  getJson('/recover/email', { method: 'POST', json: { email, check, newEmail, code } });
+
+// --- Public -------------------------------------------------------------------
+// Service notices (the shutdown channel). → [{ id, level, message, until }]
+// --- The waitlist online, her side (Waitlist W2 Plan §5) -------------------------------
+export const publishWaitlist = (token, publicId, projection) =>
+  getJson(`/waitlist/projection/${encodeURIComponent(publicId)}`, { method: 'PUT', token, json: { projection } });
+export const readWaitlistInbox = (token, { all = false, after = null } = {}) =>
+  getJson(`/waitlist/inbox${all || after ? `?${new URLSearchParams({ ...(all ? { all: '1' } : {}), ...(after ? { after } : {}) })}` : ''}`, { token });
+export const ackWaitlistInbox = (token, ids) => getJson('/waitlist/inbox/ack', { method: 'POST', token, json: { ids } });
+export const dropWaitlistInbox = (token, ids) => getJson('/waitlist/inbox/drop', { method: 'POST', token, json: { ids } });
+// The server work's lease on a syncing program (Cloud Phase 2 plan §7; serverWork.js):
+// → { mode: 'lease', until } | { mode: 'backing' }; 409 'lease_held' { holder }.
+export const takeWaitlistLease = (token) => getJson('/waitlist/lease', { method: 'POST', token, json: {} });
+export const releaseWaitlistLease = (token) => getJson('/waitlist/lease', { method: 'DELETE', token });
+// → { events: [{ seq, publicId, entryId, kind, payload, basedOnVersion, madeBy, createdAt }], last, more }
+export const readWaitlistEvents = (token, since = 0) => getJson(`/waitlist/events?since=${encodeURIComponent(since)}`, { token });
+export const readWaitlistProjection = (token, publicId) =>
+  getJson(`/waitlist/projection/${encodeURIComponent(publicId)}`, { token });
+// Her preview of one family's status page ("View their page"): → { token, preview, until }.
+// 409 not_published / no_link.
+export const previewWaitlistPage = (token, publicId, entryId) =>
+  getJson('/waitlist/preview', { method: 'POST', token, json: { public_id: publicId, entry_id: entryId } });
+export const unpublishWaitlist = (token, publicId) =>
+  getJson(`/waitlist/projection/${encodeURIComponent(publicId)}`, { method: 'DELETE', token });
+// An email to one family, in the kennel's name (W2 step 6). → { status: 'sent' | 'failed', sentAt }
+// Driving miles between two addresses (Family Requests plan §5): → { miles, minutes }.
+// 503 geo_off when the server has no map key.
+export const getDistance = (token, from, to) => getJson('/geo/distance', { method: 'POST', token, json: { from, to } });
+
+export const sendWaitlistEmail = (token, { id, publicId, entryId, kind, subject, body }) =>
+  getJson('/waitlist/messages', { method: 'POST', token, json: { id, public_id: publicId, entry_id: entryId, kind, subject, body } });
+
+// --- Integrations (Integrations plan §0, step 5) -----------------------------------------
+// → { connections: [{ id, provider, accountRef, scopes, connectedAt }] } (never a token)
+export const listIntegrations = (token) => getJson('/integrations/connections', { token });
+export const disconnectIntegration = (token, id) =>
+  getJson(`/integrations/connections/${encodeURIComponent(id)}`, { method: 'DELETE', token });
+// → { events: [{ seq, provider, kind, recordType, recordId, payload, createdAt }], last, more }
+export const readIntegrationEvents = (token, since = 0) => getJson(`/integrations/events?since=${encodeURIComponent(since)}`, { token });
+
+// E-sign through Firma (Integrations plan §2.3a, step 8). Her workspace on
+// KennelOS's Firma account; every send counts against her monthly limit.
+// → { available, connected, connectedAt, usage: { used, limit, own, resetsOn } }
+export const getFirmaStatus = (token) => getJson('/integrations/firma', { token });
+export const connectFirma = (token, kennelName) => getJson('/integrations/firma/connect', { method: 'POST', token, json: { kennelName } });
+// fields: [{ name, label }], at most 40 a call → { added }
+// `relabel`: names of fields already there whose label the Worker updates to the one given.
+export const syncFirmaFields = (token, fields, relabel = []) => getJson('/integrations/firma/fields', { method: 'POST', token, json: { fields, ...(relabel.length ? { relabel } : {}) } });
+// → { templates: [{ id, name, pageCount }] }
+export const listFirmaTemplates = (token) => getJson('/integrations/firma/templates', { token });
+// document: a base64 PDF → { id, name, pageCount }
+export const createFirmaTemplate = (token, { name, document }) =>
+  getJson('/integrations/firma/templates', { method: 'POST', token, json: { name, document }, timeoutMs: 120 * 1000 });
+// → { token, expiresAt }: Firma's editor token for one of her templates
+export const firmaTemplateToken = (token, templateId) => getJson('/integrations/firma/template-token', { method: 'POST', token, json: { templateId } });
+// The template library (Integrations plan §2.3b): KennelOS's templates offered to her.
+// → { templates: [{ id, name, description, signs, added }] }
+export const listFirmaLibrary = (token) => getJson('/integrations/firma/library', { token });
+// Copy one to her workspace, its prefills pointed at her fields. Call again while
+// `ready` is false. → { id (her copy), name, signs, ready, unmapped, already }
+// `another`: one more copy beside hers, for another kind, named `name`.
+export const addFirmaLibraryTemplate = (token, templateId, { another = false, name = '' } = {}) =>
+  getJson('/integrations/firma/library/add', { method: 'POST', token, json: { templateId, ...(another ? { another: true } : {}), ...(name ? { name } : {}) }, timeoutMs: 60 * 1000 });
+// { contractId, templateId, title, signer: { firstName, lastName, email }, facts, emailSigner, resend }
+// → { signingRequestId, signingLink, usage }
+export const sendForEsign = (token, body) => getJson('/integrations/esign/send', { method: 'POST', token, json: body, timeoutMs: 60 * 1000 });
+// → { url, expiresAt, partial, status }: a short-lived link to the signed PDF
+// A draft of that send, for a read-only preview (never sent, never counted). → { previewId, token, expiresAt }
+export const esignPreview = (token, body) => getJson('/integrations/esign/preview', { method: 'POST', token, json: body, timeoutMs: 60 * 1000 });
+export const discardEsignPreview = (token, id, { keepalive = false } = {}) => getJson(`/integrations/esign/preview?id=${encodeURIComponent(id)}`, { method: 'DELETE', token, keepalive });
+export const esignDocument = (token, ref) => getJson(`/integrations/esign/document?ref=${encodeURIComponent(ref)}`, { token });
+// → { url }: her own signing link on a contract she countersigns (D32), asked for when she taps Countersign
+export const esignCountersign = (token, ref) => getJson(`/integrations/esign/countersign?ref=${encodeURIComponent(ref)}`, { token });
+
+// --- Notifications: app alerts and the email digest (Notifications plan) ------------------
+// → { kinds, push: { available, publicKey, kinds, hideNames, thisDevice, devices },
+//     digest: { available, email, pendingEmail, frequency, kinds } }
+export const getNotifySettings = (token) => getJson('/notify', { token });
+// { push_kinds?, hide_names?, digest_kinds?, digest_frequency?, tz? } → the settings
+export const putNotifySettings = (token, body) => getJson('/notify', { method: 'PUT', token, json: body });
+export const subscribePush = (token, { endpoint, auth }) => getJson('/notify/push/subscribe', { method: 'POST', token, json: { endpoint, auth } });
+export const unsubscribePush = (token) => getJson('/notify/push/unsubscribe', { method: 'POST', token, json: {} });
+// → { ok }
+export const testPush = (token) => getJson('/notify/push/test', { method: 'POST', token, json: {} });
+// Her sign-in address is on at once; another → { pending: true } until verifyDigest.
+export const startDigest = (token, { email, frequency, kinds, tz }) =>
+  getJson('/notify/digest', { method: 'POST', token, json: { email, frequency, kinds, tz } });
+export const verifyDigest = (token, code) => getJson('/notify/digest/verify', { method: 'POST', token, json: { code } });
+export const stopDigest = (token) => getJson('/notify/digest', { method: 'DELETE', token });
+
+export const getNotices = () => getJson('/notice').then((b) => b.notices || []);
+
+// --- Changing the account's email (Phase 1 plan §2.6) ---------------------------
+// → { pending: {requestedAt, effectiveAt, deviceLabel} | null, changedAt }
+export const getEmailChange = (token) => getJson('/account/email', { token });
+// {email, code, oldEmail?, oldCode?} → { status: 'changed' } | { status: 'pending', effectiveAt }.
+// 409 'email_taken'; 400 'same_email', 'invalid_code', 'invalid_old_code'.
+export const changeEmail = (token, body) => getJson('/account/email', { method: 'POST', token, json: body });
+export const cancelEmailChange = (token) => getJson('/account/email', { method: 'DELETE', token });
+
+// --- Assisted setup and help from KennelOS support (docs/KennelOS_Assisted_Setup_Plan.md)
+// → { token, programId, deviceId, role: 'helper', label, state }. 400 'link_expired'.
+export const redeemAssist = ({ token, deviceId, deviceLabel }) =>
+  getJson('/assist/redeem', { method: 'POST', json: { token, deviceId, deviceLabel } });
+// → { role, state: 'setup'|'idle'|'requested'|'helping'|null, label }
+export const getAssistState = (token) => getJson('/assist/state', { token });
+export const assistClaimed = (token) => getJson('/assist/claimed', { method: 'POST', token, json: {} });
+export const requestAssistHelp = (token) => getJson('/assist/help', { method: 'POST', token, json: {} });
+export const endAssistHelp = (token) => getJson('/assist/end', { method: 'POST', token, json: {} });

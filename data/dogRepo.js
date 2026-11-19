@@ -1,0 +1,342 @@
+// dogRepo.js — all Dexie access for the single Dog table (breeding stock,
+// puppies, and external dogs all live here; life-stage changes are `status`
+// updates on the same record, never a new row — CLAUDE.md).
+import { db } from './db.js';
+import { makeRepo, nowIso, newId } from './repoBase.js';
+import { DOG_REFERENCES } from './referenceRegistry.js';
+import { todayYMD } from './dateUtils.js';
+import { enforceDogCap } from './editionConfig.js';
+import { SCOPED_OWNERSHIP, assertOwnKennel } from './kennelScope.js';
+import { splitTitles } from './pedigreeParse.js';
+import { normalizeTitles } from './dogTitles.js';
+
+const base = makeRepo('dogs', DOG_REFERENCES);
+
+// Fields required to save a Dog (Build Brief B1). Everything else — registered
+// name, DOB, registration number — is commonly unknown at entry time.
+const REQUIRED_FIELDS = ['call_name', 'sex', 'breed', 'ownership_type', 'status'];
+const OWNER_REQUIRED_TYPES = ['external', 'leased_in'];
+
+// A dog's portable id (Shared Dogs Plan §3.1): `kosd1_<uuid>`, a different prefix
+// from a kennel's `kos1_` so the two can't be mixed up. Minted when the dog first
+// goes on a Dog Card (data/dogCard.js), received with it on the other side, and
+// write-once after: both apps then name the same dog the same way. Unlike a
+// kennel's, an outside dog (an ancestor) may be given one, since it is only a
+// matching key, not an identity claim on anyone's behalf.
+const DOG_PUBLIC_ID_RE = /^kosd1_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const newDogPublicId = () => `kosd1_${newId()}`;
+export const isDogPublicId = (value) => DOG_PUBLIC_ID_RE.test(String(value ?? '').trim());
+
+// One public id, one dog: a repo guard rather than a unique index, so a clash
+// reaches her as a sentence.
+async function assertDogPublicIdFree(publicId, exceptId) {
+  const clash = await db.dogs.where('public_id').equals(publicId).first();
+  if (clash && clash.id !== exceptId) {
+    throw new Error(`Another dog on this device (“${dogName(clash) || 'unnamed'}”) already has that public ID.`);
+  }
+}
+
+// The name to show for a dog. A pedigree-only ancestor usually has no call name
+// (a pedigree gives registered names), so it shows its registered name instead.
+export const dogName = (d) => (d && (d.call_name || d.registered_name)) || '';
+
+// The order every sire/dam picker lists dogs in: her own (owned, co-owned), then
+// other full dogs (external, leased), then pedigree-only ancestors; A–Z by the
+// name shown within each group, titles in front ignored ("CH Zara" under Z).
+// `label` is the name the picker shows. → [{ key, label, dogs }], empty groups left out.
+export const PICKER_GROUPS = [
+  { key: 'own', label: 'Your dogs' },
+  { key: 'other', label: 'Other dogs' },
+  { key: 'pedigree', label: 'Pedigree only' }
+];
+const sortName = (n) => splitTitles(String(n || '')).name;
+export function pickerGroups(dogs, label = dogName) {
+  const groups = PICKER_GROUPS.map((g) => ({ ...g, dogs: [] }));
+  for (const d of dogs) {
+    const i = d.pedigree_only ? 2 : SCOPED_OWNERSHIP.has(d.ownership_type) ? 0 : 1;
+    groups[i].dogs.push(d);
+  }
+  for (const g of groups) {
+    g.dogs.sort((a, b) => sortName(label(a)).localeCompare(sortName(label(b)), undefined, { sensitivity: 'base', numeric: true }));
+  }
+  return groups.filter((g) => g.dogs.length);
+}
+
+// Registrations beyond the main one (`registry` + `registration_number`): a dog
+// also registered with UKC, CKC, FCI… Each entry is `{ registry,
+// registration_number, registered_name }` (that registry's name for the dog,
+// blank when it's the same). Trimmed; an entry with neither a registry nor a
+// number is dropped.
+export function normalizeRegistrations(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((r) => ({
+      registry: String(r?.registry ?? '').trim(),
+      registration_number: String(r?.registration_number ?? '').trim(),
+      registered_name: String(r?.registered_name ?? '').trim()
+    }))
+    .filter((r) => r.registry || r.registration_number);
+}
+
+// Walk up from a starting parent id and return the set of all ancestor ids.
+// `dogsById` is a Map of the current dog table so the walk is a pure in-memory
+// graph traversal. A `visited` set guards against pre-existing bad cycles in the
+// data so this never infinite-loops.
+function collectAncestors(startId, dogsById) {
+  const ancestors = new Set();
+  const stack = [startId];
+  while (stack.length) {
+    const id = stack.pop();
+    if (id == null || ancestors.has(id)) continue;
+    ancestors.add(id);
+    const dog = dogsById.get(id);
+    if (!dog) continue;
+    if (dog.sire_id) stack.push(dog.sire_id);
+    if (dog.dam_id) stack.push(dog.dam_id);
+  }
+  return ancestors;
+}
+
+// Hard-block validation (Build Brief B1). Softer, interactive rules — sex
+// mismatch on sire/dam, the "leaving deceased" confirmation — are WARN-only and
+// belong to the Stage 2 UI, not here (a repo can't prompt the user).
+async function validateDog(candidate, existingId = null) {
+  for (const f of REQUIRED_FIELDS) {
+    // A pedigree-only dog may go without a call name if it has a registered one.
+    if (f === 'call_name' && candidate.pedigree_only && candidate.registered_name) continue;
+    if (candidate[f] == null || candidate[f] === '') {
+      throw new Error(`Dog: "${f}" is required.`);
+    }
+  }
+
+  if (candidate.date_of_birth && candidate.date_of_birth > todayYMD()) {
+    throw new Error('Dog: date_of_birth cannot be in the future.');
+  }
+
+  if (
+    candidate.date_of_death &&
+    candidate.date_of_birth &&
+    candidate.date_of_death < candidate.date_of_birth
+  ) {
+    throw new Error('Dog: date_of_death cannot be before date_of_birth.');
+  }
+
+  // Pedigree-only dogs (ancestors brought in for lineage, never run as part of the
+  // kennel) are always `external` and exempt from the owner requirement: a
+  // pedigree names a dog, not who owns it today. "Bring into use" clears the flag,
+  // after which the ordinary rules below apply in full.
+  if (candidate.pedigree_only && candidate.ownership_type !== 'external') {
+    throw new Error('Dog: a pedigree-only dog must have ownership "external" — bring it into use first.');
+  }
+
+  if (!candidate.pedigree_only && OWNER_REQUIRED_TYPES.includes(candidate.ownership_type) && !candidate.owner_contact_id) {
+    throw new Error(`Dog: owner_contact_id is required when ownership_type is "${candidate.ownership_type}".`);
+  }
+
+  // Kennel scope (Multi-Kennel Scope Spec §3.1a / §4.3). A dog the user OWNS
+  // belongs to one of their own kennels — required, and it must actually be an
+  // own kennel, or it would be invisible to every scoped view.
+  //
+  // External / leased-in dogs are deliberately exempt: their kennel_id names
+  // somebody ELSE's kennel (the outside stud's home) or nothing at all, and they
+  // are scope-transparent — visible under every kennel — precisely because an
+  // outside dog used by two of the user's kennels belongs to neither.
+  if (SCOPED_OWNERSHIP.has(candidate.ownership_type)) {
+    if (!candidate.kennel_id) {
+      throw new Error('Dog: "kennel_id" is required for a dog you own or co-own.');
+    }
+    await assertOwnKennel(candidate.kennel_id, 'Dog');
+  }
+
+  // Parentage integrity — hard blocks (an undetected cycle would infinite-loop
+  // the pedigree tree renderer later).
+  const selfId = existingId ?? candidate.id;
+  if (selfId && (candidate.sire_id === selfId || candidate.dam_id === selfId)) {
+    throw new Error('Dog: a dog cannot be its own sire or dam.');
+  }
+
+  if (selfId && (candidate.sire_id || candidate.dam_id)) {
+    const allDogs = await db.dogs.toArray();
+    const dogsById = new Map(allDogs.map((d) => [d.id, d]));
+    for (const parentId of [candidate.sire_id, candidate.dam_id]) {
+      if (!parentId) continue;
+      // If this dog already appears in the proposed parent's ancestor chain,
+      // adding the link would create a cycle.
+      if (collectAncestors(parentId, dogsById).has(selfId)) {
+        throw new Error('Dog: this parent would create a pedigree cycle.');
+      }
+    }
+  }
+}
+
+// Disposition is a puppy-only field (vocab.js): the stored record must never
+// carry one unless status is 'puppy'. Enforced centrally here so every writer —
+// the dog form, sale-side disposition offers, CSV import — lands the same
+// invariant, and a life-stage change out of 'puppy' clears any lingering value.
+// additional_registrations and titles (Dog Titles Field Plan §8.0) are normalized,
+// and country_of_origin trimmed, on every write that carries them.
+function withRegistrations(record) {
+  const out = { ...record };
+  if ('additional_registrations' in record) out.additional_registrations = normalizeRegistrations(record.additional_registrations);
+  if ('titles' in record) out.titles = normalizeTitles(record.titles);
+  if ('country_of_origin' in record) out.country_of_origin = String(record.country_of_origin ?? '').replace(/\s+/g, ' ').trim();
+  return out;
+}
+
+// Which co-owner a co-owned dog lives with now (empty: with her). Only a co-owned
+// dog has one, and only one of its own co-owners: a value that stops being either
+// (ownership changed, that co-owner taken off) is cleared, here, for every writer.
+export function livesWithOk(record) {
+  const id = record.lives_with_contact_id;
+  return !id || (record.ownership_type === 'co_owned' && (record.co_owner_contact_ids || []).includes(id));
+}
+
+function nullDispositionIfNotPuppy(record) {
+  return record.status !== 'puppy' && record.disposition != null
+    ? { ...record, disposition: null }
+    : record;
+}
+
+export const dogRepo = {
+  ...base,
+
+  // Pedigree-only dogs (`pedigree_only: true`) are left out of every list by
+  // default, so they never reach a roster, picker, report, cap count or the
+  // waitlist. Only pedigree building asks for them: the pedigree tree and page,
+  // the dog form's Sire/Dam pickers, pedigree import, and the dog CSV import's
+  // matching. getById is unaffected, so links into them still resolve.
+  async getAll({ includeArchived = false, includePedigreeOnly = false } = {}) {
+    const all = await base.getAll({ includeArchived });
+    return includePedigreeOnly ? all : all.filter((d) => !d.pedigree_only);
+  },
+
+  // An ancestor known only from a pedigree: named by its registered name (a call
+  // name only if she knows one), always somebody else's, never on a roster. The
+  // pedigree import, the tidy-up's "just for the pedigree" and Kels's Add dogs.
+  createPedigreeOnly(fields) {
+    return dogRepo.create({
+      call_name: '', ...fields,
+      ownership_type: 'external', status: 'external_reference', pedigree_only: true
+    });
+  },
+
+  async create(data) {
+    data = withRegistrations(data);
+    if (data.public_id) {
+      if (!isDogPublicId(data.public_id)) throw new Error(`Dog: "${data.public_id}" is not a valid KennelOS dog ID.`);
+      data = { ...data, public_id: String(data.public_id).trim() };
+      await assertDogPublicIdFree(data.public_id, null);
+    }
+    await validateDog(data);
+    // Edition cap hook (§3/§4 of the cap spec). Default (Pro/shared) is a no-op;
+    // Lite throws CapExceededError here when adding a new counting dog at the cap.
+    await enforceDogCap({ candidate: data, existing: null, id: null });
+    if (!livesWithOk(data)) data = { ...data, lives_with_contact_id: null };
+    return base.create(nullDispositionIfNotPuppy(data));
+  },
+
+  // `opts.capExcludeIds`: dogs about to go that the cap shouldn't count (a merge's
+  // duplicate, deleted right after this write; review K13-9).
+  async update(id, changes, opts = {}) {
+    const existing = await db.dogs.get(id);
+    if (!existing) throw new Error(`dogs: no record with id ${id}`);
+    changes = withRegistrations(changes);
+    // public_id is write-once: it may be filled in once, never changed or cleared.
+    if ('public_id' in changes) {
+      const incoming = String(changes.public_id ?? '').trim();
+      changes = { ...changes };
+      if (!incoming || incoming === existing.public_id) delete changes.public_id;
+      else if (existing.public_id) throw new Error('A dog’s public ID is permanent and cannot be changed.');
+      else {
+        if (!isDogPublicId(incoming)) throw new Error(`Dog: "${incoming}" is not a valid KennelOS dog ID.`);
+        await assertDogPublicIdFree(incoming, id);
+        changes.public_id = incoming;
+      }
+    }
+    const merged = { ...existing, ...changes };
+    // Validate the merged result so partial updates are checked against the whole.
+    await validateDog(merged, id);
+    // Edition cap hook. Default no-op; Lite blocks a ✗→✓ transition into the
+    // counting set (e.g. a kept puppy maturing to an adult stage) while at cap.
+    await enforceDogCap({ candidate: merged, existing, id, excludeIds: opts.capExcludeIds || [] });
+    // Force disposition null in the write when the resulting status isn't puppy —
+    // covers both an explicit status change and a stale value on an unrelated edit.
+    if (merged.status !== 'puppy' && merged.disposition != null) {
+      changes = { ...changes, disposition: null };
+    }
+    if (!livesWithOk(merged)) changes = { ...changes, lives_with_contact_id: null };
+    return base.update(id, changes);
+  },
+
+  // The Dog Card match key (never the row id). Undefined when no dog has it.
+  async getByPublicId(publicId) {
+    const key = String(publicId ?? '').trim();
+    if (!key) return undefined;
+    return db.dogs.where('public_id').equals(key).first();
+  },
+
+  // A dog's public id, minted (and saved) the first time it goes on a card.
+  async ensurePublicId(id) {
+    const existing = await db.dogs.get(id);
+    if (!existing) throw new Error(`dogs: no record with id ${id}`);
+    if (existing.public_id) return existing.public_id;
+    // Straight to the base update: minting changes nothing the dog rules check, and an
+    // older record that wouldn't pass them today must still go on a card.
+    const publicId = newDogPublicId();
+    await assertDogPublicIdFree(publicId, id);
+    return (await base.update(id, { public_id: publicId })).public_id;
+  },
+
+  // --- Pedigree helpers (pure derivation over sire_id/dam_id) --------------
+  // DELIBERATELY NOT KENNEL-SCOPED (Multi-Kennel Scope Spec §7): the ancestor
+  // and offspring walks cross kennels by definition. Scoping them would
+  // silently truncate lineage — see assets/pedigree.js.
+
+  // Direct children of a dog. Reverse lookups aren't native in Dexie, but both
+  // parent fields are indexed, so this is two cheap index queries.
+  async getChildren(dogId) {
+    const [bySire, byDam] = await Promise.all([
+      db.dogs.where('sire_id').equals(dogId).toArray(),
+      db.dogs.where('dam_id').equals(dogId).toArray()
+    ]);
+    const byId = new Map();
+    for (const d of [...bySire, ...byDam]) byId.set(d.id, d);
+    return [...byId.values()];
+  },
+
+  // Dogs born into a given litter (roster is derived, never stored on Litter).
+  getByLitter(litterId) {
+    return db.dogs.where('litter_id').equals(litterId).toArray();
+  },
+
+  // Distinct breed values already entered — feeds the free-text breed autocomplete
+  // (Build Brief B1).
+  async getBreeds() {
+    const all = await db.dogs.toArray();
+    return [...new Set(all.map((d) => d.breed).filter(Boolean))].sort();
+  },
+
+  // Additive, dedupe-on-write merge into planned_tests (Test Planning Addendum
+  // §5) — the shared mechanism behind "Apply to dogs" and "Copy plan from…".
+  // Never removes a test the breeder pruned; adding an already-present token
+  // (case-insensitive, trimmed) is a no-op.
+  async addPlannedTests(id, tokens) {
+    const existing = await db.dogs.get(id);
+    if (!existing) throw new Error(`dogs: no record with id ${id}`);
+    const current = existing.planned_tests || [];
+    const seen = new Set(current.map((t) => t.trim().toLowerCase()));
+    const merged = [...current];
+    for (const raw of tokens || []) {
+      const trimmed = String(raw ?? '').trim();
+      if (!trimmed || seen.has(trimmed.toLowerCase())) continue;
+      seen.add(trimmed.toLowerCase());
+      merged.push(trimmed);
+    }
+    return dogRepo.update(id, { planned_tests: merged });
+  }
+};
+
+// Re-export so callers can `import { ReferenceBlockedError } from './dogRepo.js'`
+// alongside the repo if they prefer.
+export { ReferenceBlockedError } from './repoBase.js';
+export { nowIso };

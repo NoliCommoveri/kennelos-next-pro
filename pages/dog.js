@@ -1,0 +1,1799 @@
+// dog.js — Dog Detail (Profile section). Edit-in-place: view mode is read-only
+// until "Edit" unlocks the fields; ?new=1 starts in create mode. Enforces the
+// Build Brief B1 rules — hard blocks come from dogRepo (required fields, dates,
+// cycles), soft/interactive ones (sex mismatch warn, the deceased confirmations)
+// live here because they need the user.
+import { dogRepo, ReferenceBlockedError, dogName as nameOf } from '../data/dogRepo.js';
+import { CapExceededError } from '../data/repoBase.js';
+import { contactRepo } from '../data/contactRepo.js';
+import { litterRepo } from '../data/litterRepo.js';
+import { pairingRepo } from '../data/pairingRepo.js';
+import { offerKeeperTests } from '../assets/keeperTests.js';
+import { kennelRepo, seedTestsKennel } from '../data/kennelRepo.js';
+import { breedChoices } from '../data/dogSearch.js';
+import { eventRepo, testTokensOf, testMatchTokensOf } from '../data/eventRepo.js';
+import { TEST_TYPES, testTypeFor, testPrefill } from '../data/healthTestLog.js';
+import { saleRepo } from '../data/saleRepo.js';
+import { studServiceRepo } from '../data/studServiceRepo.js';
+import { pickPupDefaults } from '../data/studRules.js';
+import { contractRepo } from '../data/contractRepo.js';
+import { getMyContactId } from '../data/kennelSetup.js';
+import { editionFlags, dogCapStatus } from '../data/editionConfig.js';
+import { websiteLinkOffered } from '../data/kennelportApi.js';
+import { getActiveKennelId, resolveKennelIdForWrite, SCOPED_OWNERSHIP } from '../data/kennelScope.js';
+import { renderDogScopeNotice } from '../assets/kennelScopeUI.js';
+import {
+  SEX, DOG_STATUS, DISPOSITION, OWNERSHIP_TYPE, PAIRING_TYPE, PAIRING_STATUS,
+  REGISTRATION_TYPE, SALE_STATUS, STUD_SERVICE_DIRECTION, STUD_SERVICE_STATUS,
+  LITTER_STATUS, LITTER_DELIVERY_TYPE, WHELPED_OR_LATER, EVENT_TYPES, descriptor, COI_METHOD_SUGGESTIONS, CONTRACT_TYPE, CONTRACT_STATUS,
+  SHOW_ENTRY_STATUS, TITLE_TRACKS, PARENT_TESTS_SHOWN
+} from '../data/vocab.js';
+import { isWaitlistOnlineOffered } from '../data/cloud/cloudConfig.js';
+import { getShowRecord } from '../data/showPoints.js';
+import { titlesOf, displayName, formTitleChips, titleSuggestions, splitTitleInput, MAX_ABBR, MAX_ORGANIZATION } from '../data/dogTitles.js';
+import { esc, safeHref, badge, fmtDate, fmtMoney, todayYMD, param, confirmModal, dogRefHtml, dogOptgroups } from '../assets/ui.js';
+import { priceForRegistrationChange } from '../data/saleDefaults.js';
+import { askRegistrationPrice } from '../assets/salePrompts.js';
+import { renderUpgradeNudge } from '../assets/upgradeNudge.js';
+import { renderTimeline } from '../assets/timeline.js';
+import { renderExpensePanel } from '../assets/expensePanel.js';
+import { openEventForm, openEventFromQuery } from '../assets/eventForm.js';
+import { renderPedigree } from '../assets/pedigree.js';
+
+const OWNER_REQUIRED = ['external', 'leased_in'];
+
+const els = {
+  title: document.getElementById('dog-title'),
+  subtitle: document.getElementById('dog-subtitle'),
+  capBanner: document.getElementById('dog-cap-banner'),
+  headerActions: document.getElementById('header-actions'),
+  profileActions: document.getElementById('profile-actions'),
+  body: document.getElementById('profile-body'),
+  error: document.getElementById('page-error'),
+  recordedCoi: document.getElementById('recorded-coi-section'),
+  plannedTests: document.getElementById('planned-tests-section'),
+  healthTests: document.getElementById('health-tests-section'),
+  showRecord: document.getElementById('show-record-section'),
+  timeline: document.getElementById('timeline-section'),
+  expenses: document.getElementById('expenses-section'),
+  pairings: document.getElementById('pairings-section'),
+  sales: document.getElementById('sales-section'),
+  studServices: document.getElementById('stud-services-section'),
+  contracts: document.getElementById('contracts-section'),
+  litters: document.getElementById('litters-section'),
+  pedigree: document.getElementById('pedigree-section')
+};
+
+const blankDog = () => ({
+  call_name: '', registered_name: '', sex: '', date_of_birth: '', dob_is_estimated: false,
+  date_of_death: '', breed: '', color_markings: '', registry: '', registration_number: '',
+  microchip_id: '', url: '', photos_online: false, show_on_website: false, heats_online: false, sire_id: '', dam_id: '', ownership_type: '', owner_contact_id: '',
+  co_owner_contact_ids: [], lives_with_contact_id: '', litter_id: '', breeder_kennel_id: '', kennel_id: '', status: '', status_date: '', disposition: '', intended_registration: '', notes: '',
+  planned_tests: [], additional_registrations: [], imported: false, import_country: '',
+  titles: [], country_of_origin: ''
+});
+
+const ctx = {
+  mode: 'view',        // 'new' | 'view' | 'edit'
+  bringIn: false,      // editing a pedigree-only dog to bring it into regular use
+  original: null,      // saved record (null in new mode)
+  draft: null,         // working copy while editing
+  coiEditing: false,   // Recorded COI panel has its own inline edit toggle
+  plannedTestsAddOpen: false, // Planned Tests add/copy controls toggle (survives re-render after an add)
+  pickerArchived: false,
+  allDogs: [],
+  allContacts: [],
+  allLitters: [],
+  allKennels: [],
+  breeds: [],
+  titleEvents: [],     // the dog's title_earned events while editing (the Titles row's read-only chips)
+  dogsById: new Map(),
+  contactsById: new Map(),
+  littersById: new Map(),
+  kennelsById: new Map(),
+  // Collapsible card state — tracks which cards are expanded
+  expandedCards: new Set()
+};
+
+// Helper to create a collapsible card. The card auto-collapses when empty.
+// If hasContent is false, the card starts collapsed with an empty badge.
+// The toggle button for the card should be passed in headerButton.
+function renderCollapsibleCard(title, bodyHtml, headerButton = '', { sectionKey = '', hasContent = true } = {}) {
+  const isExpanded = ctx.expandedCards.has(sectionKey) || hasContent;
+  const toggleId = `${sectionKey}-toggle`;
+
+  return `
+    <section class="card" style="margin-top:16px;">
+      <div class="row-between">
+        <div class="collapsible-header" style="flex: 1; display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;" data-toggle="${toggleId}">
+          <span class="collapsible-arrow" style="transform: rotate(${isExpanded ? '90deg' : '0deg'}); display: inline-block; transition: transform 0.2s; font-size: 12px;">▶</span>
+          <h2 style="margin:0;">${esc(title)}${!hasContent ? ' <span class="badge badge-gray">empty</span>' : ''}</h2>
+        </div>
+        <div id="${toggleId}-actions" class="pill-row">${headerButton}</div>
+      </div>
+      <div class="collapsible-content" id="${toggleId}-content" style="display: ${isExpanded ? 'block' : 'none'}; margin-top:12px;">
+        ${bodyHtml}
+      </div>
+    </section>`;
+}
+
+// Setup collapsible functionality for a card
+function setupCollapsibleCard(sectionKey) {
+  const toggleId = `${sectionKey}-toggle`;
+  const header = document.querySelector(`[data-toggle="${toggleId}"]`);
+  const content = document.getElementById(`${toggleId}-content`);
+  const arrow = header?.querySelector('.collapsible-arrow');
+
+  if (!header || !content) return;
+
+  header.addEventListener('click', () => {
+    const isExpanded = ctx.expandedCards.has(sectionKey);
+    if (isExpanded) {
+      ctx.expandedCards.delete(sectionKey);
+      content.style.display = 'none';
+      if (arrow) arrow.style.transform = 'rotate(0deg)';
+    } else {
+      ctx.expandedCards.add(sectionKey);
+      content.style.display = 'block';
+      if (arrow) arrow.style.transform = 'rotate(90deg)';
+    }
+  });
+}
+
+// --- Data loading --------------------------------------------------------
+async function loadRefs() {
+  const [dogs, contacts, litters, kennels, breedPool] = await Promise.all([
+    // Pedigree-only ancestors included: they name a sire/dam and fill the
+    // Sire/Dam pickers (pedigree building). Nothing else on this page lists them.
+    dogRepo.getAll({ includeArchived: true, includePedigreeOnly: true }),
+    contactRepo.getAll({ includeArchived: true }),
+    litterRepo.getAll({ includeArchived: true }),
+    kennelRepo.getAll({ includeArchived: true }),
+    kennelRepo.getBreedVocabulary()
+  ]);
+  ctx.allDogs = dogs;
+  ctx.allContacts = contacts;
+  ctx.allLitters = litters;
+  ctx.allKennels = kennels;
+  // Breed autocomplete = breeds already on dogs UNION the kennel breed pool
+  // (Test Planning Addendum §8) — the pool is what lets a seeded breed suggest
+  // before the first dog exists. dogSearch.breedChoices, Kels's breed picker too.
+  ctx.breeds = breedChoices({ dogs, pool: breedPool });
+  ctx.dogsById = new Map(dogs.map((d) => [d.id, d]));
+  ctx.contactsById = new Map(contacts.map((c) => [c.id, c]));
+  ctx.littersById = new Map(litters.map((l) => [l.id, l]));
+  ctx.kennelsById = new Map(kennels.map((k) => [k.id, k]));
+}
+
+// The one kennel to silently prefill kennel_id with, when exactly one of the
+// user's own kennels exists (Own-Kennel Identity addendum §4). With zero or
+// 2+ own kennels, the field is left for the user to pick/leave blank.
+function ownKennelChoices() {
+  return ctx.allKennels.filter((k) => k.is_own_kennel && !k.is_archived);
+}
+
+// The kennel to prefill kennel_id with on a dog the user owns. The active scope
+// wins when one is set (Multi-Kennel Scope Spec §6); otherwise the sole own
+// kennel, when there is exactly one. With 2+ own kennels and no active scope
+// there is nothing to prefill and the (required) picker is left for the user —
+// the same "don't guess" posture this had before scope existed.
+function preferredOwnKennelId() {
+  const owned = ownKennelChoices();
+  const activeId = getActiveKennelId();
+  if (activeId && owned.some((k) => k.id === activeId)) return activeId;
+  return owned.length === 1 ? owned[0].id : null;
+}
+
+function dogName(id) {
+  const d = ctx.dogsById.get(id);
+  return d ? (d.call_name ? d.call_name + (d.registered_name ? ` (${d.registered_name})` : '') : nameOf(d)) : '';
+}
+// Read-only dog reference → a link to that dog's detail page. Returns '' when the
+// id doesn't resolve, so row() falls back to its faint dash. Escapes the name.
+function dogLink(id) {
+  const name = dogName(id);
+  if (!name) return '';
+  return dogRefHtml(id, name, ctx.dogsById.get(id)?.is_archived);
+}
+function contactName(id) {
+  const c = ctx.contactsById.get(id);
+  return c ? c.name : '';
+}
+function kennelName(id) {
+  const k = ctx.kennelsById.get(id);
+  return k ? k.kennel_name : '';
+}
+// A litter's human label: "Dam × Sire (whelp date)".
+function litterLabel(id) {
+  const l = ctx.littersById.get(id);
+  if (!l) return '';
+  const dam = nameOf(ctx.dogsById.get(l.dam_id)) || '—';
+  const sire = nameOf(ctx.dogsById.get(l.sire_id)) || '—';
+  return `${dam} × ${sire}${l.whelp_date ? ` (${fmtDate(l.whelp_date)})` : ''}`;
+}
+function litterOptions(current) {
+  const opts = ctx.allLitters
+    .filter((l) => ctx.pickerArchived || !l.is_archived || l.id === current)
+    .map((l) => `<option value="${esc(l.id)}"${l.id === current ? ' selected' : ''}>${esc(litterLabel(l.id))}${l.is_archived ? ' (archived)' : ''}</option>`)
+    .join('');
+  return `<option value="">— none —</option>` + opts;
+}
+
+// --- Option builders -----------------------------------------------------
+function vocabOptions(vocab, current, placeholder) {
+  const head = placeholder != null ? `<option value="">${esc(placeholder)}</option>` : '';
+  return head + vocab.map((v) =>
+    `<option value="${esc(v.value)}"${v.value === current ? ' selected' : ''}>${esc(v.label)}</option>`
+  ).join('');
+}
+
+// `sex`, when given, limits the list to that sex (plus "unknown" — a real gap
+// in the data, not grounds to make the dog unselectable). The current
+// selection always stays in the list even if it doesn't match, so an existing
+// mismatched record stays visible/editable (updateWarnings flags it instead).
+// Grouped and ordered by pickerGroups: her dogs, other dogs, pedigree only, A–Z.
+function dogOptions(current, excludeId, sex) {
+  const dogs = ctx.allDogs
+    .filter((d) => d.id !== excludeId && (ctx.pickerArchived || !d.is_archived))
+    .filter((d) => !sex || d.id === current || d.sex === sex || d.sex === 'unknown');
+  const opt = (d) => `<option value="${esc(d.id)}"${d.id === current ? ' selected' : ''}>${esc(nameOf(d))}${d.call_name && d.registered_name && d.registered_name !== d.call_name ? ' — ' + esc(d.registered_name) : ''}${d.is_archived ? ' (archived)' : ''}</option>`;
+  return `<option value="">— none —</option>` + dogOptgroups(dogs, opt, nameOf);
+}
+
+function contactOptions(current) {
+  const opts = ctx.allContacts
+    .filter((c) => ctx.pickerArchived || !c.is_archived)
+    .map((c) => `<option value="${esc(c.id)}"${c.id === current ? ' selected' : ''}>${esc(c.name)}${c.is_archived ? ' (archived)' : ''}</option>`)
+    .join('');
+  return `<option value="">— none —</option>` + opts;
+}
+
+// Ownership-dependent (Multi-Kennel Scope Spec §3.1a):
+//  - a dog you OWN or CO-OWN belongs to one of YOUR OWN kennels, and must — this
+//    is its kennel scope, so an outside kennel here would make it invisible to
+//    every scoped view. Own kennels only, and no "— none —" to pick.
+//  - an external / leased-in dog may name an OUTSIDE kennel (its real home) or
+//    none at all: it is scope-transparent either way, so every kennel is offered.
+function kennelOptions(current, ownershipType) {
+  const mustBeOwn = SCOPED_OWNERSHIP.has(ownershipType);
+  const opts = ctx.allKennels
+    .filter((k) => (mustBeOwn ? k.is_own_kennel : true))
+    .filter((k) => ctx.pickerArchived || !k.is_archived || k.id === current)
+    .map((k) => `<option value="${esc(k.id)}"${k.id === current ? ' selected' : ''}>${esc(k.kennel_name)}${k.is_own_kennel ? ' — My kennel' : ''}${k.is_archived ? ' (archived)' : ''}</option>`)
+    .join('');
+  return (mustBeOwn ? `<option value="">— select —</option>` : `<option value="">— none —</option>`) + opts;
+}
+
+// Unlike kennelOptions() above, the breeder-kennel picker isn't limited to your
+// own kennels — the whole point is naming an outside contact's kennel for a dog
+// you acquired rather than bred yourself.
+function breederKennelOptions(current) {
+  const opts = ctx.allKennels
+    .filter((k) => ctx.pickerArchived || !k.is_archived || k.id === current)
+    .map((k) => `<option value="${esc(k.id)}"${k.id === current ? ' selected' : ''}>${esc(k.kennel_name)}${k.is_own_kennel ? ' — My kennel' : ''}${k.is_archived ? ' (archived)' : ''}</option>`)
+    .join('');
+  return `<option value="">— none —</option>` + opts;
+}
+
+// --- Rendering: read-only view ------------------------------------------
+function row(label, valueHtml) {
+  return valueHtml ? `<dt>${esc(label)}</dt><dd>${valueHtml}</dd>` : '';
+}
+
+function renderView() {
+  const d = ctx.original;
+  const coOwners = (d.co_owner_contact_ids || []).map((id) => esc(contactName(id))).filter(Boolean).join(', ');
+  els.body.innerHTML = `
+    <dl class="dl-meta" style="margin-top:14px;">
+      ${row('Call name', esc(d.call_name))}
+      ${row('Registered name', esc(d.registered_name))}
+      ${row('Sex', badge(SEX, d.sex))}
+      ${row('Breed', esc(d.breed))}
+      ${row('Date of birth', d.date_of_birth ? esc(fmtDate(d.date_of_birth)) + (d.dob_is_estimated ? ' <span class="faint">(est.)</span>' : '') : '')}
+      ${row('Date of death', d.date_of_death ? esc(fmtDate(d.date_of_death)) : '')}
+      ${row('Color / markings', esc(d.color_markings))}
+      ${row('Registry', esc(d.registry))}
+      ${row('Registration #', esc(d.registration_number))}
+      ${row('Other registrations', otherRegistrationsHtml(d.additional_registrations))}
+      ${row('Imported', d.imported ? 'Yes' : '')}
+      ${row('Country of origin', esc(countryOfOrigin(d)))}
+      ${row('Microchip', esc(d.microchip_id))}
+      ${row('URL', d.url ? `<a href="${esc(safeHref(d.url))}" target="_blank" rel="noopener noreferrer">${esc(d.url)}</a>${editionFlags.waitlist && d.photos_online ? ' <span class="badge badge-blue">Shown on waitlist pages</span>' : ''}` : '')}
+      ${websiteLinkOffered() && (d.show_on_website || d.heats_online) ? row('Your website', `${d.show_on_website ? '<span class="badge badge-blue">Shown on website</span> ' : ''}${d.heats_online ? '<span class="badge badge-neutral">Heats shown</span>' : ''}`) : ''}
+      ${row('Sire', dogLink(d.sire_id))}
+      ${row('Dam', dogLink(d.dam_id))}
+      ${row('Litter', d.litter_id ? `<a href="litter.html?id=${encodeURIComponent(d.litter_id)}">${esc(litterLabel(d.litter_id) || 'View litter')}</a>` : '')}
+      ${row('Breeder kennel', esc(kennelName(d.breeder_kennel_id)))}
+      ${d.pedigree_only ? '' : `${row('Ownership', badge(OWNERSHIP_TYPE, d.ownership_type))}
+      ${row('Owner', esc(contactName(d.owner_contact_id)))}
+      ${row('Co-owners', coOwners)}
+      ${d.ownership_type === 'co_owned' ? row('Lives with', d.lives_with_contact_id ? esc(contactName(d.lives_with_contact_id)) : 'You') : ''}
+      ${row('Kennel', esc(kennelName(d.kennel_id)))}
+      ${row('Status', badge(DOG_STATUS, d.status) + (d.status_date ? ` <span class="faint">since ${esc(fmtDate(d.status_date))}</span>` : ''))}`}
+      ${d.status === 'puppy' ? row('Disposition', d.disposition ? badge(DISPOSITION, d.disposition) : '') : ''}
+      ${d.status === 'puppy' ? row('Intended registration', d.intended_registration ? badge(REGISTRATION_TYPE, d.intended_registration) : '') : ''}
+      ${row('Notes', d.notes ? esc(d.notes).replace(/\n/g, '<br>') : '')}
+    </dl>`;
+}
+
+// Country of origin (Dog Titles Field Plan D8): the field, else the import
+// country an older record carries while Imported is ticked.
+function countryOfOrigin(d) {
+  return String(d?.country_of_origin || '').trim() || (d?.imported ? String(d.import_country || '').trim() : '');
+}
+
+// A dog's additional registrations, one per line: "UKC · P123-456 · Registered as …".
+function otherRegistrationsHtml(list) {
+  return (list || [])
+    .filter((r) => r && (r.registry || r.registration_number))
+    .map((r) => [r.registry, r.registration_number].filter(Boolean).map(esc).join(' · ')
+      + (r.registered_name ? ` <span class="faint">· registered as ${esc(r.registered_name)}</span>` : ''))
+    .join('<br>');
+}
+
+// --- Rendering: edit form ------------------------------------------------
+function field(label, inner, { required = false, hint = '', wide = false } = {}) {
+  return `<div class="field${wide ? ' field-wide' : ''}">
+    <label>${esc(label)}${required ? ' <span class="req">*</span>' : ''}</label>
+    ${inner}
+    ${hint ? `<span class="field-hint">${esc(hint)}</span>` : ''}
+  </div>`;
+}
+
+// An optional date with a Clear button beside it. Some browsers (Safari on
+// iPhone/iPad above all) give a date input no way to empty it once a date is
+// picked, so a date entered by mistake would otherwise be stuck.
+function clearableDate(input, id) {
+  return `<div style="display:flex;gap:6px;align-items:center;">${input}<button type="button" class="btn btn-sm" data-date-clear="${esc(id)}">Clear</button></div>`;
+}
+
+function renderEdit() {
+  const d = ctx.draft;
+  const breedList = ctx.breeds.map((b) => `<option value="${esc(b)}"></option>`).join('');
+  const coSelected = new Set(d.co_owner_contact_ids || []);
+  const coOptions = ctx.allContacts
+    .filter((c) => ctx.pickerArchived || !c.is_archived || coSelected.has(c.id))
+    .map((c) => `<option value="${esc(c.id)}"${coSelected.has(c.id) ? ' selected' : ''}>${esc(c.name)}${c.is_archived ? ' (archived)' : ''}</option>`)
+    .join('');
+
+  els.body.innerHTML = `
+    <div class="form-grid" id="dog-form" style="margin-top:14px;">
+      ${field('Call name', `<input id="f-call_name" type="text" value="${esc(d.call_name)}">`, isPedigreeOnlyEdit() ? { hint: 'Optional for a pedigree-only dog — its registered name is shown instead.' } : { required: true })}
+      ${field('Registered name', `<input id="f-registered_name" type="text" value="${esc(d.registered_name)}">`)}
+      ${field('Sex', `<select id="f-sex">${vocabOptions(SEX, d.sex, 'Select…')}</select>`, { required: true })}
+      ${field('Breed', `<input id="f-breed" type="text" list="breed-list" value="${esc(d.breed)}"><datalist id="breed-list">${breedList}</datalist>`, { required: true, hint: 'Type freely; suggestions come from breeds already entered or seeded from a kennel test import.' })}
+      ${field('Date of birth', clearableDate(`<input id="f-date_of_birth" type="date" max="${todayYMD()}" value="${esc(d.date_of_birth)}">`, 'f-date_of_birth'))}
+      ${field('DOB estimated', `<label class="check-inline"><input id="f-dob_is_estimated" type="checkbox"${d.dob_is_estimated ? ' checked' : ''}> approximate</label>`)}
+      ${field('Date of death', clearableDate(`<input id="f-date_of_death" type="date" value="${esc(d.date_of_death)}">`, 'f-date_of_death'))}
+      ${field('Color / markings', `<input id="f-color_markings" type="text" value="${esc(d.color_markings)}">`)}
+      ${field('Registry', `<input id="f-registry" type="text" value="${esc(d.registry)}">`)}
+      ${field('Registration #', `<input id="f-registration_number" type="text" value="${esc(d.registration_number)}">`)}
+      ${registrationsEditor(d.additional_registrations)}
+      ${titlesEditor(d)}
+      ${field('Imported', `<label class="check-inline"><input id="f-imported" type="checkbox"${d.imported ? ' checked' : ''}> Imported from another country</label>`)}
+      ${field('Country of origin', `<input id="f-country_of_origin" type="text" value="${esc(d.country_of_origin || '')}" maxlength="60">`, { hint: 'The country this dog was born or first registered in. While Imported is ticked, it\'s also the country it was imported from.' })}
+      ${field('Microchip', `<input id="f-microchip_id" type="text" value="${esc(d.microchip_id)}">`)}
+      ${field('URL', `<input id="f-url" type="url" value="${esc(d.url || '')}" placeholder="https://…">`, { hint: 'A link to this dog\'s photos (an album, a gallery page).' })}
+      ${editionFlags.waitlist ? field('Photos online', `<label class="check-inline"><input id="f-photos_online" type="checkbox"${d.photos_online ? ' checked' : ''}> Show the URL as a photos link on waitlist pages</label>`, { hint: 'Families see it as a parent of a litter (public list and family pages) and as a pup on their turn or their pick. Off until you tick it.' }) : ''}
+      ${websiteLinkOffered() ? field('Your website', `<label class="check-inline"><input id="f-show_on_website" type="checkbox"${d.show_on_website ? ' checked' : ''}> Show on website</label><label class="check-inline"><input id="f-heats_online" type="checkbox"${d.heats_online ? ' checked' : ''}> Her coming heats may show (the month only)</label>`, { hint: 'This dog gets a page on your KennelPort website when you next press Update website (Settings). Heats are for a dam: each heat you log ahead shows as its month until a pairing takes its place.' }) : ''}
+      ${field('Ownership', `<select id="f-ownership_type">${vocabOptions(editionFlags.externalOwnership ? OWNERSHIP_TYPE : OWNERSHIP_TYPE.filter((o) => ['owned', 'co_owned'].includes(o.value)), d.ownership_type, 'Select…')}</select>`, { required: true })}
+      ${field('Status', `<select id="f-status">${vocabOptions(editionFlags.fullDogStatuses ? DOG_STATUS : DOG_STATUS.filter((o) => ['puppy', 'active_breeding', 'retired_breeding', 'deceased'].includes(o.value)), d.status, 'Select…')}</select>`, { required: true })}
+      ${d.status === 'puppy' ? field('Disposition', `<select id="f-disposition">${vocabOptions(DISPOSITION, d.disposition || 'undecided')}</select>`, { hint: 'Keeping this puppy or offering it? Drives the prospective-families view. Puppy-only — clears when Status moves past Puppy.' }) : ''}
+      ${d.status === 'puppy' ? field('Intended registration', `<select id="f-intended_registration">${vocabOptions(REGISTRATION_TYPE, d.intended_registration || '', 'Not decided')}</select>`, { hint: 'Limited, Full, Co-own or None. Prefills a sale\'s registration (Full adds the litter\'s surcharge to the price)' + (editionFlags.waitlist ? ', and the waitlist only offers this pup to families whose purposes fit it. Leave as Not decided to offer it to everyone.' : '.') }) : ''}
+      ${field('Sire', `<select id="f-sire_id">${dogOptions(d.sire_id, ctx.original?.id, 'male')}</select>`)}
+      ${field('Dam', `<select id="f-dam_id">${dogOptions(d.dam_id, ctx.original?.id, 'female')}</select>`)}
+      ${field('Litter', `<select id="f-litter_id">${litterOptions(d.litter_id)}</select>`, { hint: 'The litter this dog was born into, if born in-house.' })}
+      ${field('Breeder kennel', `<select id="f-breeder_kennel_id">${breederKennelOptions(d.breeder_kennel_id)}</select>`, { hint: 'The kennel that produced this dog — your own for an in-house litter, or an outside kennel for a dog you acquired.' })}
+      ${field('Owner', `<select id="f-owner_contact_id">${contactOptions(d.owner_contact_id)}</select>`, { hint: 'Required for external / leased-in dogs.' })}
+      ${field('Co-owners', `<select id="f-co_owner_contact_ids" multiple size="4">${coOptions}</select>`, { hint: 'Ctrl/Cmd-click to select multiple.' })}
+      ${d.ownership_type === 'co_owned' ? field('Lives with', `<select id="f-lives_with_contact_id"><option value="">Me</option>${[...coSelected].map((id) => `<option value="${esc(id)}"${id === d.lives_with_contact_id ? ' selected' : ''}>${esc(contactName(id) || 'A co-owner')}</option>`).join('')}</select>`, {
+        hint: websiteLinkOffered() ? 'Where this dog lives now. Living with a co-owner, it shows only under Co-owned on your website, with their kennel when you name it; living with you, like your own dogs.' : 'Where this dog lives now.'
+      }) : ''}
+      ${editionFlags.multiKennel ? field('Kennel', `<select id="f-kennel_id">${kennelOptions(d.kennel_id, d.ownership_type)}</select>`, {
+        required: SCOPED_OWNERSHIP.has(d.ownership_type),
+        hint: SCOPED_OWNERSHIP.has(d.ownership_type)
+          ? 'Which of your kennels this dog belongs to. Required for a dog you own.'
+          : 'The kennel this dog belongs to — leave blank, or name the outside kennel it comes from.'
+      }) : ''}
+      ${editionFlags.includeArchivedToggles ? `<div class="field field-wide">
+        <label class="check-inline"><input id="picker-archived" type="checkbox"${ctx.pickerArchived ? ' checked' : ''}> Include archived dogs/contacts/kennels in the pickers above</label>
+      </div>` : ''}
+      ${field('Notes', `<textarea id="f-notes">${esc(d.notes)}</textarea>`, { wide: true })}
+    </div>
+    <div id="form-warn"></div>`;
+
+  wireTitlesEditor();
+
+  // Lives with offers the co-owners chosen above: re-draw as they change.
+  document.getElementById('f-co_owner_contact_ids')?.addEventListener('change', () => {
+    if (ctx.draft.ownership_type !== 'co_owned') return;
+    ctx.draft = readForm();
+    renderEdit();
+  });
+
+  if (isPedigreeOnlyEdit()) {
+    for (const id of ['f-ownership_type', 'f-status', 'f-owner_contact_id', 'f-co_owner_contact_ids', 'f-lives_with_contact_id', 'f-kennel_id']) {
+      const f = document.getElementById(id)?.closest('.field');
+      if (f) f.hidden = true;
+    }
+  }
+
+  const form = document.getElementById('dog-form');
+  form.querySelectorAll('[data-date-clear]').forEach((btn) => btn.addEventListener('click', () => {
+    const input = document.getElementById(btn.dataset.dateClear);
+    if (input) { input.value = ''; input.dispatchEvent(new Event('change', { bubbles: true })); }
+  }));
+  document.getElementById('reg-add').addEventListener('click', () => {
+    ctx.draft = readForm();
+    ctx.draft.additional_registrations = [...ctx.draft.additional_registrations, { registry: '', registration_number: '', registered_name: '' }];
+    renderEdit();
+    [...document.querySelectorAll('#f-additional_registrations .reg-registry')].pop()?.focus();
+  });
+  form.querySelectorAll('[data-reg-remove]').forEach((btn) => btn.addEventListener('click', () => {
+    ctx.draft = readForm();
+    const i = Number(btn.dataset.regRemove);
+    ctx.draft.additional_registrations = ctx.draft.additional_registrations.filter((_, j) => j !== i);
+    renderEdit();
+  }));
+  form.addEventListener('input', updateWarnings);
+  form.addEventListener('change', updateWarnings);
+  document.getElementById('picker-archived')?.addEventListener('change', (e) => {
+    ctx.draft = readForm();
+    ctx.pickerArchived = e.target.checked;
+    renderEdit();
+    renderProfileActions();
+  });
+  // Convenience: switching Ownership to "Owned" prefills Owner with your own
+  // kennel-setup contact, if one is set and Owner is still empty. Switching to
+  // "Owned"/"Co-owned" also prefills Kennel with the sole own-kennel, if there's
+  // exactly one. Both are prefills only — never override a value already chosen.
+  document.getElementById('f-ownership_type').addEventListener('change', (e) => {
+    ctx.draft = readForm();
+    if (e.target.value === 'owned' && !ctx.draft.owner_contact_id) {
+      const myContactId = getMyContactId();
+      if (myContactId && ctx.contactsById.has(myContactId)) ctx.draft.owner_contact_id = myContactId;
+    }
+    if (SCOPED_OWNERSHIP.has(e.target.value) && !ctx.draft.kennel_id) {
+      const preferred = preferredOwnKennelId();
+      if (preferred) ctx.draft.kennel_id = preferred;
+    }
+    // Switching AWAY from an owned type can leave an own-kennel id that the
+    // now-wider picker still offers — harmless — but switching TO one can leave an
+    // OUTSIDE kennel selected, which the picker no longer offers and the repo
+    // would reject. Drop it so the required picker re-prompts.
+    if (SCOPED_OWNERSHIP.has(e.target.value) && ctx.draft.kennel_id
+        && !ctx.kennelsById.get(ctx.draft.kennel_id)?.is_own_kennel) {
+      ctx.draft.kennel_id = preferredOwnKennelId() || '';
+    }
+    renderEdit();
+  });
+  // Convenience: linking a Litter prefills Date of birth from the litter's
+  // whelp date, if DOB is still empty — a prefill only, never an override. A
+  // DOB that already conflicts with the litter's whelp date surfaces as an
+  // actionable warning instead (updateWarnings). It also prefills Breeder
+  // kennel from the litter's dam — but only when the dam is your own dog
+  // (owned/co-owned); a litter whose dam belongs to someone else (e.g. a
+  // stud service out) says nothing about which of your kennels bred it.
+  // Status drives whether Disposition (puppy-only) is shown at all. Re-render on
+  // change so the field appears when Status becomes Puppy and disappears — with
+  // its value nulled by readForm — when it moves to any other life-stage.
+  document.getElementById('f-status').addEventListener('change', () => {
+    ctx.draft = readForm();
+    renderEdit();
+  });
+  document.getElementById('f-litter_id').addEventListener('change', (e) => {
+    ctx.draft = readForm();
+    const litter = e.target.value ? ctx.littersById.get(e.target.value) : null;
+    if (litter && litter.whelp_date && !ctx.draft.date_of_birth) {
+      ctx.draft.date_of_birth = litter.whelp_date;
+    }
+    if (litter && !ctx.draft.breeder_kennel_id) {
+      const dam = litter.dam_id ? ctx.dogsById.get(litter.dam_id) : null;
+      if (dam && ['owned', 'co_owned'].includes(dam.ownership_type) && dam.kennel_id) {
+        ctx.draft.breeder_kennel_id = dam.kennel_id;
+      }
+    }
+    renderEdit();
+  });
+  updateWarnings();
+}
+
+// Additional registrations: one row per registry beyond the main one above.
+// Blank rows are kept while editing and dropped on save (dogRepo).
+function registrationsEditor(list) {
+  const rows = (list || []).map((r, i) => `
+    <div class="reg-row" data-reg="${i}" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:10px;">
+      <input class="reg-registry" type="text" value="${esc(r.registry || '')}" placeholder="Registry (UKC, CKC…)" aria-label="Registry" style="flex:1 1 120px; min-width:0;">
+      <input class="reg-number" type="text" value="${esc(r.registration_number || '')}" placeholder="Registration #" aria-label="Registration number" style="flex:1 1 140px; min-width:0;">
+      <input class="reg-name" type="text" value="${esc(r.registered_name || '')}" placeholder="Registered name, if different" aria-label="Registered name with this registry" style="flex:2 1 200px; min-width:0;">
+      <button type="button" class="btn btn-sm reg-remove" data-reg-remove="${i}" aria-label="Remove this registration">Remove</button>
+    </div>`).join('');
+  return `<div class="field field-wide" id="f-additional_registrations">
+    <label>Additional registrations</label>
+    ${rows}
+    <div style="margin-top:6px;"><button type="button" class="btn btn-sm" id="reg-add">+ Add registration</button></div>
+    <span class="field-hint">Other registries this dog is registered with, beyond the Registry and Registration # above.</span>
+  </div>`;
+}
+
+// --- Titles row (Dog Titles Field Plan §4, §8 phase 3) ----------------------
+// Field titles are chips she can edit and remove: an abbreviation, with an
+// organization and an earned-on date behind "details". Logged title_earned events
+// the field doesn't hold show read-only (open the event to change or archive it),
+// and titles on the front of the registered name say so. Blank chips are kept
+// while editing and dropped on save (dogRepo normalizeTitles).
+function titlesEditor(d) {
+  const { field: fieldChips, event: eventChips, name: nameChips } = formTitleChips(d, ctx.titleEvents);
+  const meta = (t) => [t.organization, t.earned_on ? fmtDate(t.earned_on) : ''].filter(Boolean).map(esc).join(' · ');
+  const chips = fieldChips.map((t, i) => `
+    <span class="title-chip" data-title="${i}">
+      <input class="title-abbr" type="text" list="title-suggestions" value="${esc(t.abbr)}" maxlength="${MAX_ABBR}" aria-label="Title" size="${Math.max(3, Math.min(12, t.abbr.length + 1))}">
+      <details class="title-details">
+        <summary>${meta(t) || 'details'}</summary>
+        <span class="title-details-body">
+          <input class="title-org" type="text" value="${esc(t.organization)}" maxlength="${MAX_ORGANIZATION}" placeholder="Organization (AKC…)" aria-label="Organization">
+          <input class="title-date" type="date" max="${todayYMD()}" value="${esc(t.earned_on)}" aria-label="Earned on">
+        </span>
+      </details>
+      ${t.event_id ? `<button type="button" class="title-chip-link" data-title-event="${esc(t.event_id)}" title="Open the logged event">logged</button>` : ''}
+      <button type="button" class="title-chip-remove" data-title-remove="${i}" aria-label="Remove ${esc(t.abbr || 'this title')}">×</button>
+    </span>`).join('');
+  const evChips = eventChips.map((t) => `
+    <button type="button" class="title-chip title-chip-readonly" data-title-event="${esc(t.event_id)}" title="Logged as an event. Open it to change it, or archive it to remove the title.">
+      <strong>${esc(t.abbr)}</strong>${meta(t) ? ` <span class="faint">${meta(t)}</span>` : ''} <span class="faint">· logged</span>
+    </button>`).join('');
+  const nmChips = nameChips.map((t) => `
+    <span class="title-chip title-chip-readonly"><strong>${esc(t.abbr)}</strong> <span class="faint">· in the registered name</span></span>`).join('');
+  const options = titleSuggestions().map((a) => `<option value="${esc(a)}"></option>`).join('');
+  return `<div class="field field-wide" id="f-titles">
+    <label for="title-add-input">Titles</label>
+    <div class="title-chips" id="title-chips">${chips}${evChips}<span id="title-name-chips">${nmChips}</span></div>
+    <div class="title-add">
+      <input id="title-add-input" type="text" list="title-suggestions" placeholder="Add a title (CH, GCH, CGC…)" aria-label="Add a title">
+      <button type="button" class="btn btn-sm" id="title-add">+ Add</button>
+    </div>
+    <datalist id="title-suggestions">${options}</datalist>
+    <span class="field-hint">Titles this dog holds, e.g. CH for a champion you bought. Several at once: "GCH CH". Titles logged as events show here too.</span>
+  </div>`;
+}
+
+function wireTitlesEditor() {
+  const holder = document.getElementById('f-titles');
+  if (!holder) return;
+  const add = () => {
+    const input = document.getElementById('title-add-input');
+    const abbrs = splitTitleInput(input.value);
+    if (!abbrs.length) { input.focus(); return; }
+    ctx.draft = readForm();
+    ctx.draft.titles = [...ctx.draft.titles, ...abbrs.map((abbr) => ({ abbr: abbr.slice(0, MAX_ABBR), organization: '', earned_on: '' }))];
+    renderEdit();
+    document.getElementById('title-add-input')?.focus();
+  };
+  document.getElementById('title-add').addEventListener('click', add);
+  document.getElementById('title-add-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); add(); }
+  });
+  holder.querySelectorAll('[data-title-remove]').forEach((btn) => btn.addEventListener('click', () => {
+    ctx.draft = readForm();
+    const i = Number(btn.dataset.titleRemove);
+    ctx.draft.titles = ctx.draft.titles.filter((_, j) => j !== i);
+    renderEdit();
+    document.getElementById('title-add-input')?.focus();
+  }));
+  // A logged title opens its event in place, so the form's other changes stay.
+  holder.querySelectorAll('[data-title-event]').forEach((btn) => btn.addEventListener('click', async () => {
+    const ev = ctx.titleEvents.find((e) => e.id === btn.dataset.titleEvent);
+    if (!ev || !ctx.original) return;
+    ctx.draft = readForm();
+    await openEventForm({ subjectType: 'dog', subjectId: ctx.original.id, event: ev, onSaved: () => loadTitleEvents() });
+  }));
+  // The registered name's own titles follow what she types there.
+  document.getElementById('f-registered_name')?.addEventListener('input', () => {
+    const span = document.getElementById('title-name-chips');
+    if (!span) return;
+    const { name } = formTitleChips({ ...ctx.draft, titles: readTitles(), registered_name: document.getElementById('f-registered_name').value }, ctx.titleEvents);
+    span.innerHTML = name.map((t) => `<span class="title-chip title-chip-readonly"><strong>${esc(t.abbr)}</strong> <span class="faint">· in the registered name</span></span>`).join('');
+  });
+}
+
+// The dog's title_earned events, for the read-only chips; re-draws the form once
+// read, keeping what she has typed.
+async function loadTitleEvents() {
+  const dog = ctx.original;
+  if (!dog?.id) return;
+  let events = [];
+  try { events = (await eventRepo.getForSubject('dog', dog.id)).filter((e) => e.event_type === 'title_earned'); } catch { return; }
+  if (ctx.original !== dog || ctx.mode !== 'edit') return;
+  const before = ctx.titleEvents;
+  ctx.titleEvents = events;
+  if (!events.length && !before.length) return;
+  const focusId = document.activeElement?.id;
+  ctx.draft = readForm();
+  renderEdit();
+  if (focusId) document.getElementById(focusId)?.focus();
+}
+
+function readTitles() {
+  const holder = document.getElementById('f-titles');
+  if (!holder) return [...(ctx.draft?.titles || [])];
+  return [...holder.querySelectorAll('.title-chip[data-title]')].map((el) => ({
+    abbr: el.querySelector('.title-abbr').value.trim(),
+    organization: el.querySelector('.title-org').value.trim(),
+    earned_on: el.querySelector('.title-date').value
+  }));
+}
+
+function readRegistrations() {
+  const holder = document.getElementById('f-additional_registrations');
+  if (!holder) return [...(ctx.draft?.additional_registrations || [])];
+  return [...holder.querySelectorAll('.reg-row')].map((el) => ({
+    registry: el.querySelector('.reg-registry').value.trim(),
+    registration_number: el.querySelector('.reg-number').value.trim(),
+    registered_name: el.querySelector('.reg-name').value.trim()
+  }));
+}
+
+function readForm() {
+  const val = (id) => document.getElementById(id)?.value ?? '';
+  const coSel = document.getElementById('f-co_owner_contact_ids');
+  const out = {
+    ...ctx.draft,
+    call_name: val('f-call_name').trim(),
+    registered_name: val('f-registered_name').trim(),
+    sex: val('f-sex'),
+    breed: val('f-breed').trim(),
+    date_of_birth: val('f-date_of_birth'),
+    dob_is_estimated: document.getElementById('f-dob_is_estimated')?.checked || false,
+    date_of_death: val('f-date_of_death'),
+    color_markings: val('f-color_markings').trim(),
+    registry: val('f-registry').trim(),
+    registration_number: val('f-registration_number').trim(),
+    additional_registrations: readRegistrations(),
+    titles: readTitles(),
+    imported: document.getElementById('f-imported')?.checked || false,
+    country_of_origin: val('f-country_of_origin').replace(/\s+/g, ' ').trim(),
+    // While Imported is ticked the import country is the country of origin (D8);
+    // unticked, it's cleared as before.
+    import_country: document.getElementById('f-imported')?.checked ? val('f-country_of_origin').replace(/\s+/g, ' ').trim() : '',
+    microchip_id: val('f-microchip_id').trim(),
+    url: val('f-url').trim(),
+    // Only read when its field rendered (Pro with the waitlist), else kept.
+    photos_online: document.getElementById('f-photos_online') ? document.getElementById('f-photos_online').checked : Boolean(ctx.draft?.photos_online),
+    // Her website's marks (KennelPort plan 5.3): only read when they rendered (Pro), else kept.
+    show_on_website: document.getElementById('f-show_on_website') ? document.getElementById('f-show_on_website').checked : Boolean(ctx.draft?.show_on_website),
+    heats_online: document.getElementById('f-heats_online') ? document.getElementById('f-heats_online').checked : Boolean(ctx.draft?.heats_online),
+    ownership_type: val('f-ownership_type'),
+    status: val('f-status'),
+    // Disposition is a puppy-only field (vocab.js): only a `puppy`-status dog
+    // carries one. Force it null for any other status so it can't linger from a
+    // prior life-stage, and default it to 'undecided' when the field is present
+    // (e.g. Status was just switched to Puppy and the select hasn't rendered).
+    disposition: val('f-status') === 'puppy' ? (val('f-disposition') || 'undecided') : null,
+    // Sale prefill and waitlist matching (Waitlist Spec §4.5). Only read when its
+    // field rendered, so switching Status never clobbers a stored value.
+    intended_registration: document.getElementById('f-intended_registration')
+      ? (val('f-intended_registration') || null)
+      : (ctx.draft?.intended_registration ?? null),
+    sire_id: val('f-sire_id') || null,
+    dam_id: val('f-dam_id') || null,
+    litter_id: val('f-litter_id') || null,
+    breeder_kennel_id: val('f-breeder_kennel_id') || null,
+    owner_contact_id: val('f-owner_contact_id') || null,
+    co_owner_contact_ids: coSel ? [...coSel.selectedOptions].map((o) => o.value) : [],
+    // Only a co-owned dog lives with a co-owner, and only one of its own (dogRepo
+    // clears any other on save).
+    lives_with_contact_id: document.getElementById('f-lives_with_contact_id') ? (val('f-lives_with_contact_id') || null) : null,
+    // The picker is absent in two different situations, which mean opposite
+    // things: in a single-kennel edition (Lite) it is never rendered at all and
+    // the draft's already-resolved kennel must SURVIVE; anywhere else its absence
+    // means "doesn't apply". Falling back to the draft covers the first and is a
+    // no-op for the second (the draft has nothing to carry either).
+    kennel_id: document.getElementById('f-kennel_id')
+      ? (val('f-kennel_id') || null)
+      : (ctx.draft?.kennel_id || null),
+    notes: val('f-notes')
+  };
+  // A pedigree-only dog's ownership fields are hidden while editing (they're
+  // fixed at external / no owner); they only change through "Bring into use".
+  if (isPedigreeOnlyEdit()) {
+    const o = ctx.original;
+    Object.assign(out, {
+      ownership_type: o.ownership_type, status: o.status, owner_contact_id: o.owner_contact_id ?? null,
+      co_owner_contact_ids: o.co_owner_contact_ids || [], lives_with_contact_id: null, kennel_id: o.kennel_id ?? null
+    });
+  }
+  return out;
+}
+
+const isPedigreeOnly = () => !!ctx.original?.pedigree_only;
+const isPedigreeOnlyEdit = () => isPedigreeOnly() && ctx.mode === 'edit' && !ctx.bringIn;
+
+// Pedigree-only dogs show their profile, recorded COI and pedigree, nothing that
+// belongs to running a kennel (Bring into use first). `hidden` on the section, so
+// each section's own render logic stays untouched.
+const KENNEL_SECTIONS = ['plannedTests', 'healthTests', 'showRecord', 'timeline', 'expenses', 'pairings', 'sales', 'studServices', 'contracts', 'litters'];
+function applyPedigreeOnlyVisibility() {
+  for (const k of KENNEL_SECTIONS) if (els[k]) els[k].hidden = isPedigreeOnly();
+}
+
+function updateWarnings() {
+  const d = readForm();
+  const warns = [];
+  const sire = ctx.dogsById.get(d.sire_id);
+  const dam = ctx.dogsById.get(d.dam_id);
+  if (sire && sire.sex === 'female') warns.push('Selected sire is recorded as female.');
+  if (dam && dam.sex === 'male') warns.push('Selected dam is recorded as male.');
+  if (OWNER_REQUIRED.includes(d.ownership_type) && !d.owner_contact_id) {
+    warns.push(`An owner is required when ownership is “${OWNERSHIP_TYPE.find((o) => o.value === d.ownership_type)?.label}”.`);
+  }
+  if (d.date_of_death && d.status !== 'deceased') warns.push('Date of death is set but status is not Deceased.');
+
+  const box = document.getElementById('form-warn');
+  if (!box) return;
+
+  // Linked litter's whelp date vs. this dog's DOB: warn-only, never blocks
+  // save (an imported/historical record may legitimately disagree) — but
+  // offer the three fixes a mismatch could mean instead of just a message.
+  const litter = d.litter_id ? ctx.littersById.get(d.litter_id) : null;
+  const dobConflict = !!(litter && litter.whelp_date && d.date_of_birth && d.date_of_birth !== litter.whelp_date);
+
+  box.innerHTML =
+    (warns.length ? `<div class="inline-warn">${warns.map(esc).join('<br>')}</div>` : '') +
+    (dobConflict ? `
+      <div class="inline-warn">
+        Date of birth (${esc(fmtDate(d.date_of_birth))}) doesn't match this litter's whelp date (${esc(fmtDate(litter.whelp_date))}).
+        <div class="pill-row" style="margin-top:6px;">
+          <button type="button" class="btn btn-sm" id="warn-dob-use-litter">Update dog's DOB to match</button>
+          <button type="button" class="btn btn-sm" id="warn-dob-use-dog">Update litter's whelp date to match</button>
+          <button type="button" class="btn btn-sm" id="warn-dob-change-litter">Change litter</button>
+        </div>
+      </div>` : '');
+
+  if (dobConflict) {
+    document.getElementById('warn-dob-use-litter').onclick = () => {
+      ctx.draft = readForm();
+      ctx.draft.date_of_birth = litter.whelp_date;
+      renderEdit();
+    };
+    document.getElementById('warn-dob-use-dog').onclick = async () => {
+      const updated = await litterRepo.update(litter.id, { whelp_date: d.date_of_birth });
+      ctx.littersById.set(updated.id, updated);
+      updateWarnings();
+    };
+    document.getElementById('warn-dob-change-litter').onclick = () => {
+      ctx.draft = readForm();
+      ctx.draft.litter_id = null;
+      renderEdit();
+    };
+  }
+}
+
+// --- Actions -------------------------------------------------------------
+function renderProfileActions() {
+  if (ctx.mode === 'view') {
+    els.profileActions.innerHTML = `<button class="btn btn-sm" id="btn-edit">Edit</button>`;
+    document.getElementById('btn-edit').onclick = () => enterEdit();
+  } else {
+    els.profileActions.innerHTML = `
+      <button class="btn btn-primary btn-sm" id="btn-save">Save</button>
+      <button class="btn btn-sm" id="btn-cancel">Cancel</button>`;
+    document.getElementById('btn-save').onclick = save;
+    document.getElementById('btn-cancel').onclick = cancel;
+  }
+}
+
+async function renderHeaderActions() {
+  els.headerActions.innerHTML = '';
+  if (ctx.mode === 'new' || !ctx.original) return;
+  const d = ctx.original;
+  const blockers = await dogRepo.getDeleteBlockers(d.id);
+  const altAction = editionFlags.manualDogArchive ? 'archive instead.' : 'remove it from your program instead.';
+  const delTitle = blockers.length
+    ? 'Referenced as ' + blockers.map((b) => `${b.label} (${b.count})`).join(', ') + ' — ' + altAction
+    : 'Permanently delete this record.';
+  const documentsBtn = editionFlags.documents
+    ? `<a class="btn btn-sm" href="documents.html?dog=${encodeURIComponent(d.id)}" title="View this dog's filed documents">📄 Documents</a>`
+    : '';
+  // Archive control. Pro offers a free Archive/Unarchive toggle. Lite hides the
+  // archive machinery (cap spec §5/§7): the only exit is a confirmed "remove from
+  // program" departure, and a departed dog can't be brought back in Lite (so no
+  // control at all once archived).
+  let archiveBtn = '';
+  if (d.pedigree_only) {
+    archiveBtn = editionFlags.manualDogArchive
+      ? `<button class="btn btn-sm" id="btn-archive">${d.is_archived ? 'Unarchive' : 'Archive'}</button>` : '';
+  } else if (editionFlags.manualDogArchive) {
+    archiveBtn = `<button class="btn btn-sm" id="btn-archive">${d.is_archived ? 'Unarchive' : 'Archive'}</button>`;
+  } else if (!d.is_archived) {
+    archiveBtn = `<button class="btn btn-sm" id="btn-depart" title="Remove this dog from your program">Remove from program</button>`;
+  }
+  const bringInBtn = d.pedigree_only && !d.is_archived
+    ? '<button class="btn btn-primary btn-sm" id="btn-bring-in" title="Make this dog part of your kennel — e.g. you bought it, or are breeding to it">Bring into use</button>'
+    : '';
+  // Dog Cards (Shared Dogs Plan §3): this dog, with its ancestors, tests and titles,
+  // for a breeder she co-owns with. Not for a pedigree-only ancestor.
+  const dogCardBtn = editionFlags.dogCards && !d.pedigree_only && !d.is_archived
+    ? `<a class="btn btn-sm" href="dog-cards.html?dog=${encodeURIComponent(d.id)}" title="Send this dog to another breeder's KennelOS">Send a dog card</a>`
+    : '';
+  els.headerActions.innerHTML = `
+    ${bringInBtn}
+    ${dogCardBtn}
+    ${documentsBtn}
+    ${archiveBtn}
+    <button class="btn btn-danger btn-sm" id="btn-delete"${blockers.length ? ' disabled' : ''} title="${esc(delTitle)}">Delete</button>`;
+  document.getElementById('btn-archive')?.addEventListener('click', toggleArchive);
+  document.getElementById('btn-bring-in')?.addEventListener('click', () => enterEdit({ bringIn: true }));
+  document.getElementById('btn-depart')?.addEventListener('click', departDog);
+  const del = document.getElementById('btn-delete');
+  if (!blockers.length) del.onclick = doDelete;
+}
+
+function showError(msg) {
+  els.error.innerHTML = `<div class="inline-error">${esc(msg)}</div>`;
+  els.error.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function clearError() { els.error.innerHTML = ''; }
+
+function enterEdit({ bringIn = false } = {}) {
+  clearError();
+  ctx.mode = 'edit';
+  ctx.bringIn = bringIn;
+  ctx.coiEditing = false;
+  ctx.draft = { ...ctx.original, co_owner_contact_ids: [...(ctx.original.co_owner_contact_ids || [])],
+    additional_registrations: (ctx.original.additional_registrations || []).map((r) => ({ ...r })),
+    titles: (Array.isArray(ctx.original.titles) ? ctx.original.titles : []).map((t) => ({ ...t })),
+    // An older record kept its country only as the import country: the one row shows it.
+    country_of_origin: countryOfOrigin(ctx.original) };
+  ctx.titleEvents = [];
+  loadTitleEvents();
+  // Bringing a pedigree-only dog into use: its placeholder ownership/status
+  // (external / external reference) are cleared so both are chosen deliberately.
+  if (bringIn) Object.assign(ctx.draft, { ownership_type: '', status: '' });
+  renderTitle();
+  renderEdit();
+  renderProfileActions();
+  renderRecordedCoiSection(); // hide while editing the profile
+  renderPlannedTestsSection(); // hide while editing the profile too
+  renderHealthTestsSection(); // hide while editing the profile
+  renderShowRecordSection();
+  renderTimelineSection(); // hide timeline while editing the profile
+  renderExpensesSection(); // hide expenses while editing too
+  renderPairingsSection(); // hide pairings while editing too
+  renderSalesSection();
+  renderStudServicesSection();
+  renderContractsSection();
+  renderLittersSection(); // hide litters while editing too
+  renderPedigreeSection(); // hide pedigree while editing too
+}
+
+function cancel() {
+  clearError();
+  if (ctx.mode === 'new') { location.href = 'dogs.html'; return; }
+  ctx.mode = 'view';
+  ctx.bringIn = false;
+  renderTitle();
+  renderView();
+  renderProfileActions();
+  renderRecordedCoiSection();
+  const eventsP = viewDogEventsPromise();
+  renderPlannedTestsSection(eventsP);
+  renderHealthTestsSection(eventsP);
+  renderShowRecordSection();
+  renderTimelineSection();
+  renderExpensesSection();
+  renderPairingsSection();
+  renderSalesSection();
+  renderStudServicesSection();
+  renderContractsSection();
+  renderLittersSection();
+  renderPedigreeSection();
+}
+
+// Guards against a rapid double-tap/double-click firing save() twice before
+// the first call's await chain (confirmModal prompts, the repo write) has a
+// chance to disable anything itself — each call would otherwise run to
+// completion independently, e.g. creating two dogs from one "Save" tap.
+async function save() {
+  const btn = document.getElementById('btn-save');
+  if (btn?.disabled) return;
+  if (btn) btn.disabled = true;
+  try {
+    await doSave();
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function doSave() {
+  clearError();
+  const candidate = readForm();
+
+  // status_date: stamp when status changes (or on first save).
+  const statusChanged = !ctx.original || ctx.original.status !== candidate.status;
+  if (statusChanged) candidate.status_date = todayYMD();
+  else candidate.status_date = ctx.original.status_date || '';
+
+  // Interactive rule: setting date_of_death SUGGESTS Deceased (not forced).
+  if (candidate.date_of_death && candidate.status !== 'deceased') {
+    if (await confirmModal({ title: 'Date of death is set. Also change status to “Deceased”?', confirmLabel: 'Set Deceased', cancelLabel: 'Keep status' })) {
+      candidate.status = 'deceased';
+      candidate.status_date = todayYMD();
+    }
+  }
+  // Interactive rule: leaving Deceased needs confirmation.
+  if (ctx.original && ctx.original.status === 'deceased' && candidate.status !== 'deceased') {
+    if (!(await confirmModal({ title: 'Change status from Deceased?', message: 'This dog is marked Deceased. Are you sure you want to change that?', confirmLabel: 'Change status', cancelLabel: 'Cancel' }))) return;
+  }
+
+  try {
+    let saved;
+    if (ctx.mode === 'new') {
+      // Seeding-on-create is a one-time copy of the panel as it stood at this
+      // moment (Test Planning Addendum §4) — forward-only, never re-checked
+      // against the panel again after this. Scoped to this dog's own breed
+      // (§8): a breed-tagged test only carries over for a matching breed; an
+      // untagged/breed-agnostic test still carries over to every new dog.
+      const seedKennel = seedTestsKennel(candidate, ctx.allKennels);
+      if (seedKennel) candidate.planned_tests = kennelRepo.testsForBreed(seedKennel, candidate.breed);
+      // Kennel scope (Multi-Kennel Scope Spec §6). A dog the user owns needs one;
+      // in a multi-kennel edition the required picker above supplied it, and in a
+      // single-kennel edition there IS no picker, so resolve it here. Never
+      // overrides a value the form did provide.
+      if (SCOPED_OWNERSHIP.has(candidate.ownership_type) && !candidate.kennel_id) {
+        candidate.kennel_id = await resolveKennelIdForWrite();
+      }
+      saved = await dogRepo.create(candidate);
+      // The pick is in: the stud service stops asking (studRules.pickDue).
+      if (ctx.pickServiceId) await studServiceRepo.update(ctx.pickServiceId, { pick_status: 'claimed' });
+      location.href = `dog.html?id=${encodeURIComponent(saved.id)}`;
+      return;
+    }
+    if (ctx.bringIn) {
+      candidate.pedigree_only = false;
+      if (SCOPED_OWNERSHIP.has(candidate.ownership_type) && !candidate.kennel_id) {
+        candidate.kennel_id = await resolveKennelIdForWrite();
+      }
+    }
+    const prevRegistration = ctx.original.intended_registration || null;
+    const prevStatus = ctx.original.status;
+    const becameKeeper = ctx.original.disposition !== 'keeping' && candidate.disposition === 'keeping';
+    const becameDeceased = prevStatus !== 'deceased' && candidate.status === 'deceased';
+    // Joining the breeding program: ask about her website (KennelPort plan 5.5),
+    // never tick it for her.
+    if (websiteLinkOffered() && prevStatus !== 'active_breeding' && candidate.status === 'active_breeding' && !candidate.show_on_website && SCOPED_OWNERSHIP.has(candidate.ownership_type)
+      && await confirmModal({ title: `Show ${candidate.call_name || 'this dog'} on your website?`, message: 'Your KennelPort website gets a page for this dog at your next Update website (Settings).', confirmLabel: 'Show on website', cancelLabel: 'Not now' })) {
+      candidate.show_on_website = true;
+    }
+    saved = await dogRepo.update(ctx.original.id, candidate);
+    if (saved.status === 'puppy' && saved.intended_registration && saved.intended_registration !== prevRegistration) {
+      await promptSaleRegistration(saved);
+    }
+    ctx.original = saved;
+    ctx.mode = 'view';
+    ctx.bringIn = false;
+    await loadRefs(); // names/breeds may have changed
+    ctx.original = await dogRepo.getById(saved.id);
+    renderAll();
+    // Marked Keeping: offer her kennel's planned tests for the breed.
+    if (becameKeeper && await offerKeeperTests(ctx.original)) {
+      ctx.original = await dogRepo.getById(saved.id);
+      renderAll();
+    }
+    if (becameDeceased && await promptDeceasedFollowUps(ctx.original, { wasPuppy: prevStatus === 'puppy' })) {
+      ctx.original = await dogRepo.getById(saved.id);
+      // Lite's departure leaves the page, as "Remove from program" does.
+      if (ctx.original.is_archived && !editionFlags.manualDogArchive) { location.href = 'dogs.html'; return; }
+      renderAll();
+    }
+  } catch (e) {
+    // The Lite cap throws CapExceededError (a repo can't prompt); show the
+    // upgrade nudge, not a raw error. mode is still 'new' on a blocked create
+    // and 'edit' on a blocked ✗→✓ transition (a kept pup maturing).
+    if (e instanceof CapExceededError) {
+      renderUpgradeNudge(els.error, e, ctx.mode === 'new' ? 'create' : 'mature');
+      els.error.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    } else {
+      showError(e.message || String(e));
+    }
+  }
+}
+
+// The dog was just marked Deceased: list what it leaves open (open sales,
+// unfinished pairings — nudges.deceasedDogNudges, the same list Today shows as
+// the backstop) with each one's action, and for a dog that was a Puppy until now,
+// archiving it (Lite: removing it from the program, which asks first). Each is optional; Done closes. Imported
+// on demand so the dog page doesn't load the nudge engine on every visit.
+// Resolves true when an action ran (the page's linked panels need a re-render).
+async function promptDeceasedFollowUps(dog, { wasPuppy = false } = {}) {
+  const [{ deceasedDogNudges }, pairings, sales, dogs] = await Promise.all([
+    import('../data/nudges.js'),
+    pairingRepo.getAll(),
+    saleRepo.getByDog(dog.id),
+    dogRepo.getAll({ includeArchived: true })
+  ]);
+  const items = deceasedDogNudges([dog], { pairings, sales, dogsById: new Map(dogs.map((d) => [d.id, d])), wasPuppy });
+  if (!items.length) return false;
+
+  let acted = false;
+  await new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal" role="dialog" aria-modal="true">
+      <h2 style="margin-top:0;">${esc(nameOf(dog))} is marked Deceased</h2>
+      <p class="muted">Tidy up what no longer applies, or leave any of it for later.</p>
+      <ul class="linked-list" style="margin:6px 0 0; padding:0; list-style:none;">
+        ${items.map((n, i) => `
+          <li class="row-between" style="padding:10px 0; border-top:1px solid var(--border); align-items:flex-start;">
+            <div>
+              <div><strong>${esc(n.title)}</strong></div>
+              ${n.detail ? `<div class="muted" style="font-size:13px;">${esc(n.detail)}</div>` : ''}
+            </div>
+            <div class="pill-row" data-item="${i}">
+              ${n.actions.map((a, j) => `<button class="btn btn-sm" data-action="${j}">${esc(a.label)}</button>`).join('')}
+            </div>
+          </li>`).join('')}
+      </ul>
+      <div id="df-error"></div>
+      <div class="form-actions"><button class="btn btn-primary" id="df-done">Done</button></div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const close = () => { overlay.remove(); resolve(); };
+    overlay.querySelector('#df-done').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelectorAll('[data-item]').forEach((holder) => {
+      const item = items[Number(holder.dataset.item)];
+      holder.querySelectorAll('[data-action]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          try {
+            const action = item.actions[Number(btn.dataset.action)];
+            if (action.confirm && !(await confirmModal(action.ask))) return;
+            await action.run();
+            acted = true;
+            holder.innerHTML = '<span class="muted">Done</span>';
+          } catch (e) {
+            overlay.querySelector('#df-error').innerHTML = `<div class="inline-error">${esc(e.message || String(e))}</div>`;
+          }
+        });
+      });
+    });
+  });
+  return acted;
+}
+
+// A puppy's intended registration changed while it has an open sale (decided
+// 2026-10-11): offer to change the sale's registration to match, and its price
+// with it (the Full surcharge comes or goes, salePrompts.askRegistrationPrice).
+// Skip leaves the sale as it is.
+async function promptSaleRegistration(dog) {
+  const reg = dog.intended_registration;
+  const sales = (await saleRepo.getByDog(dog.id)).filter((x) => saleRepo.isOpenSale(x) && x.registration_type !== reg);
+  if (!sales.length) return;
+  const litter = dog.litter_id ? await litterRepo.getById(dog.litter_id) : null;
+  for (const sale of sales) {
+    const buyer = sale.buyer_contact_id ? await contactRepo.getById(sale.buyer_contact_id) : null;
+    const label = (r) => (r ? descriptor(REGISTRATION_TYPE, r).label : 'no registration');
+    const ok = await confirmModal({
+      title: `Change ${buyer?.name ? `${buyer.name}'s` : 'the'} sale to ${label(reg)} too?`,
+      message: `${nameOf(dog)} has an open sale${buyer?.name ? ` to ${buyer.name}` : ''} with ${label(sale.registration_type)} registration${sale.price != null && sale.price !== '' ? ` at ${fmtMoney(sale.price)}` : ''}.`,
+      confirmLabel: 'Change the sale', cancelLabel: 'Leave the sale'
+    });
+    if (!ok) continue;
+    try {
+      const change = litter ? priceForRegistrationChange(dog, litter, sale.price, sale.registration_type, reg) : null;
+      const price = await askRegistrationPrice(change, sale.registration_type, reg);
+      await saleRepo.update(sale.id, { registration_type: reg, ...(price != null ? { price } : {}) });
+    } catch (e) {
+      showError(`The sale wasn't updated: ${e.message || e} Change it on the sale's page.`);
+    }
+  }
+}
+
+async function toggleArchive() {
+  const d = ctx.original;
+  const verb = d.is_archived ? 'Unarchive' : 'Archive';
+  if (!(await confirmModal({ title: `${verb} “${nameOf(d)}”?`, confirmLabel: verb }))) return;
+  ctx.original = d.is_archived ? await dogRepo.unarchive(d.id) : await dogRepo.archive(d.id);
+  renderAll();
+}
+
+// Lite's departure exit (cap spec §5): the ONLY way a dog leaves the active
+// roster in Lite, gated by a blocking "this is permanent" confirm the user must
+// accept. It archives the record (freeing a cap slot honestly — the dog is gone,
+// not hidden-but-owned) and returns to the roster, since a departed dog's page
+// isn't meant to be a place you linger in Lite. No auto-undo: the confirm IS the
+// safety, and history/pedigree stay intact because archive is a soft delete.
+async function departDog() {
+  const d = ctx.original;
+  const ok = await confirmModal({
+    title: `Remove “${nameOf(d)}” from your program?`,
+    message: `This can't be undone here — ${nameOf(d)} leaves your roster and you won't be able to edit it or bring it back. It stays in your dogs' pedigrees for lineage.`,
+    confirmLabel: 'Remove permanently',
+    cancelLabel: 'Cancel',
+    danger: true,
+  });
+  if (!ok) return;
+  await dogRepo.archive(d.id);
+  location.href = 'dogs.html';
+}
+
+async function doDelete() {
+  const d = ctx.original;
+  if (!(await confirmModal({ title: `Delete “${nameOf(d)}”?`, message: 'This cannot be undone.', confirmLabel: 'Delete', danger: true }))) return;
+  try {
+    await dogRepo.hardDelete(d.id);
+    location.href = 'dogs.html';
+  } catch (e) {
+    if (e instanceof ReferenceBlockedError) { showError(e.message); await renderHeaderActions(); }
+    else showError(e.message || String(e));
+  }
+}
+
+// --- Top-level render ----------------------------------------------------
+function renderTitle() {
+  if (ctx.mode === 'new') {
+    els.title.textContent = 'New Dog';
+    els.subtitle.textContent = 'Fill in the required fields and save.';
+    return;
+  }
+  const d = ctx.original;
+  // The name with its titles (Dog Titles Field Plan §8 phase 2): the field's and the
+  // name's at once, then again with its title_earned events once they're read.
+  const draw = (events = []) => {
+    const titles = titlesOf(d, events);
+    const full = displayName(d, titles);
+    els.title.innerHTML = esc(d.call_name || full || nameOf(d))
+      + (d.pedigree_only ? ' <span class="badge badge-neutral">Pedigree only</span>' : '')
+      + (d.is_archived ? ' <span class="badge badge-gray">Archived</span>' : '');
+    els.subtitle.innerHTML = ctx.bringIn
+      ? 'Choose an ownership and status to bring this dog into regular use.'
+      : (d.call_name && (d.registered_name || titles.length) ? esc(full) : '');
+  };
+  draw();
+  if (d.id) {
+    eventRepo.getForSubject('dog', d.id).then((events) => {
+      if (ctx.original === d && events.some((e) => e.event_type === 'title_earned')) draw(events);
+    }).catch(() => {});
+  }
+}
+
+// New-dog-only cap counter (cap spec §6): a plain read of the same counting
+// predicate the repo enforces, so the number shown here always matches what
+// would actually block a save. Pro/Demo's dogCapStatus() resolves null (no
+// cap), so this renders nothing there.
+async function renderCapBanner() {
+  if (!els.capBanner) return;
+  const status = await dogCapStatus();
+  els.capBanner.textContent = status ? `Creating ${status.current}/${status.cap} available dogs` : '';
+}
+
+// Event History only makes sense for a saved dog; hide it while creating/editing
+// the profile so events can't be logged against an unsaved record.
+function renderTimelineSection() {
+  if (!els.timeline) return;
+  if (ctx.mode === 'view' && ctx.original) {
+    // The Show record card is derived from the same events — keep it in step.
+    renderTimeline({ mount: els.timeline, subjectType: 'dog', subjectId: ctx.original.id, onChange: renderShowRecordSection });
+  } else {
+    els.timeline.innerHTML = '';
+  }
+}
+
+// Expenses (Financials ledger) for this dog — costs attached directly, plus any
+// captured from its events (both carry subject_type='dog'). Hidden while editing
+// the profile, same discipline as the timeline.
+function renderExpensesSection() {
+  if (!els.expenses) return;
+  if (ctx.mode === 'view' && ctx.original) {
+    renderExpensePanel({ mount: els.expenses, subjectType: 'dog', subjectId: ctx.original.id });
+  } else {
+    els.expenses.innerHTML = '';
+  }
+}
+
+// Recorded COI panel (Stage 5, Build Brief §2.2). recorded_coi is an OPTIONAL,
+// user-attested value — { value, method, source, as_of_date } — NOT computed by
+// the app and NEVER presented as if it were (§2.4: the app records the result of
+// the breeder's lab/registry analysis; it offers no relatedness math of its own).
+// The panel always labels the value as user-recorded, always shows its provenance
+// beside it (a bare percentage is never shown alone), and shows a quiet empty
+// state with an add affordance when nothing is recorded. It has its own inline
+// edit toggle, independent of the Profile edit mode.
+async function renderRecordedCoiSection() {
+  if (!els.recordedCoi) return;
+  if (ctx.mode !== 'view' || !ctx.original) { els.recordedCoi.innerHTML = ''; ctx.coiEditing = false; return; }
+  const d = ctx.original;
+  const coi = d.recorded_coi || null;
+
+  if (ctx.coiEditing) {
+    const c = coi || {};
+    const methodOpts = COI_METHOD_SUGGESTIONS.map((m) => `<option value="${esc(m)}"></option>`).join('');
+    els.recordedCoi.innerHTML = `
+      <section class="card" style="margin-top:16px;">
+        <h2 style="margin:0;">Recorded COI</h2>
+        <p class="field-hint">A coefficient of inbreeding you recorded from a lab or registry — the app stores it, it does not compute or verify it.</p>
+        <div class="form-grid" style="margin-top:12px;">
+          ${field('COI value (%)', `<input id="coi-value" type="number" step="0.01" min="0" value="${esc(c.value ?? '')}" placeholder="e.g. 6.25">`, { hint: 'Leave blank and save to remove the recorded COI.' })}
+          ${field('Method', `<input id="coi-method" type="text" list="coi-method-dl" value="${esc(c.method ?? '')}" placeholder="genomic / pedigree / registry / other"><datalist id="coi-method-dl">${methodOpts}</datalist>`)}
+          ${field('Source', `<input id="coi-source" type="text" value="${esc(c.source ?? '')}" placeholder="e.g. Embark, AKC 5-gen">`)}
+          ${field('As of', `<input id="coi-as_of" type="date" value="${esc(c.as_of_date ?? '')}">`)}
+        </div>
+        <div id="coi-error"></div>
+        <div class="form-actions" style="margin-top:12px;">
+          <button class="btn btn-primary btn-sm" id="coi-save">Save</button>
+          <button class="btn btn-sm" id="coi-cancel">Cancel</button>
+        </div>
+      </section>`;
+
+    document.getElementById('coi-cancel').addEventListener('click', () => { ctx.coiEditing = false; renderRecordedCoiSection(); });
+    document.getElementById('coi-save').addEventListener('click', async () => {
+      const valRaw = document.getElementById('coi-value').value.trim();
+      const method = document.getElementById('coi-method').value.trim();
+      const source = document.getElementById('coi-source').value.trim();
+      const asOf = document.getElementById('coi-as_of').value;
+      let recorded_coi = null;
+      if (valRaw !== '') {
+        const n = Number(valRaw);
+        if (!Number.isFinite(n)) {
+          document.getElementById('coi-error').innerHTML = '<div class="inline-error">COI value must be a number (percent, e.g. 6.25).</div>';
+          return;
+        }
+        recorded_coi = { value: n, method: method || null, source: source || null, as_of_date: asOf || null };
+      }
+      try {
+        ctx.original = await dogRepo.update(d.id, { recorded_coi });
+        ctx.coiEditing = false;
+        renderRecordedCoiSection();
+      } catch (e) { document.getElementById('coi-error').innerHTML = `<div class="inline-error">${esc(e.message || String(e))}</div>`; }
+    });
+    return;
+  }
+
+  const bodyHtml = coi && coi.value != null
+    ? `<dl class="dl-meta" style="margin-top:12px;">
+        ${row('COI value', `<strong>${esc(coi.value)}%</strong>`)}
+        ${row('Method', esc(coi.method))}
+        ${row('Source', esc(coi.source))}
+        ${row('As of', coi.as_of_date ? esc(fmtDate(coi.as_of_date)) : '')}
+       </dl>
+       <p class="faint" style="margin:10px 0 0; font-size:13px;">User-recorded / attested — recorded from your lab or registry, not computed or verified by this app.</p>`
+    : `<p class="muted" style="margin:12px 0 0;">No COI recorded.</p>`;
+
+  const hasContent = coi && coi.value != null;
+  const headerBtn = `<button class="btn btn-sm" id="coi-edit">${hasContent ? 'Edit' : '+ Add COI'}</button>`;
+  els.recordedCoi.innerHTML = renderCollapsibleCard('Recorded COI', bodyHtml, headerBtn, { sectionKey: 'recorded-coi', hasContent });
+  document.getElementById('coi-edit').addEventListener('click', () => { ctx.coiEditing = true; renderRecordedCoiSection(); });
+  setupCollapsibleCard('recorded-coi');
+}
+
+// Health-test summary (Stage 5, Build Brief §6) — a READ-ONLY presentation of
+// this dog's recorded genetic / OFA-PennHIP / breed-specific test events with
+// their details. It computes nothing: no carrier-risk math, no genotype
+// interpretation, no clear/carrier/affected → offspring inference (that needs
+// structured locus data the app doesn't model — door left open in §11). This is
+// the "genetic analysis" of Stage 5: surfacing what was recorded, nothing more.
+// Editing/adding these events stays in the Event History below.
+// A single events read for the current dog in view mode, or null otherwise —
+// so the health-test and planned-test sections can share one fetch when rendered
+// together, while each still self-fetches when re-rendered on its own.
+function viewDogEventsPromise() {
+  return (ctx.mode === 'view' && ctx.original)
+    ? eventRepo.getForSubject('dog', ctx.original.id)
+    : null;
+}
+
+const HEALTH_TEST_TYPES = ['genetic_test', 'ofa_pennhip', 'breed_specific_test'];
+async function renderHealthTestsSection(eventsP = null) {
+  if (!els.healthTests) return;
+  if (ctx.mode !== 'view' || !ctx.original) { els.healthTests.innerHTML = ''; return; }
+  const d = ctx.original;
+  const events = await (eventsP || eventRepo.getForSubject('dog', d.id));
+  const tests = events.filter((e) => HEALTH_TEST_TYPES.includes(e.event_type));
+
+  const detailsSummary = (ev) => {
+    const typeDef = descriptor(EVENT_TYPES, ev.event_type);
+    if (!typeDef.fields?.length || !ev.details) return '';
+    return typeDef.fields
+      .filter((f) => ev.details[f.key] != null && ev.details[f.key] !== '')
+      .map((f) => `${esc(f.label)}: ${esc(ev.details[f.key])}`)
+      .join(' · ');
+  };
+
+  const rowsHtml = tests.length
+    ? `<ul class="linked-list" style="margin:14px 0 0; padding:0; list-style:none;">` + tests.map((ev) => {
+        const summary = detailsSummary(ev);
+        return `<li style="padding:8px 0; border-top:1px solid var(--border);">
+          <div>${badge(EVENT_TYPES, ev.event_type)} <strong>${esc(ev.title)}</strong> <span class="faint">${esc(fmtDate(ev.event_date))}</span></div>
+          ${summary ? `<div class="muted" style="font-size:14px;">${summary}</div>` : ''}
+        </li>`;
+      }).join('') + `</ul>`
+    : `<p class="muted" style="margin:14px 0 0;">No health-test events recorded yet.</p>`;
+
+  // This dog's own say over its results on waitlist family pages (Dog.waitlist_tests,
+  // PARENT_TESTS_SHOWN), over Waitlist settings' "Parents' health test results". A parent only:
+  // never a puppy. Saved as soon as it changes.
+  const onlineHtml = editionFlags.waitlist && isWaitlistOnlineOffered() && d.status !== 'puppy'
+    ? `<div class="field" style="margin-top:14px;"><label for="ht-online">On family pages</label>
+        <select id="ht-online"><option value="">Follow Waitlist settings</option>${PARENT_TESTS_SHOWN.map((o) => `<option value="${esc(o.value)}"${d.waitlist_tests === o.value ? ' selected' : ''}>${esc(o.label)}</option>`).join('')}</select>
+        <span class="field-hint">Which of this dog's completed test names and results show under its name where your online waitlist shows its litters. Normal results only = tests whose latest result is marked Normal. Follow = Waitlist settings → Public list &amp; family pages → "Parents' health test results".</span></div>`
+    : '';
+
+  const bodyHtml = `
+    <p class="field-hint">Recorded genetic, OFA/PennHIP, and breed-specific test results for this dog — a read-only view of what's been logged. Add or edit these in the Event History below.</p>
+    ${rowsHtml}${onlineHtml}`;
+
+  const hasContent = tests.length > 0;
+  els.healthTests.innerHTML = renderCollapsibleCard('Health-Test Summary', bodyHtml, '', { sectionKey: 'health-tests', hasContent });
+  setupCollapsibleCard('health-tests');
+  els.healthTests.querySelector('#ht-online')?.addEventListener('change', async (ev) => {
+    try {
+      ctx.original = await dogRepo.update(d.id, { waitlist_tests: ev.target.value || null });
+    } catch (err) {
+      ev.target.value = ctx.original.waitlist_tests || '';
+      showError(err.message || String(err));
+    }
+  });
+}
+
+// Derived "Show record" card (Show Tracking Spec §5.1, Pro-only): progress
+// toward each title track the dog has show events for, then the show history.
+// Everything is derived by data/showPoints.js from the dog's `show` events —
+// nothing here is stored. Renders only once the dog has a show event, so pet
+// puppies never carry an empty card; the first show is logged from the Event
+// History's "+ Add Event".
+async function renderShowRecordSection() {
+  if (!els.showRecord) return;
+  if (!editionFlags.shows) { els.showRecord.innerHTML = ''; return; } // Pro-only
+  if (ctx.mode !== 'view' || !ctx.original) { els.showRecord.innerHTML = ''; return; }
+  const d = ctx.original;
+  const { tracks, history } = await getShowRecord(d.id, { held: d.titles });
+  if (!history.length) { els.showRecord.innerHTML = ''; return; }
+
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const trackHtml = tracks.map(({ track, progress: p, titleEvent, heldTitle }) => {
+    const parts = [
+      `${p.points} / ${track.points} pts`,
+      `majors ${p.majors} / ${track.majors}${p.majorJudges < p.majors ? ` (${plural(p.majorJudges, 'judge')})` : ''}`,
+      `judges ${p.judges} / ${track.distinctJudges}`
+    ];
+    if (track.championDefeats) parts.push(`champions defeated ${p.championDefeats} / ${track.championDefeats}`);
+    let status;
+    if (titleEvent) status = `<span class="badge badge-green">${esc(track.title)} earned ${esc(fmtDate(titleEvent.event_date))}</span>`;
+    // A title on the dog's Titles (Dog.titles): "Held" when it has no date.
+    else if (heldTitle) status = `<span class="badge badge-green">${esc(track.title)} ${heldTitle.earned_on ? `earned ${esc(fmtDate(heldTitle.earned_on))}` : 'Held'}</span>`;
+    else if (p.complete) status = `<span class="badge badge-green">Complete</span> <span class="faint">finished ${esc(fmtDate(p.completedOn))} — log the ${esc(track.title)} title in the Event History</span>`;
+    else status = `<span class="muted">Needs: ${esc(p.missing.join(', '))}</span>`;
+    const notCounted = p.notCounted
+      ? `<div class="faint" style="font-size:13px;">${plural(p.notCounted, 'earlier win')} not counted (before ${esc(TITLE_TRACKS.find((t) => t.value === track.requires)?.title || track.requires)})</div>`
+      : '';
+    return `<li style="padding:8px 0; border-top:1px solid var(--border);">
+      <div><strong>${esc(track.label)}</strong> <span class="faint">${esc(parts.join(' · '))}</span></div>
+      <div style="font-size:14px;">${status}</div>
+      ${notCounted}
+    </li>`;
+  }).join('');
+  const tracksBlock = tracks.length
+    ? `<ul class="linked-list" style="margin:14px 0 0; padding:0; list-style:none;">${trackHtml}</ul>`
+    : `<p class="muted" style="margin:14px 0 0;">No points recorded toward a title yet — set "Points toward" on a show result to track progress.</p>`;
+
+  const today = todayYMD();
+  const rows = history.map((ev, i) => {
+    const det = ev.details || {};
+    const status = det.entry_status && det.entry_status !== 'shown' ? ` ${badge(SHOW_ENTRY_STATUS, det.entry_status)}` : '';
+    const handler = ev.related_contact_id ? contactName(ev.related_contact_id) : '';
+    const pts = det.points === '' || det.points == null ? '' : det.points;
+    return `<tr class="clickable" data-idx="${i}">
+      <td>${esc(fmtDate(ev.event_date))}${ev.event_date > today ? ' <span class="badge badge-amber">Upcoming</span>' : ''}</td>
+      <td>${esc(det.show_name || ev.title)}</td>
+      <td>${esc(det.placement || '')}${status}</td>
+      <td>${esc(pts)}</td>
+      <td>${esc(det.judge || '')}</td>
+      <td>${esc(handler || '')}</td>
+    </tr>`;
+  }).join('');
+  const historyBlock = `
+    <div class="table-scroll" style="margin-top:14px;">
+      <table class="data">
+        <thead><tr><th>Date</th><th>Show</th><th>Award</th><th>Points</th><th>Judge</th><th>Handler</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+
+  const bodyHtml = `
+    <p class="field-hint">Points, majors and judges are counted from this dog's "Shown" show results — nothing here is stored separately. Click a row to edit it.</p>
+    ${tracksBlock}
+    ${historyBlock}`;
+  const headerBtn = `<button class="btn btn-sm" id="btn-add-show">+ Add Show</button>`;
+  els.showRecord.innerHTML = renderCollapsibleCard('Show Record', bodyHtml, headerBtn, { sectionKey: 'show-record', hasContent: true });
+  setupCollapsibleCard('show-record');
+
+  els.showRecord.querySelector('#btn-add-show')?.addEventListener('click', () => {
+    openEventForm({ subjectType: 'dog', subjectId: d.id, prefill: { event_type: 'show' }, onSaved: afterEventSaved });
+  });
+  els.showRecord.querySelectorAll('tr[data-idx]').forEach((tr) => {
+    tr.addEventListener('click', () => {
+      openEventForm({ subjectType: 'dog', subjectId: d.id, event: history[Number(tr.dataset.idx)], onSaved: afterEventSaved });
+    });
+  });
+}
+
+// An event saved from outside the timeline (the Show record card, a ?openEvent
+// deep link): redraw the timeline and the panels derived from the same events.
+function afterEventSaved() {
+  renderTimelineSection();
+  renderShowRecordSection();
+}
+
+// Planned Tests panel + advisory completeness view (Test Planning Addendum §6.2).
+// planned_tests is an editable checklist; below each planned token, an advisory
+// "logged" / "no matching event found — verify" flag, string-matched
+// case-insensitively/trimmed against this dog's own test events. Never a hard
+// fraction — matching can legitimately miss on drift, typos, or grain mismatch,
+// so the view nudges rather than scores.
+async function renderPlannedTestsSection(eventsP = null) {
+  if (!els.plannedTests) return;
+  if (ctx.mode !== 'view' || !ctx.original) { els.plannedTests.innerHTML = ''; return; }
+  const d = ctx.original;
+  const planned = d.planned_tests || [];
+
+  const [events, kennelVocab, seenTokens] = await Promise.all([
+    eventsP || eventRepo.getForSubject('dog', d.id),
+    kennelRepo.getVocabulary(),
+    eventRepo.getTestTokens()
+  ]);
+  const loggedTokens = new Set();
+  for (const e of events) {
+    for (const t of testMatchTokensOf(e)) loggedTokens.add(t.trim().toLowerCase());
+  }
+  const vocabulary = [];
+  {
+    const seen = new Set();
+    for (const t of [...kennelVocab, ...seenTokens]) {
+      const key = t.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      vocabulary.push(t);
+    }
+  }
+
+  // (#8) Only show planned tokens that are NOT yet matched by a logged event —
+  // matched ones already surface in the Health-Test Summary card above.
+  const unlogged = planned.filter((t) => !loggedTokens.has(t.trim().toLowerCase()));
+
+  const rowsHtml = unlogged.length
+    ? `<ul class="linked-list" style="margin:14px 0 0; padding:0; list-style:none;">` + unlogged.map((t) => {
+        return `<li class="row-between" style="padding:8px 0; border-top:1px solid var(--border);">
+          <span>${esc(t)} <span class="badge badge-amber">Planned</span></span>
+          <span class="pill-row" style="flex-wrap:nowrap;">
+            <button class="btn btn-sm" data-act="pt-log" data-token="${esc(t)}" title="Log a completed ${esc(t)} with the test filled in">Log result</button>
+            <button class="btn btn-sm" data-act="pt-remove" data-token="${esc(t)}" aria-label="Remove ${esc(t)}" title="Remove">✕</button>
+          </span>
+        </li>`;
+      }).join('') + `</ul>`
+    : `<p class="muted" style="margin:14px 0 0;">${planned.length ? 'All planned tests logged.' : 'No tests planned yet.'}</p>`;
+
+  // Copy-plan-from sources (§5): other dogs' plans, and kennel panels (a
+  // kennel source is scoped to this dog's own breed at copy time — see the
+  // pt-copy handler below).
+  const dogSources = ctx.allDogs.filter((o) => o.id !== d.id && !o.pedigree_only && (o.planned_tests || []).length);
+  const kennelSources = ctx.allKennels.filter((k) => (k.preferred_tests || []).length);
+  const sourceOptions = [
+    `<option value="">— choose a source —</option>`,
+    ...kennelSources.map((k) => `<option value="kennel:${esc(k.id)}">Kennel: ${esc(k.kennel_name)}</option>`),
+    ...dogSources.map((o) => `<option value="dog:${esc(o.id)}">Dog: ${esc(o.call_name)}</option>`)
+  ].join('');
+
+  // (#9) Add/copy controls collapse behind a header toggle; state survives
+  // re-render (ctx.plannedTestsAddOpen) so it stays open across an add/copy.
+  const controlsHtml = `
+    <div id="pt-controls"${ctx.plannedTestsAddOpen ? '' : ' hidden'}>
+      <div class="form-grid" style="margin-top:12px;">
+        ${field('Add a test', `<input id="pt-new" type="text" list="pt-dl" placeholder="Type a test, then press Enter"><datalist id="pt-dl">${vocabulary.map((t) => `<option value="${esc(t)}"></option>`).join('')}</datalist>`)}
+      </div>
+      <div class="form-actions"><button class="btn btn-sm" id="pt-add">Add</button></div>
+      <div class="form-grid" style="margin-top:12px;">
+        ${field('Copy plan from…', `<select id="pt-source">${sourceOptions}</select>`)}
+      </div>
+      <div class="form-actions"><button class="btn btn-sm" id="pt-copy">Copy</button></div>
+    </div>`;
+
+  const bodyHtml = `
+    <p class="field-hint">The tests this dog's plan says to run — an undated intention, not an event. Advisory only.</p>
+    ${rowsHtml}
+    ${controlsHtml}`;
+
+  const hasContent = planned.length > 0;
+  const headerBtn = `<button class="btn btn-sm" id="pt-toggle">${ctx.plannedTestsAddOpen ? 'Hide' : '+ Plan a test'}</button>`;
+  els.plannedTests.innerHTML = renderCollapsibleCard('Planned Tests', bodyHtml, headerBtn, { sectionKey: 'planned-tests', hasContent });
+
+  document.getElementById('pt-toggle').addEventListener('click', () => {
+    ctx.plannedTestsAddOpen = !ctx.plannedTestsAddOpen;
+    renderPlannedTestsSection();
+  });
+  setupCollapsibleCard('planned-tests');
+
+  const addTest = async () => {
+    const input = document.getElementById('pt-new');
+    const val = input.value.trim();
+    if (!val) return;
+    try {
+      ctx.original = await dogRepo.addPlannedTests(d.id, [val]);
+      renderPlannedTestsSection();
+    } catch (e) { showError(e.message || String(e)); }
+  };
+  document.getElementById('pt-add').addEventListener('click', addTest);
+  document.getElementById('pt-new').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    addTest();
+  });
+  // "Log result": the event form with the test filled in (its usual type, the
+  // test's name, today), so once saved it no longer reads as planned.
+  els.plannedTests.querySelectorAll('[data-act="pt-log"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const name = btn.dataset.token;
+      const tests = (await Promise.all(TEST_TYPES.map((t) => eventRepo.getByType(t)))).flat();
+      const type = testTypeFor(name, tests, testTokensOf);
+      openEventForm({
+        subjectType: 'dog', subjectId: d.id, prefill: testPrefill(name, type, todayYMD()),
+        onSaved: () => { afterEventSaved(); renderPlannedTestsSection(); renderHealthTestsSection(); }
+      });
+    });
+  });
+  els.plannedTests.querySelectorAll('[data-act="pt-remove"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const remaining = (ctx.original.planned_tests || []).filter((t) => t !== btn.dataset.token);
+      try {
+        ctx.original = await dogRepo.update(d.id, { planned_tests: remaining });
+        renderPlannedTestsSection();
+      } catch (e) { showError(e.message || String(e)); }
+    });
+  });
+  document.getElementById('pt-copy').addEventListener('click', async () => {
+    const val = document.getElementById('pt-source').value;
+    if (!val) return;
+    const [kind, srcId] = val.split(':');
+    const tokens = kind === 'kennel'
+      ? kennelRepo.testsForBreed(ctx.kennelsById.get(srcId), d.breed)
+      : (ctx.dogsById.get(srcId)?.planned_tests || []);
+    try {
+      ctx.original = await dogRepo.addPlannedTests(d.id, tokens);
+      renderPlannedTestsSection();
+    } catch (e) { showError(e.message || String(e)); }
+  });
+}
+
+// Derived "Pairings" panel (Stage 3): pairings where this dog is sire or dam.
+// Shown for breeding-age dogs, or for any dog that actually appears in a pairing
+// (so a status change never hides existing breeding history). Read-only — pairings
+// are edited from their own page.
+const BREEDING_STATUSES = ['active_breeding', 'retired_breeding'];
+async function renderPairingsSection() {
+  if (!els.pairings) return;
+  if (ctx.mode !== 'view' || !ctx.original) { els.pairings.innerHTML = ''; return; }
+
+  const d = ctx.original;
+  const pairings = await pairingRepo.getForDog(d.id);
+  // Hide the panel entirely for non-breeding dogs that have no pairings.
+  if (!pairings.length && !BREEDING_STATUSES.includes(d.status)) { els.pairings.innerHTML = ''; return; }
+
+  pairings.sort((a, b) => (b.planned_date || '').localeCompare(a.planned_date || ''));
+
+  const rowsHtml = pairings.length
+    ? `<ul class="linked-list" style="margin:14px 0 0; padding:0; list-style:none;">` + pairings.map((p) => {
+        const role = p.sire_id === d.id ? 'Sire' : 'Dam';
+        const partnerId = p.sire_id === d.id ? p.dam_id : p.sire_id;
+        return `<li class="row-between" style="padding:8px 0; border-top:1px solid var(--border);">
+          <span><span class="faint">${role} ·</span> with <strong>${esc(dogName(partnerId) || '—')}</strong> ${badge(PAIRING_TYPE, p.pairing_type)} ${badge(PAIRING_STATUS, p.status)}${p.planned_date ? ` <span class="faint">${esc(fmtDate(p.planned_date))}</span>` : ''}</span>
+          <a class="btn btn-sm" href="pairing.html?id=${encodeURIComponent(p.id)}">Open →</a>
+        </li>`;
+      }).join('') + `</ul>`
+    : `<p class="muted" style="margin:14px 0 0;">No pairings recorded for this dog yet.</p>`;
+
+  const hasContent = pairings.length > 0;
+  const headerBtn = `<a class="btn btn-sm" href="pairing.html?new=1">+ Add Pairing</a>`;
+  els.pairings.innerHTML = renderCollapsibleCard('Pairings', rowsHtml, headerBtn, { sectionKey: 'pairings', hasContent });
+  setupCollapsibleCard('pairings');
+}
+
+// Derived "Sales" panel (Stage 4): placements recorded for this dog. Shown when
+// there are existing records, or for a dog that could plausibly be sold (owned/
+// co-owned) — read-only here; sales are edited from their own page.
+async function renderSalesSection() {
+  if (!els.sales) return;
+  if (ctx.mode !== 'view' || !ctx.original) { els.sales.innerHTML = ''; return; }
+  const d = ctx.original;
+  const sales = await saleRepo.getByDog(d.id);
+  if (!sales.length && !['owned', 'co_owned'].includes(d.ownership_type)) { els.sales.innerHTML = ''; return; }
+
+  sales.sort((a, b) => (b.sale_date || b.created_at || '').localeCompare(a.sale_date || a.created_at || ''));
+  const rowsHtml = sales.length
+    ? `<ul class="linked-list" style="margin:14px 0 0; padding:0; list-style:none;">` + sales.map((s) => `
+        <li class="row-between" style="padding:8px 0; border-top:1px solid var(--border);">
+          <span>${badge(REGISTRATION_TYPE, s.registration_type)} <strong>${esc(contactName(s.buyer_contact_id) || '—')}</strong> ${badge(SALE_STATUS, s.status)}${s.sale_date ? ` <span class="faint">${esc(fmtDate(s.sale_date))}</span>` : ''}</span>
+          <a class="btn btn-sm" href="sale.html?id=${encodeURIComponent(s.id)}">Open →</a>
+        </li>`).join('') + `</ul>`
+    : `<p class="muted" style="margin:14px 0 0;">No sales recorded for this dog yet.</p>`;
+
+  const hasContent = sales.length > 0;
+  const headerBtn = `<a class="btn btn-sm" href="sale.html?new=1&dog=${encodeURIComponent(d.id)}">+ Add Sale</a>`;
+  els.sales.innerHTML = renderCollapsibleCard('Sales', rowsHtml, headerBtn, { sectionKey: 'sales', hasContent });
+  setupCollapsibleCard('sales');
+}
+
+// Derived "Stud Services" panel (Stage 4): stud services where this dog appears
+// on either side. Shown for breeding-age dogs or a dog with existing records.
+async function renderStudServicesSection() {
+  if (!els.studServices) return;
+  if (!editionFlags.studServices) { els.studServices.innerHTML = ''; return; } // Pro-only in Lite
+  if (ctx.mode !== 'view' || !ctx.original) { els.studServices.innerHTML = ''; return; }
+  const d = ctx.original;
+  const studServices = await studServiceRepo.getForDog(d.id);
+  if (!studServices.length && !BREEDING_STATUSES.includes(d.status)) { els.studServices.innerHTML = ''; return; }
+  studServices.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+
+  const rowsHtml = studServices.length
+    ? `<ul class="linked-list" style="margin:14px 0 0; padding:0; list-style:none;">` + studServices.map((s) => {
+        const partnerId = s.our_dog_id === d.id ? s.partner_dog_id : s.our_dog_id;
+        return `<li class="row-between" style="padding:8px 0; border-top:1px solid var(--border);">
+          <span>${badge(STUD_SERVICE_DIRECTION, s.direction)} with <strong>${esc(dogName(partnerId) || '—')}</strong> ${badge(STUD_SERVICE_STATUS, s.status)}</span>
+          <a class="btn btn-sm" href="stud-service.html?id=${encodeURIComponent(s.id)}">Open →</a>
+        </li>`;
+      }).join('') + `</ul>`
+    : `<p class="muted" style="margin:14px 0 0;">No stud services recorded for this dog yet.</p>`;
+
+  const hasContent = studServices.length > 0;
+  const headerBtn = `<a class="btn btn-sm" href="stud-service.html?new=1&dog=${encodeURIComponent(d.id)}">+ Add Stud Service</a>`;
+  els.studServices.innerHTML = renderCollapsibleCard('Stud Services', rowsHtml, headerBtn, { sectionKey: 'stud-services', hasContent });
+  setupCollapsibleCard('stud-services');
+}
+
+// Derived "Contracts" panel: contracts that name this dog directly via
+// Contract.related_dog_id — lease/co_own/other only (sale/stud_service
+// contracts reach their dog through the linked Sale/StudService, and show up
+// in the Sales/Stud Services panels above instead). Shown for leased-in/out
+// dogs or a dog with existing linked contracts.
+async function renderContractsSection() {
+  if (!els.contracts) return;
+  if (!editionFlags.contracts) { els.contracts.innerHTML = ''; return; } // Pro-only in Lite
+  if (ctx.mode !== 'view' || !ctx.original) { els.contracts.innerHTML = ''; return; }
+  const d = ctx.original;
+  const contracts = await contractRepo.getByDog(d.id);
+  if (!contracts.length && !['leased_in', 'leased_out'].includes(d.ownership_type)) { els.contracts.innerHTML = ''; return; }
+  contracts.sort((a, b) => (b.signed_date || b.created_at || '').localeCompare(a.signed_date || a.created_at || ''));
+
+  const rowsHtml = contracts.length
+    ? `<ul class="linked-list" style="margin:14px 0 0; padding:0; list-style:none;">` + contracts.map((c) => `
+        <li class="row-between" style="padding:8px 0; border-top:1px solid var(--border);">
+          <span>${badge(CONTRACT_TYPE, c.contract_type)} <strong>${esc(c.title || 'Contract')}</strong> ${badge(CONTRACT_STATUS, c.status)}${c.signed_date ? ` <span class="faint">signed ${esc(fmtDate(c.signed_date))}</span>` : ''}</span>
+          <a class="btn btn-sm" href="contract.html?id=${encodeURIComponent(c.id)}">Open →</a>
+        </li>`).join('') + `</ul>`
+    : `<p class="muted" style="margin:14px 0 0;">No contracts naming this dog directly yet.</p>`;
+
+  const hasContent = contracts.length > 0;
+  const headerBtn = `<a class="btn btn-sm" href="contract.html?new=1&dog=${encodeURIComponent(d.id)}">+ Add Contract</a>`;
+  els.contracts.innerHTML = renderCollapsibleCard('Contracts', rowsHtml, headerBtn, { sectionKey: 'contracts', hasContent });
+  setupCollapsibleCard('contracts');
+}
+
+// How a litter was delivered, as a short pill (the full name on hover), once it's
+// Whelped or later and recorded.
+function deliveryPill(l) {
+  if (!l.delivery_type || !WHELPED_OR_LATER.includes(l.status)) return '';
+  const d = descriptor(LITTER_DELIVERY_TYPE, l.delivery_type);
+  return ` <span class="badge ${d.badge}" title="${esc(d.label)}">${esc(d.short || d.label)}</span>`;
+}
+
+// Derived "Litters" panel: litters where this dog is sire or dam.
+async function renderLittersSection() {
+  if (!els.litters) return;
+  if (ctx.mode !== 'view' || !ctx.original) { els.litters.innerHTML = ''; return; }
+  const d = ctx.original;
+  const litters = ctx.allLitters.filter((l) => l.sire_id === d.id || l.dam_id === d.id);
+
+  const rowsHtml = litters.length
+    ? `<ul class="linked-list" style="margin:14px 0 0; padding:0; list-style:none;">` + litters.map((l) => {
+        const role = l.sire_id === d.id ? 'Sire' : 'Dam';
+        const partnerId = l.sire_id === d.id ? l.dam_id : l.sire_id;
+        return `<li class="row-between" style="padding:8px 0; border-top:1px solid var(--border);">
+          <span><span class="faint">${role} ·</span> with <strong>${esc(dogName(partnerId) || '—')}</strong> ${badge(LITTER_STATUS, l.status)}${deliveryPill(l)}${l.whelp_date ? ` <span class="faint">${esc(fmtDate(l.whelp_date))}</span>` : ''}</span>
+          <a class="btn btn-sm" href="litter.html?id=${encodeURIComponent(l.id)}">Open →</a>
+        </li>`;
+      }).join('') + `</ul>`
+    : `<p class="muted" style="margin:14px 0 0;">No litters recorded for this dog yet.</p>`;
+
+  const hasContent = litters.length > 0;
+  const headerBtn = `<a class="btn btn-sm" href="litter.html?new=1">+ Add Litter</a>`;
+  els.litters.innerHTML = renderCollapsibleCard('Litters', rowsHtml, headerBtn, { sectionKey: 'litters', hasContent });
+  setupCollapsibleCard('litters');
+}
+
+// Pedigree centered on this dog (only for a saved dog in view mode). Clicking a
+// node opens the full Pedigree page re-centered there.
+function renderPedigreeSection() {
+  if (!els.pedigree) return;
+  if (ctx.mode === 'view' && ctx.original) {
+    const bodyHtml = `<div id="dog-pedigree-mount" style="margin-top:14px;"></div>`;
+    const headerBtn = `<a class="btn btn-sm" href="pedigree.html?id=${encodeURIComponent(ctx.original.id)}">Open full view →</a>`;
+    els.pedigree.innerHTML = renderCollapsibleCard('Pedigree', bodyHtml, headerBtn, { sectionKey: 'pedigree', hasContent: true });
+    renderPedigree({
+      mount: document.getElementById('dog-pedigree-mount'),
+      rootId: ctx.original.id,
+      generations: 3,
+      onNavigate: (id) => { location.href = `pedigree.html?id=${encodeURIComponent(id)}`; },
+      editable: true
+    }).then(() => {
+      // dog.html?id=…#offspring (Kels's "Zeus puppies"): the list draws after the
+      // page loads, so the browser's own jump to it has already missed. Once.
+      if (location.hash !== '#offspring' || ctx.offspringShown) return;
+      ctx.offspringShown = true;
+      document.getElementById('offspring')?.scrollIntoView({ block: 'start' });
+    });
+    setupCollapsibleCard('pedigree');
+  } else {
+    els.pedigree.innerHTML = '';
+  }
+}
+
+function renderAll() {
+  applyPedigreeOnlyVisibility();
+  renderTitle();
+  renderProfileActions();
+  renderHeaderActions();
+  if (ctx.mode === 'view') renderView();
+  else renderEdit();
+  renderRecordedCoiSection();
+  // Health-test and planned-test sections both read this dog's events; share one
+  // fetch (a single promise) so it's queried once, not twice, per render.
+  const eventsP = viewDogEventsPromise();
+  renderPlannedTestsSection(eventsP);
+  renderHealthTestsSection(eventsP);
+  renderShowRecordSection();
+  renderTimelineSection();
+  renderExpensesSection();
+  renderPairingsSection();
+  renderSalesSection();
+  renderStudServicesSection();
+  renderContractsSection();
+  renderLittersSection();
+  renderPedigreeSection();
+}
+
+async function main() {
+  await loadRefs();
+  const id = param('id');
+  const isNew = param('new');
+
+  if (isNew) {
+    ctx.mode = 'new';
+    ctx.draft = blankDog();
+    // ?pick=<stud service id> (Today's "Ready to add your pick puppy?"): the pick
+    // puppy from our stud's outside breeding, prefilled (studRules.pickPupDefaults).
+    const pick = param('pick') ? await studServiceRepo.getById(param('pick')) : null;
+    if (pick) {
+      ctx.pickServiceId = pick.id;
+      Object.assign(ctx.draft, pickPupDefaults(pick, ctx.dogsById.get(pick.our_dog_id)));
+    }
+    renderTitle();
+    renderCapBanner();
+    renderEdit();
+    renderProfileActions();
+    renderHeaderActions();
+    return;
+  }
+
+  if (!id) { showError('No dog id provided.'); return; }
+  const dog = await dogRepo.getById(id);
+  if (!dog) { showError('Dog not found. It may have been deleted.'); return; }
+  ctx.original = dog;
+  ctx.mode = 'view';
+  // Out-of-scope banner (Multi-Kennel Scope Spec §7). A dog page reached by id is
+  // deliberately NEVER scope-filtered — the pedigree tree links straight into it
+  // across kennels — so another kennel's dog renders in full with this above it.
+  // The DOG flavor: an external or leased-in dog belongs to no kennel of yours,
+  // is in scope everywhere, and must never carry a "belongs elsewhere" banner.
+  renderDogScopeNotice(document.getElementById('scope-notice'), dog);
+  renderAll();
+  openEventFromQuery('dog', dog.id, afterEventSaved);
+}
+
+main();

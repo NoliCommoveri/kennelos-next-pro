@@ -1,0 +1,1701 @@
+// cloudBackupUI.js — every cloud-backup screen (Cloud Phase 1 plan §2, §3.4,
+// §3.5; §9 step 5). Shared, not Pro-gated (plan §3.1), so Lite and Pro both
+// carry it. Every entry point checks isCloudAvailable() first and renders
+// NOTHING when the edition has no server (`cloudUrl: null`: Demo, the shared
+// default, a post-shutdown release), so no account wording ever appears there.
+//
+//   bootCloud()                 app.js, every page: scheduler, service notices
+//   mountCloudPane(el, getMode) Import/Export: the Cloud destination of Backup & restore
+//   mountCloudAccountCard(el)   Settings: the Account card
+//   (Today's card is assets/todayCloudCard.js; it loads this on a button press)
+//   runSignInAndRestore()       first-run "I already use KennelOS"
+//   resetSignOutFieldHtml() / signOutAfterResetIfChecked()   Reset App's question
+//   devicesModal()              "Your devices": erase a lost one, free its Pro license
+//   openDevicesFromLicenseWall() the Pro activation wall's "Lost a device?" link
+//   renderPrivateGapHint()      record pages: "private details are blank here" after a
+//                               restore that didn't bring them back (bootCloud)
+//   changeEmailModal()          Account: change the account's email (plan §2.6)
+//   proLineText()               Pro only: the Account section's "Pro on this account"
+//                               line, and Link a Pro purchase email… (License Link Plan §6)
+//
+// The private vault's screens are cloudVaultUI.js, imported from here only when
+// needed (vaultUI()); live sync's are cloudSyncUI.js (syncUI()), the same way.
+//
+// Layering: talks to data/cloud/* only (never cloudApi's fetch directly, never db).
+import { esc, confirmModal, alertModal, promptModal } from './ui.js';
+import { recordName, recordKind } from '../data/cloud/syncActivity.js';
+import { isCloudAvailable, isVaultOffered, isWaitlistOnlineOffered, isSyncOffered } from '../data/cloud/cloudConfig.js';
+import { askSame, askClashes } from './mergeQuestions.js';
+import { editionFlags } from '../data/editionConfig.js';
+import {
+  startSignIn, verifySignIn, currentAccount, signOut, signOutOtherDevices, defaultDeviceLabel,
+  changeAccountEmail, cancelAccountEmailChange, refreshEmailChangeState
+} from '../data/cloud/cloudAuth.js';
+import {
+  enableBackup, disableBackup, pushIfDirty, getBackupStatus, restoreLatestAndTakeOver,
+  replaceCloudWithThisDevice, listSnapshots, downloadSnapshot, previewRestore, restoreSnapshot,
+  restoreOnNewDevice, deleteCloudData, startBackupScheduler, getServiceNotices, CLOUD_BACKUP_EVENT,
+  prepareDirectJoin, adoptOwnKennel
+} from '../data/cloud/cloudBackup.js';
+import { listDevices, requestErase, cancelErase, releaseDeviceLicense } from '../data/cloud/cloudDevices.js';
+import {
+  entitlement, cachedEntitlement, startPurchaseLink, finishPurchaseLink, unlinkPurchaseEmails
+} from '../data/cloud/cloudEntitlement.js';
+import { CloudOfflineError, CloudRequestError, CloudAuthError, CloudConflictError } from '../data/cloud/cloudApi.js';
+import {
+  getCloudRestoredAt, setCloudRestoredAt, getProLicense, getLastBackupDate, getCloudSyncState, SYNC_STATUS_EVENT
+} from '../data/settings.js';
+import { isLicenseGated } from '../data/license.js';
+// Today's card and the helpers it shares with the Account card.
+import { pausedReason, changeRequestedBy, shortDate, FAILED_CHANGE_TEXT } from './todayCloudCard.js';
+import { getMyKennelName, shouldRequireKennelSetup } from '../data/kennelSetup.js';
+
+// --- Small helpers --------------------------------------------------------------
+
+// The vault's screens (Private Vault Plan §2), loaded on first use.
+const vaultUI = () => import('./cloudVaultUI.js');
+// Live sync's (Cloud Phase 2 plan §2), the same way.
+const syncUI = () => import('./cloudSyncUI.js');
+// This device keeps in step (read from settings, so pages don't load the sync loop).
+const syncsHere = () => getCloudSyncState().enabled === true;
+
+const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+
+// "just now", "4 minutes ago", "3 hours ago", "2 days ago".
+export function relativeTime(iso, now = Date.now()) {
+  const t = Date.parse(iso || '');
+  if (!t) return 'never';
+  const d = Math.max(0, now - t);
+  if (d < MINUTE) return 'just now';
+  if (d < HOUR) { const m = Math.round(d / MINUTE); return `${m} minute${m === 1 ? '' : 's'} ago`; }
+  if (d < DAY) { const h = Math.round(d / HOUR); return `${h} hour${h === 1 ? '' : 's'} ago`; }
+  const days = Math.round(d / DAY);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+}
+
+// "Today 9:14", "Yesterday 18:02", "Tue Sep 29 9:14" (plan §2.3).
+export function snapshotLabel(iso, now = new Date(), { seconds = false } = {}) {
+  const d = new Date(iso);
+  const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', ...(seconds ? { second: '2-digit' } : {}) });
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  if (d.getTime() >= startOfToday) return `Today ${time}`;
+  if (d.getTime() >= startOfToday - DAY) return `Yesterday ${time}`;
+  const date = d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+  return `${date} ${time}`;
+}
+
+// The status line on the card and the nudge (plan §2.2).
+export function statusLine(status, now = Date.now()) {
+  if (!status.enabled && status.movedToEdition === 'pro') return 'Backup is off on this device: your records moved to KennelOS Pro.';
+  if (!status.enabled) return 'Backup is off on this device.';
+  if (!status.lastPushedAt) return status.lastError?.code === 'offline' ? 'Not backed up yet: no internet?' : 'Not backed up yet.';
+  const age = now - Date.parse(status.lastPushedAt);
+  if (status.dirty && age > DAY) {
+    const days = Math.max(1, Math.round(age / DAY));
+    // Not the internet: a syncing device backs up only once it's in step (K03, 9).
+    if (status.syncWaiting) return `Not backed up for ${days} day${days === 1 ? '' : 's'}: backups wait until keeping devices in step can carry on (see Keep my devices in step).`;
+    return `Not backed up for ${days} day${days === 1 ? '' : 's'}: no internet?`;
+  }
+  return `Backed up ${relativeTime(status.lastPushedAt, now)}.`;
+}
+
+export function errorText(e) {
+  if (e instanceof CloudOfflineError) return 'No internet connection (or cloud backup is briefly down for maintenance). Try again shortly.';
+  if (e instanceof CloudAuthError) return 'Your cloud sign-in has expired. Sign in again.';
+  // A 409 is a conflict error; only email_taken has wording of its own.
+  if (e instanceof CloudConflictError && e.code === 'email_taken') {
+    return 'That email already has its own KennelOS account. Use another address, or delete that account first.';
+  }
+  // Sync, alerts and integrations need a Pro purchase on record for the account's email.
+  if (e?.code === 'pro_required') {
+    return e.extra?.lapsed
+      ? 'The Pro purchase on record for this account’s email has ended. Renew it, or link the email you bought Pro with (Settings → Account).'
+      : 'There’s no Pro purchase on record for this account’s email yet. Link the email you bought Pro with (Settings → Account), or get in touch.';
+  }
+  if (e instanceof CloudRequestError) {
+    switch (e.code) {
+      case 'bad_email': return "That doesn't look like an email address.";
+      case 'invalid_code': return "That code isn't right, or it has expired. Check it, or send a new one.";
+      case 'too_many_attempts': return 'Too many tries with that code. Send a new one.';
+      case 'rate_limited': return 'Too many codes requested. Wait an hour, then try again.';
+      case 'email_unavailable': return "Sign-in isn't available right now. Try again later.";
+      case 'email_failed': return "We couldn't send the email. Try again in a minute.";
+      case 'this_device': return "That's this device. Use Reset App to erase it.";
+      case 'not_pending': return 'That device has already erased itself, so there is nothing to cancel.';
+      case 'not_found': return "That device isn't on this account any more.";
+      case 'own_email': return "That's the email this account signs in with. Use the address you bought Pro with.";
+      case 'same_email': return "That's already this account's email.";
+      case 'email_taken': return 'That email already has its own KennelOS account. Use another address, or delete that account first.';
+      case 'invalid_old_code': return "The code for your current email isn't right, or it has expired. Check it, or send a new one.";
+      case 'helper_not_allowed': return 'Only the account’s owner can do that, on her own device.';
+      case 'link_expired': return 'That assist link has expired or was already used. Make a new one in KennelOS Assist.';
+      case 'still_in_setup': return 'KennelOS support is still setting up this account.';
+      case 'too_many_pairings': return 'This account is still waiting on earlier unlock requests. Give it a few minutes, then try again.';
+      default: return `Cloud backup refused that (${e.code || e.status}).`;
+    }
+  }
+  if (e && e.name === 'CapExceededError') {
+    const what = e.kind === 'litters' ? 'litters' : 'active dogs';
+    return `This backup has ${e.current} ${what}. KennelOS Lite keeps up to ${e.limit}, so nothing was restored. Upgrade to Pro to restore it.`;
+  }
+  return e?.message || String(e);
+}
+
+// A modal shell matching ui.js's (.modal-overlay > .modal). Returns the overlay.
+export function openModal(innerHtml, { width = 460, dismissible = true } = {}) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal" role="dialog" aria-modal="true" style="max-width:${width}px;">${innerHtml}</div>`;
+  document.body.appendChild(overlay);
+  if (!dismissible) overlay.setAttribute('data-no-dismiss', '');
+  if (!dismissible) overlay.addEventListener('click', (e) => { if (e.target === overlay) e.stopPropagation(); }, true);
+  return overlay;
+}
+
+// A typed confirmation ("type REPLACE"). Resolves true/false.
+export function typedConfirm({ title, message, phrase, confirmLabel }) {
+  return new Promise((resolve) => {
+    const overlay = openModal(`
+      <h2 style="margin-top:0;">${esc(title)}</h2>
+      <p class="muted" style="white-space:pre-wrap;">${esc(message)}</p>
+      <div class="field field-wide">
+        <label>Type <strong>${esc(phrase)}</strong> to confirm</label>
+        <input id="tc-input" type="text" autocomplete="off" placeholder="${esc(phrase)}">
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-danger" id="tc-ok" disabled>${esc(confirmLabel)}</button>
+        <button class="btn" id="tc-cancel">Cancel</button>
+      </div>`);
+    const input = overlay.querySelector('#tc-input');
+    const ok = overlay.querySelector('#tc-ok');
+    const done = (v) => { overlay.remove(); resolve(v); };
+    input.addEventListener('input', () => { ok.disabled = input.value.trim() !== phrase; });
+    ok.addEventListener('click', () => done(true));
+    overlay.querySelector('#tc-cancel').addEventListener('click', () => done(false));
+    input.focus();
+  });
+}
+
+// A "working…" modal with an optional progress bar. Returns { update, close }.
+export function progressModal(title) {
+  const overlay = openModal(`
+    <h2 style="margin-top:0;">${esc(title)}</h2>
+    <p class="muted" id="pg-text">Working…</p>
+    <progress id="pg-bar" style="width:100%;" hidden></progress>`, { dismissible: false });
+  return {
+    update(text, done = null, total = null) {
+      overlay.querySelector('#pg-text').textContent = text;
+      const bar = overlay.querySelector('#pg-bar');
+      if (total) { bar.hidden = false; bar.max = total; bar.value = done; } else bar.hidden = true;
+    },
+    close() { overlay.remove(); }
+  };
+}
+
+
+export const notify = () => { try { window.dispatchEvent(new CustomEvent(CLOUD_BACKUP_EVENT, { detail: { status: 'ui' } })); } catch { /* fine */ } };
+
+// --- Sign-in (plan §2.1) ------------------------------------------------------------
+// Email → code. A typed code, not a link: an iPhone home-screen app has its own
+// storage, separate from Safari's, and a link would sign in the wrong copy.
+// Resolves the account on success, null on cancel. The device is named
+// automatically (renamed under Your devices). `email` + `sendNow` start at the
+// code (an email typed on the kennel setup screen); `whatLink` adds "What's
+// backed up?" under the intro, for the turn-on paths.
+export function signInModal({ title = 'Sign in to cloud backup', intro = '', email: presetEmail = '', sendNow = false, whatLink = false } = {}) {
+  return new Promise((resolve) => {
+    const overlay = openModal(`<div id="si-body"></div>`);
+    const body = overlay.querySelector('#si-body');
+    const done = (v) => { overlay.remove(); resolve(v); };
+    let email = presetEmail || currentAccount()?.email || '';
+    const deviceLabel = currentAccount()?.deviceLabel || defaultDeviceLabel();
+
+    const showEmail = (errorMsg = '') => {
+      body.innerHTML = `
+        <h2 style="margin-top:0;">${esc(title)}</h2>
+        ${intro ? `<p class="muted">${esc(intro)}</p>` : ''}
+        ${whatLink ? '<p class="field-hint"><a href="#" id="si-what">What\'s backed up?</a></p>' : ''}
+        <div class="field field-wide"><label for="si-email">Your email</label>
+          <input id="si-email" type="email" autocomplete="email" inputmode="email" value="${esc(email)}" placeholder="you@example.com"></div>
+        <p class="field-hint">We use your email to send your code. We don't keep it.</p>
+        ${errorMsg ? `<div class="inline-error">${esc(errorMsg)}</div>` : ''}
+        <div class="form-actions">
+          <button class="btn btn-primary" id="si-send">Email me a code</button>
+          <button class="btn" id="si-cancel">Cancel</button>
+        </div>
+        ${isVaultOffered() ? '<p class="field-hint"><a href="#" id="si-lost">Lost access to your email?</a></p>' : ''}`;
+      body.querySelector('#si-lost')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        recoverAccountScreens(body, { email: body.querySelector('#si-email').value.trim(), onBack: () => showEmail(), onDone: () => done(null) });
+      });
+      const input = body.querySelector('#si-email');
+      const send = async () => {
+        email = input.value.trim();
+        const btn = body.querySelector('#si-send');
+        btn.disabled = true; btn.textContent = 'Sending…';
+        try { await startSignIn(email); showCode(); } catch (e) { showEmail(errorText(e)); }
+      };
+      body.querySelector('#si-send').addEventListener('click', send);
+      body.querySelector('#si-what')?.addEventListener('click', (e) => { e.preventDefault(); whatGetsBackedUpModal(); });
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+      body.querySelector('#si-cancel').addEventListener('click', () => done(null));
+      input.focus();
+    };
+
+    const showCode = (errorMsg = '', note = '') => {
+      body.innerHTML = `
+        <h2 style="margin-top:0;">Check your email</h2>
+        <p class="muted">We sent a 6-digit code to <strong>${esc(email)}</strong>. Type it here within 10 minutes.</p>
+        <div class="field"><label for="si-code">Code</label>
+          <input id="si-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="123456" style="font-size:20px;letter-spacing:4px;max-width:180px;"></div>
+        ${note ? `<p class="field-hint">${esc(note)}</p>` : ''}
+        ${errorMsg ? `<div class="inline-error">${esc(errorMsg)}</div>` : ''}
+        <p class="field-hint">Didn't get it? Check your spam folder, or <a href="#" id="si-resend">send a new code</a>.</p>
+        <div class="form-actions">
+          <button class="btn btn-primary" id="si-verify">Sign in</button>
+          <button class="btn" id="si-back">Use a different email</button>
+          <button class="btn" id="si-cancel">Cancel</button>
+        </div>`;
+      const input = body.querySelector('#si-code');
+      const verify = async () => {
+        const btn = body.querySelector('#si-verify');
+        btn.disabled = true; btn.textContent = 'Checking…';
+        try {
+          await verifySignIn(email, input.value, { deviceLabel });
+          notify();
+          done(currentAccount());
+        } catch (e) {
+          if (e instanceof CloudRequestError && e.code === 'too_many_attempts') showEmail(errorText(e));
+          else showCode(errorText(e));
+        }
+      };
+      body.querySelector('#si-verify').addEventListener('click', verify);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') verify(); });
+      body.querySelector('#si-resend').addEventListener('click', async (e) => {
+        e.preventDefault();
+        try { await startSignIn(email); showCode('', 'A new code is on its way. Only the newest code works.'); } catch (err) { showCode(errorText(err)); }
+      });
+      body.querySelector('#si-back').addEventListener('click', () => showEmail());
+      body.querySelector('#si-cancel').addEventListener('click', () => done(null));
+      input.focus();
+    };
+
+    if (sendNow && email) {
+      body.innerHTML = '<p class="muted">Sending your code…</p>';
+      startSignIn(email).then(() => showCode(), (e) => showEmail(errorText(e)));
+    } else {
+      showEmail();
+    }
+  });
+}
+
+// --- Recovering the account with no signed-in device (Phase 1 plan §2.7) ----------
+// "Lost access to your email?" on the sign-in screen: the recovery code proves
+// the account, then a new address (with its code) waits a day. Drawn into the
+// sign-in modal's body; `onBack` returns to its email screen, `onDone` closes it.
+function recoverAccountScreens(body, { email = '', onBack, onDone }) {
+  let recovery = null; // { email, check } once the code is proven
+  let newEmail = '';
+  const vault = () => import('../data/cloud/cloudVault.js');
+
+  const showProve = (errorMsg = '') => {
+    body.innerHTML = `
+      <h2 style="margin-top:0;">Get back into your account</h2>
+      <p class="muted">If you can't get email at your old address and no device is still signed in, your recovery code can prove the account is yours.</p>
+      <div class="field field-wide"><label for="ra-email">Your account's email</label>
+        <input id="ra-email" type="email" autocomplete="email" inputmode="email" value="${esc(email)}" placeholder="you@example.com"></div>
+      <div class="field field-wide"><label for="ra-code">Recovery code</label>
+        <input id="ra-code" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"></div>
+      ${errorMsg ? `<div class="inline-error">${esc(errorMsg)}</div>` : ''}
+      <div class="form-actions">
+        <button class="btn btn-primary" id="ra-go">Continue</button>
+        <button class="btn" id="ra-back">Back</button>
+      </div>`;
+    const go = async () => {
+      email = body.querySelector('#ra-email').value.trim();
+      const code = body.querySelector('#ra-code').value;
+      const btn = body.querySelector('#ra-go');
+      btn.disabled = true; btn.textContent = 'Checking…';
+      try {
+        const { startAccountRecovery } = await vault();
+        recovery = await startAccountRecovery(email, code);
+        showNewEmail();
+      } catch (e) {
+        showProve(recoveryErrorText(e));
+      }
+    };
+    body.querySelector('#ra-go').addEventListener('click', go);
+    body.querySelector('#ra-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+    body.querySelector('#ra-back').addEventListener('click', () => onBack());
+    body.querySelector(email ? '#ra-code' : '#ra-email').focus();
+  };
+
+  const showNewEmail = (errorMsg = '') => {
+    body.innerHTML = `
+      <h2 style="margin-top:0;">Your new email</h2>
+      <p class="muted">We'll send a code to check it. This becomes your account's email.</p>
+      <div class="field field-wide"><label for="ra-new">New email</label>
+        <input id="ra-new" type="email" autocomplete="email" inputmode="email" value="${esc(newEmail)}" placeholder="you@example.com"></div>
+      ${errorMsg ? `<div class="inline-error">${esc(errorMsg)}</div>` : ''}
+      <div class="form-actions">
+        <button class="btn btn-primary" id="ra-send">Email me a code</button>
+        <button class="btn" id="ra-cancel">Cancel</button>
+      </div>`;
+    const send = async () => {
+      newEmail = body.querySelector('#ra-new').value.trim();
+      const btn = body.querySelector('#ra-send');
+      btn.disabled = true; btn.textContent = 'Sending…';
+      try { await startSignIn(newEmail); showNewCode(); } catch (e) { showNewEmail(errorText(e)); }
+    };
+    body.querySelector('#ra-send').addEventListener('click', send);
+    body.querySelector('#ra-new').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+    body.querySelector('#ra-cancel').addEventListener('click', () => onDone());
+    body.querySelector('#ra-new').focus();
+  };
+
+  const showNewCode = (errorMsg = '', note = '') => {
+    body.innerHTML = `
+      <h2 style="margin-top:0;">Check your email</h2>
+      <p class="muted">We sent a 6-digit code to <strong>${esc(newEmail)}</strong>. Type it here within 10 minutes.</p>
+      <div class="field"><label for="ra-ncode">Code</label>
+        <input id="ra-ncode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="123456" style="font-size:20px;letter-spacing:4px;max-width:180px;"></div>
+      ${note ? `<p class="field-hint">${esc(note)}</p>` : ''}
+      ${errorMsg ? `<div class="inline-error">${esc(errorMsg)}</div>` : ''}
+      <p class="field-hint">Didn't get it? Check your spam folder, or <a href="#" id="ra-resend">send a new code</a>.</p>
+      <div class="form-actions">
+        <button class="btn btn-primary" id="ra-verify">Continue</button>
+        <button class="btn" id="ra-other">Use a different email</button>
+        <button class="btn" id="ra-cancel">Cancel</button>
+      </div>`;
+    const verify = async () => {
+      const btn = body.querySelector('#ra-verify');
+      btn.disabled = true; btn.textContent = 'Checking…';
+      try {
+        const { finishAccountRecovery } = await vault();
+        const res = await finishAccountRecovery(recovery, { newEmail, code: body.querySelector('#ra-ncode').value });
+        showPending(res.effectiveAt);
+      } catch (e) {
+        if (e instanceof CloudRequestError && e.code === 'too_many_attempts') showNewEmail(errorText(e));
+        else if (e?.code === 'email_taken' || e?.code === 'same_email') showNewEmail(errorText(e));
+        else showNewCode(errorText(e));
+      }
+    };
+    body.querySelector('#ra-verify').addEventListener('click', verify);
+    body.querySelector('#ra-ncode').addEventListener('keydown', (e) => { if (e.key === 'Enter') verify(); });
+    body.querySelector('#ra-resend').addEventListener('click', async (e) => {
+      e.preventDefault();
+      try { await startSignIn(newEmail); showNewCode('', 'A new code is on its way. Only the newest code works.'); } catch (err) { showNewCode(errorText(err)); }
+    });
+    body.querySelector('#ra-other').addEventListener('click', () => showNewEmail());
+    body.querySelector('#ra-cancel').addEventListener('click', () => onDone());
+    body.querySelector('#ra-ncode').focus();
+  };
+
+  const showPending = (effectiveAt) => {
+    const when = new Date(effectiveAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+    body.innerHTML = `
+      <h2 style="margin-top:0;">Your email will change in 1 day</h2>
+      <p>To keep your account safe, the change takes effect on <strong>${esc(when)}</strong>. Then sign in with <strong>${esc(newEmail)}</strong> and restore your backup. If a device is still signed in somewhere, it will show this change with a way to cancel it.</p>
+      <div class="form-actions"><button class="btn btn-primary" id="ra-done">Done</button></div>`;
+    body.querySelector('#ra-done').addEventListener('click', () => onDone());
+  };
+
+  showProve();
+}
+
+function recoveryErrorText(e) {
+  if (e?.name === 'RecoveryError') {
+    // not_ready: the code opened her real vault, but the server has no recovery check
+    // for it yet (a vault from before the check existed). no_match: the code opened
+    // nothing, which is also what an account with no vault answers (review K05-6).
+    return e.code === 'not_ready'
+      ? "That recovery code is right, but this account hasn't been set up for recovery yet. Open KennelOS on a device that's still signed in to it (it finishes the setup by itself), then try again here."
+      : "We couldn't match that code to this account. Check it and try again. Recovery codes come with Sensitive records: if you never turned those on, a code can't get you back in. Sign in on a device that still has your account, or get in touch.";
+  }
+  return errorText(e);
+}
+
+
+// --- "What gets backed up" (plan §2.1 step 3) ------------------------------------
+// Information only, opened from "What's backed up?" (since 2026-10-10 it's no
+// longer a step of turning backup on).
+function whatGetsBackedUpModal() {
+  return new Promise((resolve) => {
+    const overlay = openModal(`
+      <h2 style="margin-top:0;">What gets backed up</h2>
+      <p><strong>Cloud backup:</strong> your dogs, litters, pairings, health records and
+        test results, kennels, contacts' <strong>names</strong>, and your waitlist: its order, settings,
+        application form, and each applicant's <strong>name and email</strong>.</p>
+      <p><strong>Sensitive records:</strong> contacts' phone, email and address, prices and
+        payments (including waitlist fees paid), Financials, contracts, receipts, the rest of each
+        application's answers, and your notes. ${isVaultOffered()
+        ? 'They stay on this device unless you turn on sensitive records backup, which <strong>encrypts</strong> them so only you can open them.'
+        : 'They stay on this device. To keep a copy, download a file backup now and then from <a href="import-export.html">Import / Export</a>.'}</p>
+      <p class="field-hint">Backups run automatically after you make changes. The last 30 days are kept,
+        so you can roll back to an earlier day.</p>
+      <div class="form-actions"><button class="btn btn-primary" id="wb-ok">OK</button></div>`, { width: 500 });
+    overlay.querySelector('#wb-ok').addEventListener('click', () => { overlay.remove(); resolve(); });
+  });
+}
+
+// Run a push with a progress modal, then deal with whatever came back.
+async function pushWithProgress(run, title = 'Backing up…') {
+  const pg = progressModal(title);
+  let result;
+  try {
+    result = await run((p) => {
+      if (p.phase === 'files' && p.total) pg.update(`Uploading documents: ${p.done + 1} of ${p.total}…`, p.done, p.total);
+      else pg.update('Uploading your records…');
+    });
+  } finally {
+    pg.close();
+  }
+  await handlePushResult(result);
+  notify();
+  return result;
+}
+
+// "Turn on": sign in if needed → first backup → the sensitive records card
+// (passkey first). `email` comes from the kennel setup screen: its code is sent
+// at once.
+const TURN_ON_INTRO = "Your dogs, litters, pairings and health records back up automatically. We'll email you a 6-digit code: no password to remember.";
+
+export async function turnOnFlow({ email = '' } = {}) {
+  if (!isCloudAvailable()) return false;
+  let account = currentAccount();
+  if (!account?.signedIn || (email && account.email !== email)) {
+    account = await signInModal({ title: 'Turn on cloud backup', intro: TURN_ON_INTRO, whatLink: true, email, sendNow: Boolean(email) });
+    if (!account) return false;
+  }
+  const result = await pushWithProgress((onProgress) => enableBackup({ onProgress }));
+  // Private Vault Plan §2.1: offered after the first backup succeeds.
+  if (result?.status === 'pushed' && isVaultOffered() && getBackupStatus().vault !== 'on') {
+    const ui = await vaultUI();
+    if ((await ui.refreshVaultState()) === 'off') await ui.turnOnVaultFlow({ offer: true });
+  }
+  return true;
+}
+
+// --- Push results → the user (plan §3.4, §3.5) ------------------------------------
+export async function handlePushResult(result) {
+  switch (result?.status) {
+    case 'skipped':
+      // Back up now on a syncing device that isn't in step: say so, don't just
+      // flash a progress bar (K03 review, 9).
+      if (result.reason === 'sync_behind') {
+        await alertModal({
+          title: 'Backup is waiting',
+          message: getCloudSyncState().lastError && getCloudSyncState().lastError.code !== 'offline'
+            ? 'This device keeps your devices in step, and that is paused (see Keep my devices in step on the Cloud pane). Backups carry on once it\'s fixed.'
+            : 'This device keeps your devices in step and has changes still to send or bring down. It backs up as soon as it\'s in step, usually within a minute.'
+        });
+      }
+      return;
+    case 'pushed':
+    case 'unchanged':
+      return;
+    case 'offline':
+      await alertModal({ title: 'Backup is on', message: "There's no internet connection right now, so it will back up automatically when you're back online." });
+      return;
+    case 'conflict':
+      await conflictDialog(result);
+      return;
+    case 'shrink':
+      await shrinkDialog(result);
+      return;
+    case 'vault_locked': {
+      const unlocked = await (await vaultUI()).unlockModal({
+        merge: true,
+        intro: result.stale
+          ? 'Sensitive records backup was turned off and on again on another device, so it has a new recovery code. Unlock it here to keep backing up.'
+          : 'This account backs up sensitive records, encrypted. Unlock them on this device to keep backing up.'
+      });
+      if (unlocked) await pushWithProgress((onProgress) => pushIfDirty({ force: true, onProgress }));
+      return;
+    }
+    case 'auth': {
+      const account = await signInModal({ title: 'Sign in again', intro: 'Your cloud sign-in has expired. Backup is paused until you sign in again. Your records on this device are untouched.' });
+      if (account) await pushWithProgress((onProgress) => pushIfDirty({ force: true, onProgress }));
+      return;
+    }
+    default:
+      await alertModal({ title: "Backup didn't finish", message: result?.message || 'Something went wrong. It will try again automatically.' });
+  }
+}
+
+// One backup device at a time (plan §3.4): restore theirs here, or replace it.
+// A Lite device whose program is now backed up from Pro gets movedToProDialog
+// first: that's an upgrade, not a second device.
+async function conflictDialog(result, { skipMoved = false } = {}) {
+  if (!skipMoved && result.movedToEdition === 'pro') return movedToProDialog(result);
+  // A program that keeps its devices in step has no one backing device: join it.
+  if (result.syncing && isSyncOffered()) return (await syncUI()).joinOfferDialog();
+  const kennel = (await getMyKennelName()) || 'your program';
+  const who = result.backingDevice?.label || 'another device';
+  const when = result.backingDevice?.lastPushAt ? ` (last backup ${relativeTime(result.backingDevice.lastPushAt)})` : '';
+  const message = result.ownDevice
+    ? `The cloud already has a backup of ${kennel} from this device${when}, made before it was reset or signed out.`
+    : `Backups for ${kennel} are coming from ${who}${when}. Only one device backs up at a time.`;
+  const choice = await new Promise((resolve) => {
+    const overlay = openModal(`
+      <h2 style="margin-top:0;">There's already a backup</h2>
+      <p class="muted">${esc(message)}</p>
+      <ul class="muted" style="padding-left:18px;">
+        <li><strong>Restore that backup here</strong> — its records are merged into this device (anything newer here is kept, and nothing sensitive here is lost). This device then takes over the backups.</li>
+        <li><strong>Replace it with this device's records</strong> — this device's records become the backup. The old one stays in the 30-day history.</li>
+      </ul>
+      <div class="form-actions">
+        <button class="btn btn-primary" data-v="restore">Restore that backup here</button>
+        <button class="btn" data-v="replace">Replace it…</button>
+        <button class="btn" data-v="cancel">Not now</button>
+      </div>`, { width: 520 });
+    overlay.querySelectorAll('[data-v]').forEach((b) => b.addEventListener('click', () => { overlay.remove(); resolve(b.dataset.v); }));
+  });
+
+  if (choice === 'restore') return restoreAndTakeOverFlow();
+  if (choice === 'replace') {
+    const ok = await typedConfirm({
+      title: 'Replace the cloud backup?',
+      message: `This device's records become the backup for ${kennel}. Backups from ${who} stop. The old backup stays in the 30-day history, so you can still restore it.`,
+      phrase: 'REPLACE',
+      confirmLabel: 'Replace the backup'
+    });
+    if (!ok) return;
+    try {
+      await pushWithProgress((onProgress) => replaceCloudWithThisDevice({ onProgress }), 'Replacing the backup…');
+    } catch (e) {
+      await alertModal({ title: "That didn't work", message: errorText(e) });
+    }
+  }
+}
+
+// Editions Plan, "Converting Lite → Pro": the owner restored this program into
+// Pro, which now backs it up. The answer is to stop backing up here, not to
+// fight over it. "Other choices…" still reaches the usual restore / replace.
+async function movedToProDialog(result) {
+  const kennel = (await getMyKennelName()) || 'your program';
+  const who = result.backingDevice?.label;
+  const when = result.backingDevice?.lastPushAt ? `, last backup ${relativeTime(result.backingDevice.lastPushAt)}` : '';
+  const choice = await new Promise((resolve) => {
+    const overlay = openModal(`
+      <h2 style="margin-top:0;">Your records moved to KennelOS Pro</h2>
+      <p class="muted">${esc(`${kennel} is now backed up from KennelOS Pro${who ? ` (${who}${when})` : ''}. Keep working in Pro; changes made here in Lite won't reach it.`)}</p>
+      <p class="muted">Turning off backup here leaves your Pro backup exactly as it is. Your records on this device stay too.</p>
+      <div class="form-actions">
+        <button class="btn btn-primary" data-v="off">Turn off backup here</button>
+        <button class="btn" data-v="other">Other choices…</button>
+        <button class="btn" data-v="cancel">Not now</button>
+      </div>`, { width: 520 });
+    overlay.querySelectorAll('[data-v]').forEach((b) => b.addEventListener('click', () => { overlay.remove(); resolve(b.dataset.v); }));
+  });
+  if (choice === 'off') {
+    disableBackup({ movedToEdition: 'pro' });
+    window.dispatchEvent(new CustomEvent(CLOUD_BACKUP_EVENT, { detail: { status: 'skipped' } }));
+  }
+  if (choice === 'other') return conflictDialog(result, { skipMoved: true });
+}
+
+// A cloud restore's questions (cloudBackup.restoreSnapshot `ask`): records
+// entered both here and in the backup, as a file Merge asks them.
+const askRestore = ({ asks, clashes }) => (asks
+  ? askSame(asks, { theirs: 'in your cloud backup' })
+  : askClashes(clashes, { theirsLabel: 'your cloud backup' }));
+
+async function restoreAndTakeOverFlow() {
+  if (isVaultOffered()) await (await vaultUI()).unlockBeforeRestore();
+  const pg = progressModal('Restoring the backup…');
+  try {
+    const { restored, push, cancelled } = await restoreLatestAndTakeOver({
+      onProgress: (done, total) => pg.update(`Downloading documents: ${done} of ${total}…`, done, total),
+      ask: askRestore
+    });
+    pg.close();
+    if (cancelled) return;
+    if (restored?.missingFiles?.length) {
+      await alertModal({ title: 'Restored', message: `${restored.missingFiles.length} document file(s) couldn't be downloaded. Try again later from Import / Export.` });
+    }
+    await handlePushResult(push);
+    location.reload();
+  } catch (e) {
+    pg.close();
+    await alertModal({ title: "That didn't work", message: errorText(e) });
+  }
+}
+
+// The shrink guard's question (plan §3.5).
+async function shrinkDialog(result) {
+  const s = result.shrink || {};
+  const lines = [];
+  if (s.dogs) lines.push(`Dogs: ${s.dogs.previous} in the backup, ${s.dogs.next} here`);
+  if (s.total) lines.push(`All records: ${s.total.previous} in the backup, ${s.total.next} here`);
+  const choice = await new Promise((resolve) => {
+    const overlay = openModal(`
+      <h2 style="margin-top:0;">This device has far fewer records than your last backup</h2>
+      <p class="muted">${lines.map(esc).join('<br>')}</p>
+      <p class="muted">That can happen after clearing the browser, a "Replace" import, or Reset App. Backup is paused so the good copy isn't overwritten.</p>
+      <div class="form-actions">
+        <button class="btn btn-primary" data-v="restore">Restore from backup instead</button>
+        <button class="btn btn-danger" data-v="upload">Upload anyway</button>
+        <button class="btn" data-v="cancel">Not now</button>
+      </div>`, { width: 520 });
+    overlay.querySelectorAll('[data-v]').forEach((b) => b.addEventListener('click', () => { overlay.remove(); resolve(b.dataset.v); }));
+  });
+  if (choice === 'restore') return restoreAndTakeOverFlow();
+  if (choice === 'upload') await pushWithProgress((onProgress) => pushIfDirty({ force: true, allowShrink: true, onProgress }));
+}
+
+// --- Restore as of… (plan §2.3, §4.3) ------------------------------------------------
+// The backups to choose from, as <option> data. Two backups in the same minute
+// ("Back up now" twice) would read the same, so a repeated label gets its seconds.
+function snapshotOptions(snapshots) {
+  const labels = snapshots.map((s) => snapshotLabel(s.createdAt));
+  return snapshots.map((s, i) => ({
+    value: s.id,
+    label: `${labels.filter((l) => l === labels[i]).length > 1 ? snapshotLabel(s.createdAt, new Date(), { seconds: true }) : labels[i]}`
+      + ` — ${s.counts?.dogs ?? 0} dogs${s.deviceLabel ? `, from ${s.deviceLabel}` : ''}`
+  }));
+}
+
+// Roll back to the backup picked in the card's dropdown: load it, say what would
+// change, and write nothing until she confirms.
+async function rollBackTo(id, snapshots) {
+  const chosen = snapshots.find((s) => s.id === id);
+  if (!chosen) return;
+
+  const pg = progressModal('Loading that backup…');
+  let envelope; let preview;
+  try {
+    envelope = await downloadSnapshot(id);
+    preview = await previewRestore(envelope, { overwrite: true });
+  } catch (e) {
+    pg.close();
+    return alertModal({ title: "Couldn't load that backup", message: errorText(e) });
+  }
+  pg.close();
+  // Distinct records either part of the backup would change: the sensitive
+  // part counts too, when this device can open it (K03 review, 7).
+  const { updated, inserted } = preview.counts;
+  if (!updated && !inserted) return alertModal({ title: 'Nothing to restore', message: `Your records already match the backup from ${snapshotLabel(chosen.createdAt)}.` });
+  const syncing = getCloudSyncState().enabled;
+
+  const sensitiveLine = chosen.vaultKeyId && getBackupStatus().vault === 'on'
+    ? 'Their sensitive records (phone numbers, prices, notes…) roll back too, from the encrypted backup.'
+    : 'Their sensitive records (phone numbers, prices, notes…) keep their current values: those aren\'t in this backup, so they can\'t roll back.';
+  const choice = await rollBackChoice({
+    title: `Roll back to ${snapshotLabel(chosen.createdAt)}?`,
+    canChoose: preview.records.length > 0,
+    paragraphs: [
+      updated ? `${updated} record(s) will be rolled back to how they were then.` : '',
+      inserted ? `${inserted} record(s) missing here will be added back.` : '',
+      chosen.vaultKeyId && getBackupStatus().vault === 'on'
+        ? 'Their sensitive records (phone numbers, prices, notes…) roll back too, from the encrypted backup.'
+        : 'Their sensitive records (phone numbers, prices, notes…) keep their current values: those aren\'t in this backup, so they can\'t roll back.',
+      // A syncing device sends the rolled-back records to every device (K03, 6).
+      syncing
+        ? 'This device keeps your devices in step, so the roll back reaches all of them: a change made on any device since then is undone everywhere.'
+        : '',
+      'Records added since then stay. Archive them by hand if you don\'t want them.',
+      'To bring back only some records (one dog\'s notes, a contact deleted by mistake), choose them instead.'
+    ].filter(Boolean)
+  });
+  if (!choice) return;
+  let only = null;
+  if (choice === 'choose') {
+    only = await chooseRecordsModal(preview.records, chosen, { syncing, sensitiveLine });
+    if (!only) return;
+  }
+  const pg2 = progressModal('Restoring…');
+  try {
+    const r = await restoreSnapshot(envelope, {
+      overwrite: true, ask: askRestore, only, onProgress: (d, t) => pg2.update(`Downloading documents: ${d} of ${t}…`, d, t)
+    });
+    pg2.close();
+    if (r.cancelled) return;
+    await alertModal({
+      title: only ? 'Restored' : 'Rolled back',
+      message: r.missingFiles?.length ? `Done. ${r.missingFiles.length} document file(s) couldn't be downloaded.` : 'Done. Reloading…'
+    });
+    location.reload();
+  } catch (e) {
+    pg2.close();
+    await alertModal({ title: "That didn't work", message: errorText(e) });
+  }
+}
+
+// Roll back everything, or Choose records…: → 'all' | 'choose' | null.
+function rollBackChoice({ title, paragraphs, canChoose }) {
+  return new Promise((resolve) => {
+    const overlay = openModal(`
+      <h2 style="margin-top:0;">${esc(title)}</h2>
+      ${paragraphs.map((p) => `<p>${esc(p)}</p>`).join('')}
+      <div class="form-actions" style="flex-wrap:wrap;">
+        <button class="btn" type="button" data-v="">Cancel</button>
+        ${canChoose ? '<button class="btn" type="button" data-v="choose">Choose records…</button>' : ''}
+        <button class="btn btn-danger" type="button" data-v="all">Roll back everything</button>
+      </div>`, { width: 540 });
+    overlay.querySelectorAll('[data-v]').forEach((b) => b.addEventListener('click', () => {
+      overlay.remove();
+      resolve(b.dataset.v || null);
+    }));
+  });
+}
+
+// Restore one record (or a few) from a backup: every record the backup would
+// change, ticked by her, newest-looking names first by kind. → a Set of
+// '<table>:<id>', or null. A chosen document brings its file (cloudBackup).
+function chooseRecordsModal(records, chosen, { syncing, sensitiveLine }) {
+  const sorted = [...records].map((r) => ({ ...r, name: recordName(r.tbl, r.row), kind: recordKind(r.tbl) }))
+    .sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name));
+  return new Promise((resolve) => {
+    const overlay = openModal(`
+      <h2 style="margin-top:0;">Choose what to restore</h2>
+      <p class="muted">From the backup of ${esc(snapshotLabel(chosen.createdAt))}. Each record you tick goes back to how it was then${syncing ? ', on every device in step' : ''}; everything else stays as it is.</p>
+      <p class="field-hint">${esc(sensitiveLine)}</p>
+      ${sorted.length > 8 ? '<div class="field"><input type="search" data-filter aria-label="Find a record" placeholder="Find a record…"></div>' : ''}
+      <ul data-list style="list-style:none;padding:0;margin:0;max-height:50vh;overflow:auto;">
+        ${sorted.map((r) => `<li data-name="${esc(`${r.name} ${r.kind}`.toLowerCase())}" style="padding:6px 0;border-top:1px solid var(--border);">
+          <label style="display:flex;gap:8px;align-items:flex-start;">
+            <input type="checkbox" value="${esc(r.key)}">
+            <span>${esc(r.name)}<span class="field-hint" style="display:block;">${esc(r.kind)} · ${r.insert ? 'missing here: added back' : 'changed since then'}</span></span>
+          </label></li>`).join('')}
+      </ul>
+      <div class="form-actions">
+        <button class="btn" type="button" data-v="cancel">Cancel</button>
+        <button class="btn btn-primary" type="button" data-v="restore" disabled>Restore</button>
+      </div>`, { width: 540 });
+    const go = overlay.querySelector('[data-v="restore"]');
+    const boxes = [...overlay.querySelectorAll('input[type="checkbox"]')];
+    const count = () => {
+      const n = boxes.filter((b) => b.checked).length;
+      go.disabled = n === 0;
+      go.textContent = n ? `Restore ${n} record${n === 1 ? '' : 's'}` : 'Restore';
+    };
+    boxes.forEach((b) => b.addEventListener('change', count));
+    overlay.querySelector('[data-filter]')?.addEventListener('input', (e) => {
+      const q = e.target.value.trim().toLowerCase();
+      overlay.querySelectorAll('[data-list] li').forEach((li) => { li.hidden = !!q && !li.dataset.name.includes(q); });
+    });
+    overlay.querySelectorAll('[data-v]').forEach((b) => b.addEventListener('click', () => {
+      const keys = boxes.filter((x) => x.checked).map((x) => x.value);
+      overlay.remove();
+      resolve(b.dataset.v === 'restore' && keys.length ? new Set(keys) : null);
+    }));
+  });
+}
+
+// --- Import/Export: the Cloud destination of Backup & restore (plan §2.2, §2.4) --------
+// The card and its two axes (Back up | Restore, and where to/from) belong to
+// pages/import-export.js. This fills the Cloud destination's pane, in the same
+// shape as the other two: a blurb, "Last backup", the action (Back up now, or the
+// backups to roll back to, right on the page), and a connection strip at the foot.
+// `getMode()` says which side is showing ('backup' | 'restore'). Returns the
+// render function, which the page calls when the tab or destination changes.
+export function mountCloudPane(el, getMode) {
+  if (!el || !isCloudAvailable()) return () => {};
+  const render = () => { if (!el.hidden) renderPane(el, getMode(), render); };
+  // A background push must not rebuild a dropdown she has open.
+  const refresh = () => {
+    if (el.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return;
+    render();
+  };
+  window.addEventListener(CLOUD_BACKUP_EVENT, refresh);
+  window.addEventListener(SYNC_STATUS_EVENT, refresh);
+  // Learn the vault's state from the server once per visit (another device may
+  // have turned it on or off); refreshVaultState re-renders through the event.
+  if (isVaultOffered() && currentAccount()?.signedIn) vaultUI().then((ui) => ui.refreshVaultState()).catch(() => {});
+  return render;
+}
+
+const backupStamp = (iso) => (iso ? new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'Never');
+
+// The cloud backups, fetched once per (account, last backup) so a re-render
+// doesn't ask the server again.
+let snapshotCache = null;
+function cachedSnapshots(status) {
+  const key = `${status.account?.email || ''}|${status.lastPushedAt || ''}`;
+  if (!snapshotCache || snapshotCache.key !== key) {
+    const promise = listSnapshots();
+    snapshotCache = { key, promise };
+    promise.catch(() => { if (snapshotCache?.promise === promise) snapshotCache = null; });
+  }
+  return snapshotCache.promise;
+}
+
+// Sensitive records (the encrypted tier, Private Vault Plan §2.2): one dropdown.
+// It reads Off, Locked or On; everything you can do with it is a choice in the
+// list, and choosing one opens its dialog at once.
+function sensitiveField(status) {
+  if (!(isVaultOffered() || status.vault === 'on' || status.vault === 'locked')) return '';
+  const what = "Contacts' phone, email and address, prices, Financials, contracts and your notes";
+  let current; let choices; let hint;
+  if (status.vault === 'on') {
+    current = status.vaultPushedAt ? `On · backed up ${relativeTime(status.vaultPushedAt)}` : 'On';
+    choices = [['vault-approve', 'Unlock another device…'], ['vault-passkeys', 'Passkeys…'], ['vault-code', 'New recovery code…'], ['vault-off', 'Turn off…']];
+    hint = `${what}, encrypted so only you can open them.`;
+  } else if (status.vault === 'locked') {
+    current = 'Locked on this device';
+    choices = [['vault-unlock', 'Unlock…']];
+    hint = `${what} are backed up encrypted. Unlock them here to bring them back and keep backing up.`;
+  } else {
+    current = 'Off';
+    choices = status.enabled && isVaultOffered() ? [['vault-on', 'Turn on…']] : [];
+    hint = `${what} stay only on this device. Last file backup: ${relativeTime(getLastBackupDate())}.`;
+  }
+  return `<div class="field" style="max-width:340px;margin-top:12px;">
+      <label for="cb-sensitive">Sensitive records</label>
+      <select id="cb-sensitive"${choices.length ? '' : ' disabled'}>
+        <option value="" selected>${esc(current)}</option>
+        ${choices.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}
+      </select>
+      <span class="field-hint">${esc(hint)}</span>
+    </div>`;
+}
+
+function renderPane(el, mode, rerender) {
+  const status = getBackupStatus();
+  const account = status.account;
+  const signedIn = !!account?.signedIn;
+  const restoredAt = getCloudRestoredAt();
+  const paused = status.enabled ? pausedReason(status.lastError) : null;
+  const restoring = mode === 'restore';
+
+  // --- The strip at the foot: is cloud backup on here, and the one way to change that.
+  let stripText; let stripBtn; let stripOn = false;
+  if (!account) {
+    stripText = 'Cloud backup off';
+    stripBtn = restoring ? ['restore-new', 'Sign in and restore'] : ['on', 'Turn on'];
+  } else if (!signedIn) {
+    stripText = `Sign-in expired · ${account.email || ''}`;
+    stripBtn = ['signin', 'Sign in again'];
+  } else if (status.enabled) {
+    stripOn = true;
+    stripText = `Cloud backup on · ${account.email || ''}`;
+    stripBtn = ['off', 'Turn off'];
+  } else {
+    stripText = `Cloud backup off on this device · ${account.email || ''}`;
+    stripBtn = ['on', 'Turn on'];
+  }
+  const strip = `<div class="dbx-strip">
+      <span class="dbx-status"><span class="dbx-dot${stripOn ? ' dbx-dot-on' : ''}"></span> ${esc(stripText)}</span>
+      <button class="btn btn-sm" type="button" data-act="${stripBtn[0]}">${esc(stripBtn[1])}</button>
+    </div>`;
+
+  // --- "Last backup", in the other destinations' format, with what's worth adding.
+  let aside = '';
+  if (signedIn && !status.enabled && status.movedToEdition === 'pro') aside = 'Your records moved to KennelOS Pro.';
+  else if (signedIn && status.enabled && !paused) {
+    const line = statusLine(status);
+    if (/no internet|in step/.test(line)) aside = line;
+    else if (status.dirty) aside = 'Recent changes will back up shortly.';
+  }
+  const lastBackup = `<p class="muted">Last backup: <strong>${esc(backupStamp(status.lastPushedAt))}</strong>${aside ? ` <span class="faint">${esc(aside)}</span>` : ''}</p>`;
+  const pausedWarn = paused
+    ? `<div class="inline-warn">Backup is paused: ${esc(paused)} <button class="btn btn-sm" data-act="resolve" style="margin-left:6px;">${status.lastError?.code === 'vault_locked' ? 'Unlock…' : 'Resolve…'}</button></div>`
+    : '';
+
+  let body;
+  if (restoring) {
+    body = `
+      <p class="muted">Roll back to an earlier cloud backup. Records go back to how they were then; nothing is deleted, and nothing changes until you confirm.</p>
+      ${signedIn ? lastBackup : ''}
+      <div class="field" style="max-width:340px;">
+        <label for="cb-asof">Restore as of</label>
+        <select id="cb-asof" disabled><option value="">${signedIn ? 'Loading your backups…' : 'Sign in to see your backups'}</option></select>
+      </div>
+      ${signedIn ? sensitiveField(status) : ''}`;
+  } else {
+    const ready = signedIn && status.enabled;
+    body = `
+      <p class="muted">Backs up your kennel records automatically after you make changes, free. If this device is lost or replaced, sign in on the new one with your email and everything comes back.</p>
+      ${signedIn ? lastBackup : ''}
+      ${pausedWarn}
+      <button class="btn btn-primary" data-act="now"${ready ? '' : ' disabled'}>⬆ Back up now</button>
+      ${signedIn ? sensitiveField(status) : ''}
+      ${signedIn && (isSyncOffered() || syncsHere()) ? '<div id="cb-sync-slot"></div>' : ''}`;
+  }
+
+  el.innerHTML = `
+    ${restoredAt ? `<div class="inline-warn" style="margin-bottom:10px;">Restored from cloud backup ${esc(relativeTime(restoredAt))}.
+      Sensitive records (contacts' phone, email and address, prices, notes) are blank on this device.
+      ${status.vault === 'locked'
+        ? 'Unlock them under Sensitive records to bring them back.'
+        : 'If you have a file backup, restore it from <strong>This device</strong> with <strong>Merge</strong> to bring them back.'}
+      <button class="btn btn-sm" data-act="hide-restored" style="margin-left:6px;">Got it</button></div>` : ''}
+    ${body}
+    ${strip}`;
+
+  const guarded = async (control, fn) => {
+    control.disabled = true;
+    try { await fn(); } catch (err) { await alertModal({ title: "That didn't work", message: errorText(err) }); }
+    finally { rerender(); }
+  };
+  const act = (name, fn) => el.querySelector(`[data-act="${name}"]`)?.addEventListener('click', (e) => guarded(e.currentTarget, fn));
+
+  act('on', turnOnFlow);
+  act('restore-new', async () => { if (await runSignInAndRestore({ fromCard: true })) location.reload(); });
+  act('signin', async () => {
+    const acc = await signInModal({ title: 'Sign in again' });
+    if (acc) await pushWithProgress((onProgress) => pushIfDirty({ force: true, onProgress }));
+  });
+  act('resolve', () => (status.lastError?.code === 'vault_locked'
+    ? handlePushResult({ status: 'vault_locked', stale: !!status.lastError.stale })
+    : status.lastError?.code === 'conflict' && status.lastError.syncing && isSyncOffered()
+      ? syncUI().then((ui) => ui.joinOfferDialog())
+      : pushWithProgress((onProgress) => pushIfDirty({ force: true, onProgress }))));
+  act('now', () => pushWithProgress((onProgress) => pushIfDirty({ force: true, onProgress })));
+  act('off', async () => {
+    if (await confirmModal({ title: 'Turn off backup on this device?', message: 'Changes on this device stop backing up. The cloud copy stays, and you can turn it back on any time.', confirmLabel: 'Turn off' })) disableBackup();
+  });
+  act('hide-restored', () => setCloudRestoredAt(null));
+
+  // Sensitive records: choosing an entry opens its dialog straight away.
+  const sensitive = el.querySelector('#cb-sensitive');
+  const vaultActions = {
+    'vault-on': (ui) => ui.turnOnVaultFlow(),
+    'vault-unlock': (ui) => ui.unlockModal({ merge: true }),
+    'vault-approve': (ui) => ui.approveDevicesModal(),
+    'vault-passkeys': (ui) => ui.passkeysModal(),
+    'vault-code': (ui) => ui.newRecoveryCodeFlow(),
+    'vault-off': (ui) => ui.turnOffVaultFlow()
+  };
+  sensitive?.addEventListener('change', () => {
+    const run = vaultActions[sensitive.value];
+    if (run) guarded(sensitive, async () => run(await vaultUI()));
+  });
+
+  // Keep my devices in step (Cloud Phase 2 plan §2.1): its own module, loaded when shown.
+  const syncSlot = el.querySelector('#cb-sync-slot');
+  if (syncSlot) syncUI().then((ui) => { if (syncSlot.isConnected) ui.fillSyncField(syncSlot, rerender); }).catch(() => {});
+
+  // Restore: the backups are listed right here; choosing one starts the roll back.
+  const asOf = el.querySelector('#cb-asof');
+  if (asOf && signedIn) {
+    cachedSnapshots(status).then((snapshots) => {
+      if (!asOf.isConnected) return; // re-rendered meanwhile
+      if (!snapshots.length) { asOf.innerHTML = '<option value="">No cloud backups yet</option>'; return; }
+      asOf.innerHTML = '<option value="" selected>Choose a backup…</option>'
+        + snapshotOptions(snapshots).map((o) => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join('');
+      asOf.disabled = false;
+      asOf.addEventListener('change', () => { if (asOf.value) guarded(asOf, () => rollBackTo(asOf.value, snapshots)); });
+    }).catch((e) => {
+      if (!asOf.isConnected) return;
+      asOf.innerHTML = '<option value="">Couldn\'t load your backups</option>';
+      asOf.insertAdjacentHTML('afterend', `<span class="field-hint">${esc(errorText(e))}</span>`);
+    });
+  }
+}
+
+// --- Settings: the Account card ------------------------------------------------------------
+// The cloud sign-in itself (who, which device, Pro on this account, the other
+// devices, sign out, delete). Backups are on Import/Export; this is the account.
+export function mountCloudAccountCard(el) {
+  if (!el || !isCloudAvailable()) { if (el) el.remove(); return; }
+  el.hidden = false;
+  const render = () => renderAccountCard(el);
+  if (currentAccount()?.signedIn) refreshEmailChangeState().then(render, () => {});
+  window.addEventListener(CLOUD_BACKUP_EVENT, render);
+  render();
+}
+
+function renderAccountCard(el) {
+  const account = currentAccount();
+  let main;
+  if (!account) {
+    main = `<p class="muted">Not signed in. Your account is the email you sign in to cloud backup with; turn cloud backup on from <a href="import-export.html">Import / Export</a>.</p>`;
+  } else if (!account.signedIn) {
+    main = `
+      <p class="muted">Signed in as <strong>${esc(account.email || '')}</strong>, but the sign-in has expired.
+        Backup is paused until you sign in again. Your records here are untouched.</p>
+      <div class="form-actions"><button class="btn btn-primary" data-act="signin">Sign in again</button>
+        <button class="btn" data-act="signout">Sign out</button></div>`;
+  } else if (account.role === 'helper') {
+    // Support's device in her account (docs/KennelOS_Assisted_Setup_Plan.md §5):
+    // her account settings are hers; Hand back is on the bar at the top.
+    main = `<p>Signed in as <strong>KennelOS support</strong>, helping <strong>${esc(account.helperLabel || 'this user')}</strong>.</p>
+      <p class="muted">Her email, sign-in, devices, recovery code and license are hers to change. Use <strong>Hand back</strong> at the top when you’re done.</p>`;
+  } else {
+    main = `
+      ${emailChangeNoticeHtml()}
+      <p>${account.email ? `Signed in as <strong>${esc(account.email)}</strong>` : 'Signed in <span class="faint">(the account\'s email was changed on another device)</span>'}${account.deviceLabel ? ` <span class="faint">· this device: ${esc(account.deviceLabel)}</span>` : ''}</p>
+      ${isLicenseGated() ? `<p class="field-hint" data-pro-line>${esc(proLineText(cachedEntitlement()))}</p>` : ''}
+      <div class="form-actions">
+        ${isLicenseGated() ? `<button class="btn btn-sm" data-act="pro-link"${cachedEntitlement()?.pro ? ' hidden' : ''}>Link a Pro purchase email…</button>
+        <button class="btn btn-sm" data-act="pro-unlink"${cachedEntitlement()?.linkedEmails ? '' : ' hidden'}>Unlink purchase emails</button>` : ''}
+        <button class="btn btn-sm" data-act="email">Change email…</button>
+        <button class="btn btn-sm" data-act="devices">Your devices…</button>
+        <button class="btn btn-sm" data-act="others">Sign out other devices</button>
+        <button class="btn btn-sm" data-act="signout">Sign out</button>
+        <button class="btn btn-sm btn-danger" data-act="delete">Delete my cloud data…</button>
+      </div>
+      ${editionFlags.liveSync === true ? '<div data-assist-help></div>' : ''}`;
+  }
+  el.innerHTML = `<h2 style="margin-top:0;">Account</h2>${main}`;
+  const helpSlot = el.querySelector('[data-assist-help]');
+  if (helpSlot) import('./cloudAssistUI.js').then((ui) => ui.mountHelpSection(helpSlot)).catch(() => {});
+
+  const act = (name, fn) => el.querySelector(`[data-act="${name}"]`)?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try { await fn(); } catch (err) { await alertModal({ title: "That didn't work", message: errorText(err) }); }
+    finally { if (btn.isConnected) btn.disabled = false; renderAccountCard(el); }
+  });
+
+  act('signin', async () => {
+    const acc = await signInModal({ title: 'Sign in again' });
+    if (acc) await pushWithProgress((onProgress) => pushIfDirty({ force: true, onProgress }));
+  });
+  act('devices', () => devicesModal());
+  act('email', () => changeEmailModal());
+  act('email-cancel', () => cancelEmailChangeFlow());
+  act('email-dismiss', async () => { await cancelAccountEmailChange(); notify(); });
+  act('others', async () => {
+    if (!(await confirmModal({ title: 'Sign out other devices?', message: 'Every other device signed in to this account is signed out. They keep their records but stop backing up until they sign in again.\n\nLost a device? Use Your devices → Erase instead, which also deletes the records on it.', confirmLabel: 'Sign them out' }))) return;
+    const n = await withFreshSignIn((reauth) => signOutOtherDevices(reauth), { purpose: 'sign out your other devices', confirmLabel: 'Sign them out' });
+    if (n === null) return;
+    await alertModal({ title: 'Done', message: n ? `Signed out ${n} other device(s).` : 'No other devices were signed in.' });
+  });
+  act('signout', async () => {
+    if (await confirmModal({ title: 'Sign out of cloud backup?', message: 'Backup stops on this device. Your records here and the cloud copy both stay.', confirmLabel: 'Sign out' })) await signOut();
+  });
+  act('delete', async () => {
+    const ok = await typedConfirm({
+      title: 'Delete your cloud data?',
+      message: 'This deletes every cloud backup, every uploaded document and your cloud account. Your records on this device are not touched. There is no undo.',
+      phrase: 'DELETE',
+      confirmLabel: 'Delete cloud data'
+    });
+    if (!ok) return;
+    if ((await withFreshSignIn((reauth) => deleteCloudData(reauth).then(() => true), { purpose: 'delete your cloud data', confirmLabel: 'Delete cloud data' })) === null) return;
+    await alertModal({ title: 'Cloud data deleted', message: 'Your cloud backups and account are gone. Everything on this device is still here.' });
+  });
+  act('pro-link', () => linkPurchaseModal());
+  act('pro-unlink', async () => {
+    if (!(await confirmModal({
+      title: 'Unlink purchase emails?',
+      message: 'Pro purchases made with other email addresses stop counting for this account. The purchases themselves are untouched, and you can link them again.',
+      confirmLabel: 'Unlink'
+    }))) return;
+    await withFreshSignIn((reauth) => unlinkPurchaseEmails({ reauth }), { purpose: 'unlink purchase emails', confirmLabel: 'Unlink' });
+  });
+
+  if (el.querySelector('[data-pro-line]')) fillProLine(el);
+}
+
+// --- Changing the account's email (plan §2.6) ---------------------------------------
+
+// A pending change, as every signed-in device shows it. '' when there's none.
+
+function emailChangeNoticeHtml() {
+  const status = getBackupStatus();
+  if (status.emailChangeFailed && !status.emailChange) {
+    return `<div class="inline-warn" style="margin-bottom:12px;">
+      <strong>Your email change didn't happen.</strong> ${esc(FAILED_CHANGE_TEXT)}
+      <button class="btn btn-sm" data-act="email-dismiss" style="margin-left:4px;">OK</button>
+    </div>`;
+  }
+  const c = status.emailChange;
+  if (!c) return '';
+  return `<div class="inline-warn" style="margin-bottom:12px;">
+      <strong>Your account's email is changing.</strong> ${changeRequestedBy(c)};
+      it takes effect ${esc(shortDate(c.effectiveAt))}. Not you?
+      <button class="btn btn-sm" data-act="email-cancel" style="margin-left:4px;">Cancel it</button>
+    </div>`;
+}
+
+export async function cancelEmailChangeFlow() {
+  if (!(await confirmModal({ title: 'Cancel the email change?', message: 'The account keeps its current email.', confirmLabel: 'Cancel the change', cancelLabel: 'Keep it' }))) return;
+  await cancelAccountEmailChange();
+  notify();
+  await alertModal({ title: 'Cancelled', message: 'The account keeps its current email.' });
+}
+
+// New address → its code → can you still get mail at the current one? Yes:
+// its code too, and it changes now. No: it changes in a day, and every
+// signed-in device can cancel it until then.
+export function changeEmailModal() {
+  return new Promise((resolve) => {
+    const overlay = openModal('<div id="ce-body"></div>');
+    const body = overlay.querySelector('#ce-body');
+    const done = (v) => { overlay.remove(); resolve(v); };
+    const current = currentAccount()?.email || '';
+    let email = ''; let code = '';
+
+    const actions = (primary, primaryLabel) => `<div class="form-actions">
+        <button class="btn btn-primary" id="ce-ok">${esc(primaryLabel)}</button>
+        <button class="btn" id="ce-cancel">Cancel</button></div>`;
+    const wire = (onOk, inputSel) => {
+      body.querySelector('#ce-ok').addEventListener('click', onOk);
+      body.querySelector('#ce-cancel').addEventListener('click', () => done(false));
+      const input = inputSel && body.querySelector(inputSel);
+      if (input) { input.addEventListener('keydown', (e) => { if (e.key === 'Enter') onOk(); }); input.focus(); }
+    };
+    const busy = (label) => { const b = body.querySelector('#ce-ok'); b.disabled = true; b.textContent = label; };
+    const err = (m) => (m ? `<div class="inline-error">${esc(m)}</div>` : '');
+
+    const showNew = (m = '') => {
+      body.innerHTML = `<h2 style="margin-top:0;">Change your email</h2>
+        <p class="muted">Your account, backups and devices stay the same; you'll sign in with the new address.</p>
+        <div class="field field-wide"><label for="ce-email">New email</label>
+          <input id="ce-email" type="email" autocomplete="email" inputmode="email" value="${esc(email)}" placeholder="you@example.com"></div>
+        ${err(m)}${actions(true, 'Email me a code')}`;
+      wire(async () => {
+        email = body.querySelector('#ce-email').value.trim();
+        if (current && email.toLowerCase() === current.toLowerCase()) return showNew("That's already this account's email.");
+        busy('Sending…');
+        try { await startSignIn(email); showNewCode(); } catch (e) { showNew(errorText(e)); }
+      }, '#ce-email');
+    };
+
+    const showNewCode = (m = '') => {
+      body.innerHTML = `<h2 style="margin-top:0;">Check your new email</h2>
+        <p class="muted">We sent a 6-digit code to <strong>${esc(email)}</strong>.</p>
+        <div class="field"><label for="ce-code">Code</label>
+          <input id="ce-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" value="${esc(code)}" placeholder="123456" style="font-size:20px;letter-spacing:4px;max-width:180px;"></div>
+        ${err(m)}${actions(true, 'Continue')}`;
+      wire(() => {
+        code = body.querySelector('#ce-code').value.trim();
+        if (!/^\d{6}$/.test(code.replace(/\s/g, ''))) return showNewCode('Type the 6-digit code from the email.');
+        showOld();
+      }, '#ce-code');
+    };
+
+    const showOld = (m = '') => {
+      body.innerHTML = `<h2 style="margin-top:0;">Can you still get email at ${current ? esc(current) : 'your current address'}?</h2>
+        <p class="muted">If you can, we'll send a code there too and the change happens now. If you can't, it happens in a day, and
+          your other signed-in devices can cancel it until then, in case it wasn't you.</p>
+        ${current ? '' : `<div class="field field-wide"><label for="ce-old">Current email</label>
+          <input id="ce-old" type="email" autocomplete="email" inputmode="email"></div>`}
+        ${err(m)}
+        <div class="form-actions" style="flex-direction:column;align-items:stretch;">
+          <button class="btn btn-primary" id="ce-yes">Yes, email a code there</button>
+          <button class="btn" id="ce-no">No, I can't get into it</button>
+          <button class="btn" id="ce-cancel">Cancel</button>
+        </div>`;
+      body.querySelector('#ce-cancel').addEventListener('click', () => done(false));
+      body.querySelector('#ce-no').addEventListener('click', () => submit({}));
+      body.querySelector('#ce-yes').addEventListener('click', async () => {
+        const oldEmail = current || body.querySelector('#ce-old').value.trim();
+        const b = body.querySelector('#ce-yes'); b.disabled = true; b.textContent = 'Sending…';
+        try { await startSignIn(oldEmail); showOldCode(oldEmail); } catch (e) { showOld(errorText(e)); }
+      });
+    };
+
+    const showOldCode = (oldEmail, m = '') => {
+      body.innerHTML = `<h2 style="margin-top:0;">Check your current email</h2>
+        <p class="muted">We sent a 6-digit code to <strong>${esc(oldEmail)}</strong>.</p>
+        <div class="field"><label for="ce-oldcode">Code</label>
+          <input id="ce-oldcode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="123456" style="font-size:20px;letter-spacing:4px;max-width:180px;"></div>
+        ${err(m)}${actions(true, 'Change my email')}`;
+      wire(() => submit({ oldEmail, oldCode: body.querySelector('#ce-oldcode').value.trim() }), '#ce-oldcode');
+    };
+
+    const submit = async ({ oldEmail = null, oldCode = null }) => {
+      body.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      try {
+        const res = await changeAccountEmail({ email, code, oldEmail, oldCode });
+        notify();
+        done(true);
+        await alertModal(res.status === 'changed'
+          ? { title: 'Email changed', message: `Your account's email is now ${email}. Sign in with it from now on.` }
+          : { title: 'Email change requested', message: `Your account's email changes to ${email} on ${shortDate(res.effectiveAt)}. Until then, sign in with your current address.\n\nEvery device signed in to your account shows this and can cancel it.` });
+      } catch (e) {
+        const c = e?.code;
+        if (c === 'invalid_old_code' || (c === 'too_many_attempts' && oldCode)) showOldCode(oldEmail, errorText(e));
+        else if (c === 'invalid_code' || c === 'too_many_attempts') { code = ''; showNewCode(errorText(e)); }
+        else showNew(errorText(e));
+      }
+    };
+
+    showNew();
+  });
+}
+
+// --- Pro on this account (License Link Plan §5, §6) ------------------------------------
+// Whether the SERVER knows this account is Pro: it decides the online features
+// that need Pro (the waitlist's), never the app itself, which the license key
+// unlocks as before.
+const PLAN_LABEL = { monthly: 'monthly', yearly: 'yearly', lifetime: 'lifetime' };
+
+export function proLineText(e, { offline = false } = {}) {
+  if (offline) return "Pro on this account: couldn't check (no internet?).";
+  if (!e) return 'Pro on this account: checking…';
+  if (e.pro) {
+    const plan = PLAN_LABEL[e.plan] ? ` (${PLAN_LABEL[e.plan]})` : '';
+    const until = e.until ? `, until ${new Date(e.until).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}` : '';
+    return `Pro on this account${plan}${until}${e.source === 'linked' ? ', through a linked purchase email' : ''}.`;
+  }
+  if (e.lapsed) return "Your Pro purchase for this account has ended, so online features that need Pro are off. Renew it, and they're back.";
+  return "This account isn't linked to a Pro purchase yet. Bought Pro with another email address? Link it here.";
+}
+
+async function fillProLine(el) {
+  let e = null;
+  let offline = false;
+  try { e = await entitlement(); } catch { offline = true; }
+  const line = el.querySelector('[data-pro-line]');
+  if (!line) return; // re-rendered meanwhile
+  line.textContent = proLineText(e, { offline });
+  const link = el.querySelector('[data-act="pro-link"]');
+  const unlink = el.querySelector('[data-act="pro-unlink"]');
+  if (link) link.hidden = offline || !!e?.pro;
+  if (unlink) unlink.hidden = !e?.linkedEmails;
+}
+
+// Two steps, like sign-in: the purchase email, then the code sent to it.
+// Resolves the new entitlement, or null on cancel.
+export function linkPurchaseModal() {
+  return new Promise((resolve) => {
+    const overlay = openModal('<div id="pl-body"></div>');
+    const body = overlay.querySelector('#pl-body');
+    const done = (v) => { overlay.remove(); resolve(v); };
+    let email = '';
+
+    const showEmail = (errorMsg = '') => {
+      body.innerHTML = `
+        <h2 style="margin-top:0;">Link a Pro purchase email</h2>
+        <p class="muted">If you bought KennelOS Pro with a different email address from the one you sign in with,
+          type it here. We'll send a code to it, to check it's yours.</p>
+        <div class="field field-wide"><label for="pl-email">Email you bought Pro with</label>
+          <input id="pl-email" type="email" autocomplete="email" inputmode="email" value="${esc(email)}" placeholder="you@example.com"></div>
+        <p class="field-hint">We use it to send the code, and don't keep it.</p>
+        ${errorMsg ? `<div class="inline-error">${esc(errorMsg)}</div>` : ''}
+        <div class="form-actions">
+          <button class="btn btn-primary" id="pl-send">Email me a code</button>
+          <button class="btn" id="pl-cancel">Cancel</button>
+        </div>`;
+      const input = body.querySelector('#pl-email');
+      const send = async () => {
+        email = input.value.trim();
+        const btn = body.querySelector('#pl-send');
+        btn.disabled = true; btn.textContent = 'Sending…';
+        try { await startPurchaseLink(email); showCode(); } catch (e) { showEmail(errorText(e)); }
+      };
+      body.querySelector('#pl-send').addEventListener('click', send);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+      body.querySelector('#pl-cancel').addEventListener('click', () => done(null));
+      input.focus();
+    };
+
+    const showCode = (errorMsg = '', note = '') => {
+      body.innerHTML = `
+        <h2 style="margin-top:0;">Check that inbox</h2>
+        <p class="muted">We sent a 6-digit code to <strong>${esc(email)}</strong>. Type it here within 10 minutes.</p>
+        <div class="field"><label for="pl-code">Code</label>
+          <input id="pl-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="123456" style="font-size:20px;letter-spacing:4px;max-width:180px;"></div>
+        ${note ? `<p class="field-hint">${esc(note)}</p>` : ''}
+        ${errorMsg ? `<div class="inline-error">${esc(errorMsg)}</div>` : ''}
+        <p class="field-hint">Didn't get it? Check the spam folder, or <a href="#" id="pl-resend">send a new code</a>.</p>
+        <div class="form-actions">
+          <button class="btn btn-primary" id="pl-verify">Link it</button>
+          <button class="btn" id="pl-back">Use a different email</button>
+          <button class="btn" id="pl-cancel">Cancel</button>
+        </div>`;
+      const input = body.querySelector('#pl-code');
+      const verify = async () => {
+        const btn = body.querySelector('#pl-verify');
+        btn.disabled = true; btn.textContent = 'Checking…';
+        try {
+          const e = await finishPurchaseLink(email, input.value);
+          done(e);
+          notify();
+          await alertModal(e.pro
+            ? { title: 'Linked', message: proLineText(e) }
+            : { title: 'Linked, but no Pro purchase yet', message: `We haven't been told of a Pro purchase made with ${email}. If you've just bought it, check again in a few minutes. Otherwise, link the address you bought it with.` });
+        } catch (e) {
+          if (e instanceof CloudRequestError && e.code === 'too_many_attempts') showEmail(errorText(e));
+          else showCode(errorText(e));
+        }
+      };
+      body.querySelector('#pl-verify').addEventListener('click', verify);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') verify(); });
+      body.querySelector('#pl-resend').addEventListener('click', async (e) => {
+        e.preventDefault();
+        try { await startPurchaseLink(email); showCode('', 'A new code is on its way. Only the newest code works.'); } catch (err) { showCode(errorText(err)); }
+      });
+      body.querySelector('#pl-back').addEventListener('click', () => showEmail());
+      body.querySelector('#pl-cancel').addEventListener('click', () => done(null));
+      input.focus();
+    };
+
+    showEmail();
+  });
+}
+
+// --- Your devices: a lost one (plan §2.5) --------------------------------------------
+// Erase: that device deletes every record on it the next time it opens KennelOS
+// online. Free its Pro license: this browser calls Lemon Squeezy with the key
+// and that device's activation id, so its slot comes back now.
+function deviceStatusText(d) {
+  if (d.erase?.confirmedAt) return `Erased ${relativeTime(d.erase.confirmedAt)}.`;
+  if (d.erase) return `Erase requested ${snapshotLabel(d.erase.requestedAt)}. It happens the next time that device opens KennelOS with an internet connection.`;
+  const seen = d.lastSeenAt ? `Last used ${relativeTime(d.lastSeenAt)}` : '';
+  // Live sync (Cloud Phase 2 plan §2.2): when it last caught up.
+  const synced = d.lastSyncAt ? ` · last synced ${relativeTime(d.lastSyncAt)}` : '';
+  if (d.status === 'signed-in') return `${seen || 'Signed in'}${synced}.`;
+  if (d.status === 'signed-out-here') return `Signed out on that device${seen ? ` · ${seen.toLowerCase()}` : ''}. It can't be erased from here.`;
+  return `Signed out${seen ? ` · ${seen.toLowerCase()}` : ''}.`;
+}
+
+export function devicesModal({ key = '' } = {}) {
+  return new Promise((resolve) => {
+    const overlay = openModal('<div id="dv-body"><p class="muted">Loading your devices…</p></div>', { width: 560 });
+    const body = overlay.querySelector('#dv-body');
+    const done = () => { overlay.remove(); resolve(); };
+    const proHere = isLicenseGated();
+    let licenseKey = key;
+
+    const render = async () => {
+      let devices;
+      try {
+        devices = await listDevices();
+      } catch (e) {
+        body.innerHTML = `<h2 style="margin-top:0;">Your devices</h2><div class="inline-error">${esc(errorText(e))}</div>
+          <div class="form-actions"><button class="btn" id="dv-close">Close</button></div>`;
+        body.querySelector('#dv-close').addEventListener('click', done);
+        return;
+      }
+      const syncing = devices.some((d) => d.lastSyncAt) && syncsHere();
+      const rows = devices.map((d) => {
+        // A program in step has no one backing device (Cloud Phase 2 plan §6.4).
+        const tags = [d.thisDevice ? 'this device' : '', d.backing && !syncing ? 'backs up your records' : ''].filter(Boolean)
+          .map((t) => `<span class="faint">· ${esc(t)}</span>`).join(' ');
+        const canErase = !d.thisDevice && !d.erase && d.status !== 'signed-out-here';
+        const canCancel = !!d.erase && !d.erase.confirmedAt;
+        const canFree = proHere && !d.thisDevice && !!d.licenseInstanceId;
+        const actions = [
+          canErase ? `<button class="btn btn-sm btn-danger" data-erase="${esc(d.id)}">Erase…</button>` : '',
+          canFree ? `<button class="btn btn-sm" data-free="${esc(d.id)}">Free its Pro license</button>` : '',
+          canCancel ? `<button class="btn btn-sm" data-cancel="${esc(d.id)}">Found it: cancel the erase</button>` : ''
+        ].join('');
+        return `<li style="padding:10px 0;border-top:1px solid var(--border);">
+            <strong>${esc(d.label || 'Unnamed device')}</strong> ${tags}
+            <div class="field-hint">${esc(deviceStatusText(d))}</div>
+            ${actions ? `<div class="form-actions" style="margin-top:6px;">${actions}</div>` : ''}
+          </li>`;
+      }).join('');
+      body.innerHTML = `
+        <h2 style="margin-top:0;">Your devices</h2>
+        <p class="muted">Every device signed in to this cloud account. Lost one? <strong>Erase</strong> it: the next time it
+          opens KennelOS with an internet connection, every record on it is deleted.</p>
+        ${proHere ? '<p class="field-hint"><strong>Free its Pro license</strong> gives that device\'s slot back, so you can activate Pro on another one.</p>' : ''}
+        <ul style="list-style:none;padding:0;margin:0;">${rows || '<li class="muted">No devices.</li>'}</ul>
+        <div id="dv-msg"></div>
+        <div class="form-actions"><button class="btn" id="dv-close">Close</button></div>`;
+      body.querySelector('#dv-close').addEventListener('click', done);
+
+      const byId = new Map(devices.map((d) => [d.id, d]));
+      const wire = (attr, fn) => body.querySelectorAll(`[${attr}]`).forEach((btn) => btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          const msg = await fn(byId.get(btn.getAttribute(attr)));
+          await render();
+          if (msg) body.querySelector('#dv-msg').innerHTML = `<div class="inline-warn">${esc(msg)}</div>`;
+        } catch (e) {
+          await alertModal({ title: "That didn't work", message: errorText(e) });
+          if (btn.isConnected) btn.disabled = false;
+        }
+      }));
+      wire('data-erase', async (d) => {
+        if (!(await eraseDeviceFlow(d))) return null;
+        let msg = `${d.label || 'That device'} will be erased the next time it opens KennelOS online.`;
+        if (proHere && d.licenseInstanceId) {
+          const freed = await freeLicenseFlow(d);
+          if (freed === true) msg += ' Its Pro license is free.';
+          else if (freed === false) msg += " Its Pro license couldn't be freed yet; try Free its Pro license again.";
+        }
+        return msg;
+      });
+      wire('data-free', async (d) => {
+        const freed = await freeLicenseFlow(d);
+        if (freed === null) return null;
+        return freed ? `${d.label || 'That device'}'s Pro license is free. You can activate Pro on another device now.`
+          : "Lemon Squeezy didn't release it. Check the key and your connection. If you've already freed it, there's nothing more to do.";
+      });
+      wire('data-cancel', async (d) => {
+        await cancelErase(d.id);
+        return `${d.label || 'That device'} won't be erased. It stays signed out: sign in on it again to keep backing up.`;
+      });
+    };
+
+    // The key: the one this device is activated with, else the one typed on
+    // the activation wall, else ask.
+    async function freeLicenseFlow(d) {
+      let k = getProLicense()?.key || licenseKey;
+      if (!k) {
+        k = await promptModal({
+          title: 'Your Pro license key',
+          message: 'Enter the license key from your purchase confirmation. It goes to Lemon Squeezy only, never to cloud backup.',
+          label: 'License key',
+          placeholder: 'XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX',
+          confirmLabel: 'Free the license'
+        });
+        if (!k) return null;
+        licenseKey = k;
+      }
+      return releaseDeviceLicense(d, k);
+    }
+
+    render();
+  });
+}
+
+async function eraseDeviceFlow(d) {
+  const name = d.label || 'that device';
+  const ok = await typedConfirm({
+    title: `Erase ${name}?`,
+    message: `The next time ${name} opens KennelOS with an internet connection, every record on it is deleted and it's signed out.`
+      + `\n\nUntil then nothing happens to it. If it stays offline or never opens KennelOS again, its records stay on it. Your phone's own Find My (iPhone) or Find My Device (Android) can erase the whole phone.`
+      + `\n\nSensitive records (contacts' phone, email and address, prices, Financials, contracts, private notes) aren't in cloud backup. If ${name} has the only copy of them, erasing it loses them, unless you have a file backup that includes them.`
+      + `\n\nYour cloud backup isn't touched.`,
+    phrase: 'ERASE',
+    confirmLabel: `Erase ${name}`
+  });
+  if (!ok) return false;
+  return withFreshSignIn((reauth) => requestErase(d.id, reauth), { purpose: 'erase the device', confirmLabel: 'Erase it' })
+    .then((r) => r !== null);
+}
+
+// Erasing a device, signing out the others and deleting the cloud data need a
+// fresh sign-in: one in the last 15 minutes, or a code just emailed to the
+// account, so a stolen phone that is still signed in can't do them (plan
+// §2.5). Runs `fn` as is; on reauth_required, asks for a code and runs it
+// again with { email, code }. Resolves fn's result, or null on cancel.
+export async function withFreshSignIn(fn, { purpose, confirmLabel }) {
+  try {
+    return await fn({});
+  } catch (e) {
+    if (!(e instanceof CloudRequestError && e.code === 'reauth_required')) throw e;
+  }
+  const reauth = await confirmCodeModal({ purpose, confirmLabel });
+  if (!reauth) return null;
+  return fn(reauth);
+}
+
+// Resolves { email, code }, or null on cancel.
+function confirmCodeModal({ purpose, confirmLabel }) {
+  const email = currentAccount()?.email || '';
+  return new Promise((resolve) => {
+    const overlay = openModal('<div id="cc-body"></div>');
+    const body = overlay.querySelector('#cc-body');
+    const done = (v) => { overlay.remove(); resolve(v); };
+    const show = (errorMsg = '', note = '') => {
+      body.innerHTML = `
+        <h2 style="margin-top:0;">Confirm it's you</h2>
+        <p class="muted">We sent a 6-digit code to <strong>${esc(email)}</strong>. Type it here within 10 minutes to ${esc(purpose)}.</p>
+        <div class="field"><label for="cc-code">Code</label>
+          <input id="cc-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="123456" style="font-size:20px;letter-spacing:4px;max-width:180px;"></div>
+        ${note ? `<p class="field-hint">${esc(note)}</p>` : ''}
+        ${errorMsg ? `<div class="inline-error">${esc(errorMsg)}</div>` : ''}
+        <p class="field-hint">Didn't get it? Check your spam folder, or <a href="#" id="cc-resend">send a new code</a>.</p>
+        <div class="form-actions">
+          <button class="btn btn-danger" id="cc-ok">${esc(confirmLabel)}</button>
+          <button class="btn" id="cc-cancel">Cancel</button>
+        </div>`;
+      const input = body.querySelector('#cc-code');
+      const ok = () => {
+        const code = input.value.replace(/\s/g, '');
+        if (!/^\d{6}$/.test(code)) { show('Type the 6-digit code from the email.'); return; }
+        done({ email, code });
+      };
+      body.querySelector('#cc-ok').addEventListener('click', ok);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') ok(); });
+      body.querySelector('#cc-resend').addEventListener('click', async (e) => {
+        e.preventDefault();
+        try { await startSignIn(email); show('', 'A new code is on its way. Only the newest code works.'); } catch (err) { show(errorText(err)); }
+      });
+      body.querySelector('#cc-cancel').addEventListener('click', () => done(null));
+      input.focus();
+    };
+    startSignIn(email).then(() => show(), (err) => show(errorText(err)));
+  });
+}
+
+// The Pro activation wall's "Lost a device?" link (licenseGate.js): sign in
+// to cloud backup if needed, then the device list, to free the lost device's
+// slot. `key` is whatever was typed in the wall's key field.
+export async function openDevicesFromLicenseWall({ key = '' } = {}) {
+  if (!isCloudAvailable()) return;
+  if (!currentAccount()?.signedIn) {
+    const account = await signInModal({
+      title: 'Free a lost device',
+      intro: 'Sign in to your cloud backup account to see the devices on it, then free the Pro license of the one you lost. This works for devices that had cloud backup turned on.'
+    });
+    if (!account) return;
+  }
+  await devicesModal({ key });
+}
+
+// --- First run: "I already use KennelOS → sign in and restore" (plan §2.3) -------------
+// Resolves true when records were restored (the caller reloads), false when the
+// user backed out. An account with no backup yet turns backup on and resolves
+// 'empty', so first-run carries on to kennel setup.
+export async function runSignInAndRestore({ fromCard = false } = {}) {
+  if (!isCloudAvailable()) return false;
+  const account = await signInModal({
+    title: 'Sign in and restore',
+    intro: 'Sign in with the email you used for cloud backup. Your records come back on this device.'
+  });
+  if (!account) return false;
+  // A program KennelOS support set up for her (docs/KennelOS_Assisted_Setup_Plan.md):
+  // her takeover replaces the restore. Reload either way; a later load finishes it.
+  if (account.assisted) {
+    await (await import('./cloudAssistUI.js')).claimAssistedAccount();
+    return true;
+  }
+  // Private Vault Plan §2.3: the unlock step, when the program has a vault.
+  if (isVaultOffered()) await (await vaultUI()).unlockBeforeRestore();
+  // A program that keeps its devices in step (Cloud Phase 2 plan §2.1): this
+  // device joins it, which brings every record, in place of restoring a backup.
+  // Not unlocked here (sync needs Sensitive records), it restores as before.
+  const joined = await joinInsteadOfRestore();
+  if (joined !== null) return joined;
+  const pg = progressModal('Restoring your records…');
+  try {
+    const { restored, push, cancelled } = await restoreOnNewDevice({
+      onProgress: (done, total) => pg.update(`Downloading documents: ${done} of ${total}…`, done, total),
+      ask: askRestore
+    });
+    pg.close();
+    if (cancelled) return false;
+    if (!restored) {
+      await alertModal({ title: 'No backup yet', message: "There's no backup on this account yet. Cloud backup is now on for this device, so your records will start backing up as you add them." });
+      return fromCard ? true : 'empty';
+    }
+    const n = Object.values(restored.summary).reduce((t, s) => t + (s.inserted || 0) + (s.updated || 0), 0);
+    const vault = restored.vault?.status;
+    const privateNote = vault === 'restored'
+      ? 'Your sensitive records came back too.'
+      : vault === 'locked'
+        ? "Sensitive records (contacts' phone, email and address, prices, notes) are blank until you unlock them: Import / Export → Cloud → Sensitive records → Unlock. Backups from this device are paused until then."
+        : "Sensitive records (contacts' phone, email and address, prices, notes) weren't in this backup. If you have a file backup, restore it from Import / Export with Merge to bring those back.";
+    const missing = (restored.missingFiles?.length || 0) + (restored.vault?.missingFiles?.length || 0);
+    await alertModal({
+      title: 'Your records are back',
+      message: `Restored ${n} record(s). ${privateNote}`
+        + (missing ? `\n\n${missing} document file(s) couldn't be downloaded yet.` : '')
+    });
+    // The program keeps its devices in step (Cloud Phase 2 plan §2.1): offer to join.
+    if (push?.status === 'conflict' && push.syncing && isSyncOffered()) await (await syncUI()).joinOfferDialog();
+    return true;
+  } catch (e) {
+    pg.close();
+    await alertModal({ title: "Couldn't restore", message: errorText(e) });
+    return false;
+  }
+}
+
+// → true (joined), false (she backed out of the join), or null (restore instead:
+// the program doesn't sync, sync isn't offered here, or this device can't join yet).
+async function joinInsteadOfRestore() {
+  if (!isSyncOffered()) return null;
+  const sync = await import('../data/cloud/cloudSync.js');
+  if (!(await sync.programSyncs())?.enabled) return null;
+  prepareDirectJoin();
+  if ((await sync.syncReadiness()).length) return null;
+  const joined = await (await syncUI()).joinSyncFlow({ confirmed: true });
+  if (joined) await adoptOwnKennel();
+  return joined;
+}
+
+// Today's card (plan §2.1: turn it on, or it's paused) is assets/todayCloudCard.js,
+// which loads this module only when one of its buttons is pressed.
+
+// --- Service notices (plan §2.1: the in-app shutdown channel) ---------------------------
+async function renderServiceNotices() {
+  const notices = await getServiceNotices();
+  if (!notices.length) return;
+  const seen = new Set();
+  for (const n of notices) {
+    if (!n || seen.has(n.id)) continue;
+    seen.add(n.id);
+    // app.js draws the notices this session already fetched at boot.
+    if (n.id != null && document.querySelector(`.cloud-notice[data-notice-id="${CSS.escape(String(n.id))}"]`)) continue;
+    const bar = document.createElement('div');
+    bar.className = `cloud-notice cloud-notice-${['info', 'warning', 'shutdown'].includes(n.level) ? n.level : 'info'}`;
+    bar.setAttribute('role', 'status');
+    bar.innerHTML = `<strong>${n.level === 'shutdown' ? 'Cloud backup is ending.' : 'KennelOS cloud:'}</strong> ${esc(n.message || '')}`;
+    document.body.insertBefore(bar, document.body.firstChild);
+  }
+}
+
+// --- Record pages: private details blank after a restore (Private Vault Plan §2.3) -----
+// Phase 1 §2.3's per-record hint: after a cloud restore that didn't bring the
+// private tier back, the pages that hold private details say why they're blank,
+// and how to get them back (unlock, or a file backup). Gone once they're back
+// (an unlock clears cloudRestoredAt) or the user says "Got it" on the card.
+const PRIVATE_DETAIL_PAGES = new Set([
+  'contact.html', 'contacts.html', 'dog.html', 'sale.html', 'sales.html', 'contract.html', 'contracts.html',
+  'stud-service.html', 'litter.html', 'financials.html', 'waitlist-entry.html', 'documents.html'
+]);
+
+export function renderPrivateGapHint() {
+  const page = location.pathname.split('/').pop();
+  if (!PRIVATE_DETAIL_PAGES.has(page) || !getCloudRestoredAt()) return;
+  const main = document.querySelector('main');
+  if (!main || main.querySelector('.private-gap-hint')) return;
+  const locked = getBackupStatus().vault === 'locked';
+  const hint = document.createElement('div');
+  hint.className = 'inline-warn private-gap-hint';
+  hint.style.marginBottom = '12px';
+  hint.innerHTML = locked
+    ? 'Sensitive records (phone, email, address, prices, notes) are blank on this device until you unlock them. <a href="import-export.html#backup-restore">Unlock your sensitive records</a>'
+    : 'Sensitive records (phone, email, address, prices, notes) weren\'t in the cloud backup this device was restored from, so they\'re blank here. <a href="import-export.html">Restore a file backup</a> with Merge to bring them back.';
+  main.insertBefore(hint, main.firstChild);
+}
+
+// --- Reset App's question (plan §3.3) ------------------------------------------------------
+// The checkbox for the Reset App modal: '' when there's no cloud sign-in on
+// this device. Ticked by default, because a typed "erase" may mean the device is
+// changing hands.
+export function resetSignOutFieldHtml() {
+  if (!isCloudAvailable() || !currentAccount()) return '';
+  return `
+    <label style="display:flex;gap:8px;align-items:flex-start;margin:10px 0;">
+      <input type="checkbox" id="reset-cloud-signout" checked>
+      <span>Also sign out of cloud backup on this device
+        <span class="field-hint" style="display:block;">Leave this ticked if the device might change hands. Untick it to stay signed in and restore your backup straight after the reset.</span></span>
+    </label>
+    <p class="field-hint">Cloud backup is turned off on this device either way, so the reset can't overwrite your cloud copy.</p>`;
+}
+
+export async function signOutAfterResetIfChecked(root) {
+  const box = root?.querySelector('#reset-cloud-signout');
+  if (box && box.checked) {
+    try { await signOut(); } catch { /* local sign-out still happened */ }
+  }
+}
+
+// --- Boot (app.js) ---------------------------------------------------------------------------
+export async function bootCloud() {
+  if (!isCloudAvailable()) return;
+  startBackupScheduler();
+  // The waitlist online (Waitlist W2 Plan §5): Pro, behind its release switch.
+  if (isWaitlistOnlineOffered() && editionFlags.waitlist) {
+    import('../data/cloud/cloudWaitlist.js').then((m) => m.startWaitlistScheduler()).catch(() => {});
+  }
+  // App alerts (Notifications plan §2.1): a device with them on tells the server its
+  // subscription again once a day, so a dropped one (iPhone) comes back.
+  if (editionFlags.waitlist) {
+    import('../data/cloud/cloudNotify.js').then((m) => m.refreshAlertsHere()).catch(() => {});
+  }
+  // Vendor integrations (Integrations plan §0): Pro; asks nothing until the
+  // account has a connection.
+  if (editionFlags.accounts) {
+    import('../data/cloud/cloudIntegrations.js').then((m) => m.startIntegrationsScheduler()).catch(() => {});
+  }
+  // Live sync (Cloud Phase 2 plan §5): only on a device that keeps in step.
+  if (editionFlags.liveSync === true && syncsHere()) syncUI().then((ui) => ui.startSyncUI()).catch(() => {});
+  renderServiceNotices().catch(() => {});
+  try { renderPrivateGapHint(); } catch { /* a hint only */ }
+  // Assisted setup and help (docs/KennelOS_Assisted_Setup_Plan.md): the automatic
+  // vault hand-over on whichever side gives the key, and an unfinished takeover.
+  if (editionFlags.liveSync === true && currentAccount()?.signedIn) {
+    import('./cloudAssistUI.js').then((ui) => {
+      ui.startAssistLoops();
+      if (currentAccount()?.assisted) return ui.claimAssistedAccount();
+      return null;
+    }).catch((e) => console.warn('KennelOS: assist', e));
+  }
+}

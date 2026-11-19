@@ -1,0 +1,586 @@
+// tidyRules.js — Kels's "Tidy up my records" checks (End-State guide §33): the
+// places where two records that should agree don't. Pure: every function takes
+// the rows it needs and returns findings; nothing here reads or writes the
+// database, and nothing here decides what to do about a finding. The task
+// (assets/tidyUpUI.js) asks the breeder, one finding at a time, and writes
+// through the repos (or data/recordMerge.js for a duplicate).
+//
+// These run only inside Kels, never as Today nudges: some are slow (the
+// duplicate scans) and some are opinions she should be asked about in person.
+//
+// A finding: { key, kind, ... }. `key` is stable for the same records, so
+// "don't ask me again" can remember it (nudgeState, prefixed `tidy:`). Order is
+// the order she raises them in: TIDY_KINDS.
+import { RELEASED_SALE_STATUSES, EVENT_TYPES, WHELPED_OR_LATER } from './vocab.js';
+import { studParents } from './studRules.js';
+import { similarNamed, dogRegKeys, dogNameKeys, sameRegistration, sameRegisteredName, registrationsConflict } from './dogSearch.js';
+import { normName, normEmail, normPhone, hasVet, isVet } from './contactSearch.js';
+import { duplicateApplicationPairs } from './applicationDuplicates.js';
+import { titlesOf, abbrKey, nameTitles, splitTitleInput } from './dogTitles.js';
+
+export const TIDY_KINDS = [
+  'litter-count',        // a litter's born count ≠ its puppy records
+  'litter-delivery',     // a whelped litter with no delivery type
+  'pup-placed',          // a pup with a sale isn't marked Placed
+  'pup-no-plan',         // a pup of hers with no plan (disposition) at all
+  'delivered-owned',     // a delivered pup is still on her roster as hers
+  'litter-pairing-parents', // a litter's parents ≠ its breeding's
+  'pup-litter-parents',  // a litter's pups have blank or different parents
+  'dog-no-parents',      // a dog of hers with no litter has a blank sire or dam
+  'dog-titles-in-notes', // dogs whose notes have a "Titles: …" line their titles lack (one finding)
+  'dog-titles-in-name',  // dogs whose registered name starts with titles (one finding)
+  'stud-unlinked',       // a stud service past its date with no breeding linked (Pro)
+  'breeder-no-kennel',   // a Breeder contact with no kennel (Pro)
+  'kennel-no-contact',   // an outside kennel no contact belongs to (Pro)
+  'event-no-vet',        // vet visits / surgeries with a typed vet and no vet contact (Pro)
+  'no-vet',              // nobody in her contacts is a vet (Pro)
+  'duplicate-dogs',      // two dog records for one dog
+  'duplicate-contacts',  // two contact records for one person (Pro)
+  'duplicate-applications', // one family on one waitlist twice (Pro, waitlist)
+  'tour-leftovers'       // archived records an old guided tour left behind
+];
+
+const blank = (v) => v == null || (typeof v === 'string' && v.trim() === '');
+const num = (v) => (blank(v) ? null : Number.isFinite(Number(v)) ? Number(v) : null);
+const pairKey = (a, b) => (a < b ? `${a}:${b}` : `${b}:${a}`);
+
+// Name, email and phone keys are contactSearch's, so "the same person" reads one way everywhere.
+export { normName, normPhone };
+const normId = (s) => String(s ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+const normUrl = (s) => String(s ?? '').trim().toLowerCase().replace(/^https?:\/\/(www\.|m\.)?/, '').replace(/\/+$/, '');
+
+// --- Litters -------------------------------------------------------------------
+
+// How many pups the litter says were born alive: `puppies_born_alive`, else the
+// total less any recorded deceased, else null (no count to compare).
+export function recordedAlive(litter) {
+  const alive = num(litter.puppies_born_alive);
+  if (alive != null) return alive;
+  const total = num(litter.puppies_born_total);
+  if (total == null) return null;
+  return Math.max(0, total - (num(litter.puppies_born_deceased) ?? 0));
+}
+
+// Born litters whose count disagrees with their puppy records. Every record with
+// the litter_id counts, departed (archived) and deceased pups too: a pup that
+// left or died later was still born alive.
+export function litterCountFindings(litters, allDogs) {
+  const pups = new Map();
+  for (const d of allDogs) if (d.litter_id) pups.set(d.litter_id, (pups.get(d.litter_id) || 0) + 1);
+  const out = [];
+  for (const l of litters) {
+    if (l.is_archived || l.status === 'expected') continue;
+    const recorded = recordedAlive(l);
+    if (recorded == null) continue;
+    const actual = pups.get(l.id) || 0;
+    if (actual === recorded) continue;
+    out.push({ key: `count:${l.id}:${recorded}:${actual}`, kind: 'litter-count', litter: l, recorded, actual, more: actual > recorded });
+  }
+  return out;
+}
+
+// What a "fix the count" writes: alive = the records, and the total grows to
+// fit if it would now be smaller than alive + deceased.
+export function countFix(litter, actual) {
+  const changes = { puppies_born_alive: actual };
+  const total = num(litter.puppies_born_total);
+  const dead = num(litter.puppies_born_deceased) ?? 0;
+  if (total != null && total !== actual + dead) changes.puppies_born_total = actual + dead;
+  return changes;
+}
+
+// A litter linked to a breeding with different parents. The litter's own
+// sire/dam are authoritative (§4), but either side can be the typo, so both fixes are offered.
+// A litter that's Whelped or later with no delivery type recorded (vocab
+// LITTER_DELIVERY_TYPE): she's asked how it was delivered.
+export function deliveryFindings(litters) {
+  return litters.filter((l) => !l.is_archived && WHELPED_OR_LATER.includes(l.status) && blank(l.delivery_type))
+    .sort((a, b) => (b.whelp_date || '').localeCompare(a.whelp_date || ''))
+    .map((l) => ({ key: `delivery:${l.id}`, kind: 'litter-delivery', litter: l }));
+}
+
+export function litterPairingFindings(litters, pairings) {
+  const byId = new Map(pairings.map((p) => [p.id, p]));
+  const out = [];
+  for (const l of litters) {
+    if (l.is_archived || !l.pairing_id) continue;
+    const p = byId.get(l.pairing_id);
+    if (!p || p.is_archived) continue;
+    const sire = p.sire_id !== l.sire_id;
+    const dam = p.dam_id !== l.dam_id;
+    if (!sire && !dam) continue;
+    out.push({ key: `litpair:${l.id}:${p.sire_id}:${p.dam_id}:${l.sire_id}:${l.dam_id}`, kind: 'litter-pairing-parents', litter: l, pairing: p, sire, dam });
+  }
+  return out;
+}
+
+// Per litter: its pups (on the roster) with a blank sire/dam (`fill`) or one
+// different from the litter's (`conflict`).
+export function pupParentFindings(litters, dogs) {
+  const byLitter = new Map();
+  for (const d of dogs) {
+    if (d.is_archived || !d.litter_id) continue;
+    if (!byLitter.has(d.litter_id)) byLitter.set(d.litter_id, []);
+    byLitter.get(d.litter_id).push(d);
+  }
+  const out = [];
+  for (const l of litters) {
+    if (l.is_archived) continue;
+    const fill = [];
+    const conflict = [];
+    for (const p of byLitter.get(l.id) || []) {
+      const off = (p.sire_id && p.sire_id !== l.sire_id) || (p.dam_id && p.dam_id !== l.dam_id);
+      if (off) conflict.push(p);
+      else if (!p.sire_id || !p.dam_id) fill.push(p);
+    }
+    if (!fill.length && !conflict.length) continue;
+    const ids = [...fill, ...conflict].map((p) => p.id).sort().join(',');
+    out.push({ key: `puppar:${l.id}:${l.sire_id}:${l.dam_id}:${ids}`, kind: 'pup-litter-parents', litter: l, fill, conflict });
+  }
+  return out;
+}
+
+// What filling / correcting a pup from its litter writes.
+export function pupParentFix(pup, litter) {
+  const changes = {};
+  if (pup.sire_id !== litter.sire_id) changes.sire_id = litter.sire_id;
+  if (pup.dam_id !== litter.dam_id) changes.dam_id = litter.dam_id;
+  return changes;
+}
+
+// --- Dogs ------------------------------------------------------------------------
+
+const MINE = ['owned', 'co_owned', 'leased_in'];
+
+// Her own dogs (not from one of her litters) with a blank sire or dam. Pups in a
+// litter are pupParentFindings' job; outside and pedigree-only dogs aren't asked
+// about (a pedigree's top row has no parents, and that's fine).
+export function dogParentFindings(dogs, littersById) {
+  const out = [];
+  for (const d of dogs) {
+    if (d.is_archived || d.pedigree_only || !MINE.includes(d.ownership_type)) continue;
+    if (d.litter_id && littersById.has(d.litter_id)) continue;
+    const missing = [!d.sire_id && 'sire', !d.dam_id && 'dam'].filter(Boolean);
+    if (!missing.length) continue;
+    out.push({ key: `dogpar:${d.id}:${missing.join('+')}`, kind: 'dog-no-parents', dog: d, missing });
+  }
+  return out;
+}
+
+// --- Titles (Dog Titles Field Plan §5) --------------------------------------------
+// One finding per kind for all the dogs, not one per dog: a chart import can
+// leave dozens of ancestors. The key comes from the dogs and titles in it, so a
+// new import (or a new title) raises it again after "Don't ask me again".
+
+// A short, stable hash for a finding key (djb2), so a long list keeps a short key.
+function hashKey(text) {
+  let h = 5381;
+  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+const groupKey = (prefix, items) => {
+  const parts = items.map((it) => `${it.dog.id}=${it.titles.map(abbrKey).join('+')}`).sort();
+  return `${prefix}:${items.length}:${hashKey(parts.join(','))}`;
+};
+
+// Each dog's title_earned events, by dog id.
+function titleEventsByDog(events) {
+  const by = new Map();
+  for (const e of events || []) {
+    if (!e || e.event_type !== 'title_earned' || e.is_archived) continue;
+    if (!by.has(e.subject_id)) by.set(e.subject_id, []);
+    by.get(e.subject_id).push(e);
+  }
+  return by;
+}
+
+// The abbreviations on a dog's "Titles: …" notes lines (what chart imports wrote
+// before titles had a field), each once, in order.
+export function notesTitleAbbrs(notes) {
+  const out = [];
+  for (const m of String(notes ?? '').matchAll(/^[ \t]*Titles:[ \t]*(.+)$/gim)) {
+    for (const abbr of splitTitleInput(m[1])) {
+      // A title has a capital in it and is short ("CH", "HIAdsc"); a word she
+      // wrote there ("none", "pending") isn't one.
+      if (!/[A-Z]/.test(abbr) || abbr.length > 12) continue;
+      if (!out.some((a) => abbrKey(a) === abbrKey(abbr))) out.push(abbr);
+    }
+  }
+  return out;
+}
+
+// Dogs (pedigree-only included) whose notes name titles that aren't among their
+// titles (titlesOf: the field, logged events, the name). The notes line is left
+// as it is (D4). → [] or one { kind: 'dog-titles-in-notes', items: [{ dog, titles }] }.
+export function titlesInNotesFindings(dogs, events = []) {
+  const evBy = titleEventsByDog(events);
+  const items = [];
+  for (const d of dogs || []) {
+    if (!d || d.is_archived) continue;
+    const abbrs = notesTitleAbbrs(d.notes);
+    if (!abbrs.length) continue;
+    const held = new Set(titlesOf(d, evBy.get(d.id) || []).map((t) => abbrKey(t.abbr)));
+    const titles = abbrs.filter((a) => !held.has(abbrKey(a)));
+    if (titles.length) items.push({ dog: d, titles });
+  }
+  return items.length ? [{ key: groupKey('titlesnotes', items), kind: 'dog-titles-in-notes', items }] : [];
+}
+
+// Dogs whose registered name starts with titles ("GCH A-K Bella", D5b): the
+// titles would go to their titles and come off the front of the name.
+// → [] or one { kind: 'dog-titles-in-name', items: [{ dog, titles, name }] }.
+export function titlesInNameFindings(dogs) {
+  const items = [];
+  for (const d of dogs || []) {
+    if (!d || d.is_archived) continue;
+    const { name, titles } = nameTitles(d.registered_name);
+    if (titles.length && name) items.push({ dog: d, titles, name });
+  }
+  return items.length ? [{ key: groupKey('titlesname', items), kind: 'dog-titles-in-name', items }] : [];
+}
+
+// What saving one dog's titles writes: its titles with these added (dogRepo
+// normalizes and dedupes, so answering twice adds nothing), and for the name
+// finding the name without its front titles.
+export function titlesFix(dog, titles, { name = null } = {}) {
+  const changes = { titles: [...(Array.isArray(dog.titles) ? dog.titles : []), ...titles.map((abbr) => ({ abbr, organization: '', earned_on: '' }))] };
+  if (name) changes.registered_name = name;
+  return changes;
+}
+
+// Pups with a sale that's going ahead (open or delivered) whose plan isn't Placed.
+// Asked only once the deposit is in: a sale still at Deposit pending (a waitlist
+// pick, a side sale, or one from the Sale page) may yet fall through, and marking
+// the pup Placed early takes it away from the family whose turn it is.
+export function pupPlacedFindings(dogs, sales) {
+  const paid = (s) => !s.is_archived && s.status && s.status !== 'deposit_pending' && !RELEASED_SALE_STATUSES.includes(s.status);
+  const live = new Set(sales.filter(paid).map((s) => s.dog_id));
+  return dogs
+    .filter((d) => !d.is_archived && d.status === 'puppy' && d.disposition !== 'placed' && live.has(d.id))
+    .map((d) => ({ key: `placed:${d.id}`, kind: 'pup-placed', dog: d, sale: sales.find((s) => s.dog_id === d.id && paid(s)) }));
+}
+
+// Pups of hers (owned) with no plan at all: blank reads as Undecided, which the
+// waitlist never offers and the website never shows as available, so she's asked
+// what the plan is. A pup with a sale going ahead is pup-placed's to ask about.
+export function pupNoPlanFindings(dogs, sales) {
+  const live = new Set(sales.filter((s) => !s.is_archived && s.status && !RELEASED_SALE_STATUSES.includes(s.status)).map((s) => s.dog_id));
+  return dogs
+    .filter((d) => !d.is_archived && d.status === 'puppy' && d.ownership_type === 'owned' && blank(d.disposition) && !live.has(d.id))
+    .map((d) => ({ key: `noplan:${d.id}`, kind: 'pup-no-plan', dog: d }));
+}
+
+// A dog whose sale is Delivered but who is still on her roster as hers (owned).
+// Co-owned dogs are left alone: keeping a share is a normal way to sell.
+export function deliveredOwnedFindings(dogs, sales) {
+  const out = [];
+  for (const d of dogs) {
+    if (d.is_archived || d.ownership_type !== 'owned') continue;
+    const sale = sales.filter((s) => !s.is_archived && s.dog_id === d.id && s.status === 'delivered')
+      .sort((a, b) => String(b.sale_date || b.updated_at || '').localeCompare(String(a.sale_date || a.updated_at || '')))[0];
+    if (!sale) continue;
+    // A newer sale still going (a re-sale after a return) means she has the dog back.
+    if (sales.some((s) => !s.is_archived && s.dog_id === d.id && s.id !== sale.id && !['delivered', ...RELEASED_SALE_STATUSES].includes(s.status))) continue;
+    out.push({ key: `delivered:${d.id}:${sale.id}`, kind: 'delivered-owned', dog: d, sale });
+  }
+  return out;
+}
+
+// --- Stud services (Pro) ---------------------------------------------------------
+
+// A stud service whose date has passed (returned, else sent; or Completed) with
+// no breeding linked. `candidates` are breedings of the same two dogs, opened no
+// earlier than two weeks before it was sent, that no other stud service claims:
+// the "link it" answers. None means she can create one.
+// `dogs`: every dog (the stud is whichever of the two is male, studRules.studParents).
+export function studFindings(studServices, pairings, today, dogs = []) {
+  const claimed = new Set(studServices.filter((s) => !s.is_archived && s.pairing_id).map((s) => s.pairing_id));
+  const out = [];
+  for (const s of studServices) {
+    if (s.is_archived || s.pairing_id || ['cancelled', 'failed'].includes(s.status)) continue;
+    const date = s.returned_date || s.sent_date || null;
+    const past = s.status === 'completed' || (date && date < today);
+    if (!past) continue;
+    const { damId, sireId } = studParents(s, dogs) || {};
+    const since = s.sent_date ? shiftDays(s.sent_date, -14) : null;
+    const candidates = pairings.filter((p) => !p.is_archived && p.dam_id === damId && p.sire_id === sireId && !claimed.has(p.id)
+      && (!since || (p.planned_date || String(p.created_at || '').slice(0, 10) || since) >= since));
+    out.push({ key: `stud:${s.id}`, kind: 'stud-unlinked', stud: s, candidates });
+  }
+  return out;
+}
+
+function shiftDays(ymd, n) {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+// --- Contacts & kennels (Pro) ----------------------------------------------------
+
+export function breederKennelFindings(contacts) {
+  return contacts
+    .filter((c) => !c.is_archived && (c.contact_type || []).includes('breeder') && !c.kennel_id)
+    .map((c) => ({ key: `breederkennel:${c.id}`, kind: 'breeder-no-kennel', contact: c }));
+}
+
+// Outside kennels no (current) contact belongs to. `used` = some dog names it
+// (as its kennel or its breeder); an unused one can simply be archived.
+export function kennelContactFindings(kennels, contacts, dogs) {
+  const linked = new Set(contacts.filter((c) => !c.is_archived && c.kennel_id).map((c) => c.kennel_id));
+  const usedBy = new Set();
+  for (const d of dogs) { if (d.kennel_id) usedBy.add(d.kennel_id); if (d.breeder_kennel_id) usedBy.add(d.breeder_kennel_id); }
+  return kennels
+    .filter((k) => !k.is_archived && !k.is_own_kennel && !linked.has(k.id))
+    .map((k) => ({ key: `kennelcontact:${k.id}`, kind: 'kennel-no-contact', kennel: k, used: usedBy.has(k.id) }));
+}
+
+// Vet visits and surgeries with the vet typed as a name (`details.vet`, the
+// type's contactFallback: KennelAssistant, the litter check-in, or logged before
+// the picker) and no vet contact linked (related_contact_id). One finding per
+// name, however it's typed, covering every event that names it. `match`: the
+// contact it most likely is (the same name, a vet first; else a near name,
+// dogSearch.similarNamed), or null. The key carries how many events, so a new
+// one with that name asks again. `name`: her most-used spelling of it.
+export const VET_EVENT_TYPES = EVENT_TYPES.filter((t) => t.relatedContact === 'Vet').map((t) => t.value);
+const vetKey = (type) => EVENT_TYPES.find((t) => t.value === type)?.fields.find((f) => f.contactFallback)?.key;
+
+export function vetContactFindings(events, contacts) {
+  const groups = new Map();
+  for (const e of events) {
+    if (e.is_archived || e.related_contact_id || !VET_EVENT_TYPES.includes(e.event_type)) continue;
+    const typed = String(e.details?.[vetKey(e.event_type)] ?? '').trim();
+    const n = normName(typed);
+    if (!n) continue;
+    if (!groups.has(n)) groups.set(n, { spellings: new Map(), events: [] });
+    const g = groups.get(n);
+    g.events.push(e);
+    g.spellings.set(typed, (g.spellings.get(typed) || 0) + 1);
+  }
+  // Her most-used spelling names it; on a tie, one written with capitals.
+  const caps = (t) => (/[A-Z]/.test(t) ? 1 : 0);
+  for (const g of groups.values()) g.name = [...g.spellings].sort(([a, x], [b, y]) => y - x || caps(b) - caps(a))[0][0];
+  const live = contacts.filter((c) => !c.is_archived);
+  return [...groups].map(([n, g]) => {
+    const same = live.filter((c) => normName(c.name) === n).sort((a, b) => isVet(b) - isVet(a));
+    const match = same[0] || similarNamed([...live].sort((a, b) => isVet(b) - isVet(a)), g.name, (c) => c.name);
+    const list = [...g.events].sort((a, b) => String(a.event_date || '').localeCompare(String(b.event_date || '')));
+    return { key: `vetcontact:${n}:${list.length}`, kind: 'event-no-vet', name: g.name, events: list, match: match || null };
+  });
+}
+
+// Nobody in her contacts is tagged Vet. Raised once she has a dog of her own;
+// one finding, so "Don't ask me again" settles it.
+export function noVetFindings(contacts, dogs) {
+  if (!dogs.length || hasVet(contacts)) return [];
+  return [{ key: 'novet', kind: 'no-vet' }];
+}
+
+// The event, linked to its vet: the contact replaces the typed name (as the
+// event form clears it once a contact is linked).
+export function vetLinkFix(event, contactId) {
+  const details = { ...(event.details || {}) };
+  delete details[vetKey(event.event_type)];
+  return { related_contact_id: contactId, details };
+}
+
+// Two contacts with the same name (normalized) and at least one other detail
+// in common: email, phone, address, Facebook, or kennel. A name alone isn't enough.
+export function duplicateContactFindings(contacts) {
+  const groups = new Map();
+  for (const c of contacts) {
+    if (c.is_archived) continue;
+    const n = normName(c.name);
+    if (!n) continue;
+    if (!groups.has(n)) groups.set(n, []);
+    groups.get(n).push(c);
+  }
+  const details = [
+    ['email', (c) => normEmail(c.email)],
+    ['phone', (c) => normPhone(c.phone)],
+    ['address', (c) => normName(c.address)],
+    ['Facebook', (c) => normUrl(c.facebook_profile)],
+    ['kennel', (c) => c.kennel_id || '']
+  ];
+  const out = [];
+  for (const group of groups.values()) {
+    for (let i = 0; i < group.length; i++) {
+      for (let j = i + 1; j < group.length; j++) {
+        const [a, b] = [group[i], group[j]];
+        const shared = details.filter(([, f]) => f(a) && f(a) === f(b)).map(([label]) => label);
+        if (!shared.length) continue;
+        const [x, y] = orderPair(a, b);
+        out.push({ key: `dupcontact:${pairKey(a.id, b.id)}`, kind: 'duplicate-contacts', a: x, b: y, shared });
+      }
+    }
+  }
+  return out;
+}
+
+// Older record first: it's the one most likely to be the "real" one.
+const orderPair = (a, b) => (String(a.created_at || '') <= String(b.created_at || '') ? [a, b] : [b, a]);
+
+// Two dog records for one dog. Missing details are unknown, never a difference:
+// an outside dog often has no birthday or registration number, so those can only
+// rule a pair OUT when both records have them and they differ.
+//   certain: a Dog Card id (public_id), a registration number in common, or a
+//     registered name in common (any of either's, additional registrations
+//     included: dogSearch), the name never for two of one litter (possible then);
+//   possible: the same call name, breed and sex, and nothing that contradicts it.
+// Registration numbers contradict only as `registrationsConflict` says (both have
+// numbers, none shared, and two could be the same registry's).
+// Never a pair: littermates (same litter) by name alone, a dog and its own parent
+// or child, or two dogs whose known sex differs.
+export const DOG_CONTRADICTIONS = [
+  ['birthday', (d) => d.date_of_birth || ''],
+  ['microchip', (d) => normId(d.microchip_id)],
+  ['sire', (d) => d.sire_id || ''],
+  ['dam', (d) => d.dam_id || '']
+];
+const knownSex = (d) => (d.sex === 'male' || d.sex === 'female' ? d.sex : '');
+
+export function compareDogs(a, b) {
+  if (a.id === b.id) return null;
+  if (a.sire_id === b.id || a.dam_id === b.id || b.sire_id === a.id || b.dam_id === a.id) return null;
+  if (knownSex(a) && knownSex(b) && knownSex(a) !== knownSex(b)) return null;
+  const sameReg = sameRegistration(a, b);
+  const sameRegName = sameRegisteredName(a, b);
+  const cnA = normName(a.call_name);
+  const sameCall = cnA && cnA === normName(b.call_name) && normName(a.breed) === normName(b.breed);
+  const hasRegs = dogRegKeys(a).length && dogRegKeys(b).length;
+  const differs = [...(registrationsConflict(a, b) ? ['registration number'] : []),
+    ...DOG_CONTRADICTIONS.filter(([, f]) => f(a) && f(b) && f(a) !== f(b)).map(([label]) => label)];
+  const matches = [...(sameReg ? ['registration number'] : []),
+    ...DOG_CONTRADICTIONS.filter(([, f]) => f(a) && f(a) === f(b)).map(([label]) => label)];
+  const unknown = [...(hasRegs ? [] : ['registration number']),
+    ...DOG_CONTRADICTIONS.filter(([, f]) => !f(a) || !f(b)).map(([label]) => label)];
+  if (a.public_id && a.public_id === b.public_id) return { strength: 'certain', reasons: ['KennelOS ID'], matches, unknown: [] };
+  if (sameReg) return { strength: 'certain', reasons: ['registration number'], matches, unknown: [] };
+  // Littermates share a birthday, breed and dam: a name alone never makes them certain (K1-1).
+  const littermates = a.litter_id && a.litter_id === b.litter_id;
+  if (sameRegName && !differs.length) return { strength: littermates ? 'possible' : 'certain', reasons: ['registered name'], matches, unknown };
+  if (sameCall && !differs.length && !(a.litter_id && a.litter_id === b.litter_id)) {
+    return { strength: 'possible', reasons: ['call name', 'breed'], matches, unknown };
+  }
+  return null;
+}
+
+export function duplicateDogFindings(dogs) {
+  const live = dogs.filter((d) => !d.is_archived);
+  // Only pairs sharing a name or a registration number can match, so bucket by those.
+  const buckets = new Map();
+  const put = (k, d) => { if (!k) return; if (!buckets.has(k)) buckets.set(k, []); buckets.get(k).push(d); };
+  for (const d of live) {
+    put(normName(d.call_name) && `c:${normName(d.call_name)}`, d);
+    for (const k of dogNameKeys(d)) put(`r:${k}`, d);
+    for (const k of dogRegKeys(d)) put(`n:${k}`, d);
+    put(d.public_id && `p:${d.public_id}`, d);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const group of buckets.values()) {
+    for (let i = 0; i < group.length; i++) {
+      for (let j = i + 1; j < group.length; j++) {
+        const k = pairKey(group[i].id, group[j].id);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const m = compareDogs(group[i], group[j]);
+        if (!m) continue;
+        const [a, b] = orderPair(group[i], group[j]);
+        out.push({ key: `dupdog:${k}`, kind: 'duplicate-dogs', a, b, ...m });
+      }
+    }
+  }
+  return out.sort((x, y) => (x.strength === y.strength ? 0 : x.strength === 'certain' ? -1 : 1));
+}
+
+// One family who applied twice to the same waitlist: applicationDuplicates.js's
+// rule (the same contact, email or phone is certain; the same or a near name only
+// possible), live applications and families on the list only.
+export function duplicateApplicationFindings(entries, contacts = []) {
+  const contactsById = new Map(contacts.map((c) => [c.id, c]));
+  return duplicateApplicationPairs(entries, { contactsById })
+    .map((p) => ({ key: `dupapplication:${p.key}`, kind: 'duplicate-applications', a: p.a, b: p.b, strength: p.strength, reason: p.reason }));
+}
+
+// --- Everything ------------------------------------------------------------------
+
+// Every finding, in TIDY_KINDS order. `flags` are the edition's (editionFlags):
+// contactsSection gates the contact and kennel checks, studServices the stud one,
+// waitlist the duplicate applications (`waitlistEntries`, in kennel scope).
+// --- Leftover tour records (Load Performance plan D5) ----------------------------
+// Before the tour was read-only, leaving it after her own records came to point at
+// sample ones archived those sample records and forgot which were sample. They
+// are found again by the seed's fixed names (sampleData.js and Lite's
+// editionTour.js), ARCHIVED ones only, and she confirms each before anything
+// goes. Never removed by itself.
+export const TOUR_KENNEL_NAMES = ['Thornfield Kennels', 'Meadow Ridge Kennels', 'Briar Hollow Kennels'];
+export const TOUR_DOG_NAMES = ['Ash', 'Aster', 'Birch', 'Bramble', 'Cassius', 'Cedar', 'Clover', 'Dahlia', 'Daisy',
+  'Diesel', 'Fern', 'Gunnar', 'Hazel', 'Ivy', 'Juniper', 'Juno', 'Maple', 'Marigold', 'Nell', 'Opal', 'Percy',
+  'Poppy', 'Sage', 'Sorrel', 'Titan', 'Willow', 'Wren'];
+export const TOUR_DOG_REGISTERED_NAMES = ['Briar Hollow Cassius', 'Briar Hollow Opal', 'Meadow Ridge Marigold',
+  'Meadow Ridge Maximus Gunnar', 'Thornfield Daisy Mae', 'Thornfield Diesel Engine', 'Thornfield Maximus Gunnar',
+  'Thornfield Midnight Juniper', 'Thornfield Wild Ivy'];
+export const TOUR_CONTACT_NAMES = ['Dana Ruiz', 'Dr. Patricia Nguyen', 'Ellen Brooks', 'Grace Halloran', 'Hugo Marsh',
+  'Jamal Reed', 'Lauren Pike', 'Marcus Webb', 'Nora Kim', 'Owen Farrow', 'Priya Shah', 'Renee Coleman',
+  'Rex Regional Pet Transport', 'Sam Okafor', 'Tessa Lin'];
+
+// One finding listing them all, or none. A dog counts only with a seed name AND
+// something tying it to the seed: its registered name, or a kennel that is a
+// leftover or no longer exists. A contact needs a seed name and the seed's
+// 555-01xx phone (or none). Archived litters and breedings whose parents are
+// both leftover dogs go with them.
+export function tourLeftoverFindings({ kennels = [], dogs = [], contacts = [], litters = [], pairings = [] }) {
+  const archived = (r) => r && r.is_archived;
+  const kennelIds = new Set(kennels.map((k) => k.id));
+  const leftKennels = kennels.filter((k) => archived(k) && TOUR_KENNEL_NAMES.includes(k.kennel_name));
+  const leftKennelIds = new Set(leftKennels.map((k) => k.id));
+  const tied = (id) => id && (leftKennelIds.has(id) || !kennelIds.has(id));
+  const leftDogs = dogs.filter((d) => archived(d) && TOUR_DOG_NAMES.includes(d.call_name)
+    && (TOUR_DOG_REGISTERED_NAMES.includes(d.registered_name) || tied(d.kennel_id) || tied(d.breeder_kennel_id)));
+  const dogIds = new Set(leftDogs.map((d) => d.id));
+  const leftContacts = contacts.filter((c) => archived(c) && TOUR_CONTACT_NAMES.includes(c.name)
+    && (!c.phone || /^555-01\d\d$/.test(String(c.phone).trim())));
+  const parentsLeft = (r) => archived(r) && dogIds.has(r.sire_id) && dogIds.has(r.dam_id);
+  const leftLitters = litters.filter(parentsLeft);
+  const leftPairings = pairings.filter(parentsLeft);
+  const n = leftKennels.length + leftDogs.length + leftContacts.length;
+  if (!n) return [];
+  const ids = [...leftKennels, ...leftDogs, ...leftContacts].map((r) => r.id).sort();
+  return [{
+    key: `tour-leftovers:${ids.join(',')}`.slice(0, 300), kind: 'tour-leftovers',
+    kennels: leftKennels, dogs: leftDogs, contacts: leftContacts, litters: leftLitters, pairings: leftPairings
+  }];
+}
+
+// `scoped` rows (litters, sales, studServices, dogs) are already in kennel scope;
+// `allDogs` is every dog (archived and pedigree-only included) for counting
+// litters and matching duplicates; contacts and kennels are program-wide.
+// `titleEvents`: title_earned events, so a title already logged isn't asked about.
+// `leftovers`: { kennels, dogs, contacts, litters, pairings }, archived ones
+// included (tourLeftoverFindings), or null to skip that check.
+export function tidyFindings({ litters, pairings, sales, studServices = [], dogs, allDogs, contacts = [], kennels = [], vetEvents = [], titleEvents = [], waitlistEntries = [], leftovers = null, flags = {}, today }) {
+  const littersById = new Map(litters.map((l) => [l.id, l]));
+  const all = [
+    ...litterCountFindings(litters, allDogs),
+    ...deliveryFindings(litters),
+    ...pupPlacedFindings(dogs, sales),
+    ...pupNoPlanFindings(dogs, sales),
+    ...deliveredOwnedFindings(dogs, sales),
+    ...litterPairingFindings(litters, pairings),
+    ...pupParentFindings(litters, dogs),
+    ...dogParentFindings(dogs, littersById),
+    ...titlesInNotesFindings(allDogs, titleEvents),
+    ...titlesInNameFindings(allDogs),
+    ...(flags.studServices ? studFindings(studServices, pairings, today, allDogs) : []),
+    ...(flags.contactsSection ? breederKennelFindings(contacts) : []),
+    ...(flags.contactsSection ? kennelContactFindings(kennels, contacts, allDogs) : []),
+    ...(flags.contactsSection ? vetContactFindings(vetEvents, contacts) : []),
+    ...(flags.contactsSection ? noVetFindings(contacts, dogs) : []),
+    ...duplicateDogFindings(allDogs),
+    ...(flags.contactsSection ? duplicateContactFindings(contacts) : []),
+    ...(flags.waitlist ? duplicateApplicationFindings(waitlistEntries, contacts) : []),
+    ...(leftovers ? tourLeftoverFindings(leftovers) : [])
+  ];
+  return all.sort((a, b) => TIDY_KINDS.indexOf(a.kind) - TIDY_KINDS.indexOf(b.kind));
+}
