@@ -625,12 +625,29 @@ export function holdsPlace(entry, { sales, dogs } = {}) {
 // Bought out of order: placed by a side sale (a sale outside the turn order, linked to
 // their record by side_entry_id), not by a pick on their turn. On the public list
 // such a family keeps a plain row at their number, never "Pup selected", so other
-// families can't see a sale was made out of order (owner, 2026-11-21). `sales`: array
+// families can't see a sale was made out of order (owner, 2026-11-21). A side sale
+// marked in order (`side_in_order`, sideSaleInOrder) is treated as a turn sale: an
+// early sale with nobody waiting ahead of them (owner, 2026-11-22). `sales`: array
 // or Map by id.
 export function boughtOutOfOrder(entry, sales) {
   if (!entry || !entry.placed_sale_id) return false;
   const sale = saleLookup(sales)(entry.placed_sale_id);
-  return Boolean(sale && sale.side_entry_id === entry.id);
+  return Boolean(sale && sale.side_entry_id === entry.id && sale.side_in_order !== true);
+}
+
+// Is a side sale shown as a turn sale on the public list (`side_in_order`)? Set when
+// it's recorded with no waiting family ahead of them (sideSaleInOrderAt), and hers to
+// change either way on the family's page. Older sales without it: out of order.
+export const sideSaleInOrder = (sale) => Boolean(sale && sale.side_entry_id && sale.side_in_order === true);
+
+// Recording a side sale: is it in order? True when no family numbered ahead of them
+// is still waiting (on the list, not paused on `today`). Families with a pup selected
+// ahead don't count. `entries`: the kennel's records.
+export function sideSaleInOrderAt(entry, entries, { kennelId, programsById = new Map(), today, config = WAITLIST_CONFIG_DEFAULTS } = {}) {
+  const ranked = rankedList(entries, kennelId ?? entry.kennel_id, programsById);
+  const at = ranked.findIndex((e) => e.id === entry.id);
+  if (at < 0) return false;
+  return !ranked.slice(0, at).some((e) => !isPaused(e, today, config));
 }
 
 // The waitlist record a contact's "Waitlist page" opens (owner, 2026-11-15): one that
@@ -1178,20 +1195,32 @@ export function familyPagePlan(litter, { pups = [], sales = [], entries = [], of
 }
 export const waitlistLitters = (kennel, litters) => (litters || []).filter((l) => isWaitlistLitter(l, kennel));
 
+// A born litter with no pup left to offer: every pup gone, kept, reserved or sold
+// (a released sale frees it). Undecided pups, or none recorded yet, keep it. Derived.
+const SPOKEN_FOR_DISPOSITIONS = ['keeping', 'placed'];
+export function isLitterSpokenFor(litter, dogs = [], sales = []) {
+  if (!litter || litter.status === 'expected') return false;
+  const pups = dogs.filter((d) => d.litter_id === litter.id && !d.is_archived);
+  if (!pups.length) return false;
+  const sold = (d) => sales.some((s) => s.dog_id === d.id && !s.is_archived && !RELEASED_SALE_STATUSES.includes(s.status));
+  return pups.every((d) => GONE_DOG_STATUSES.includes(d.status) || SPOKEN_FOR_DISPOSITIONS.includes(d.disposition) || sold(d));
+}
+
 // What a kennel has coming before picks open (Spec §16.4), one item per future
 // litter: a pairing with no litter yet, an `expected` litter (shown with its
-// pairing, decided 2026-10-08), or a whelped litter whose picks aren't open.
+// pairing, decided 2026-10-08), or a whelped litter whose picks aren't open and
+// that still may have a pup to offer (isLitterSpokenFor; pass `dogs` and `sales`).
 // Every stage, unfiltered: the projection applies her switches (showUpcoming).
 // → [{ id, kind: 'planned_pairing' | 'pairing' | 'early_litter', stage, pairing,
 //      litter, pairing_id, litter_id, sire_id, dam_id }]. `id` is the pairing's id
 // when there is one (so "Not this litter" on it carries over to its litter),
 // else the litter's; an early litter is always its litter's id.
-export function upcomingItems(kennel, { litters = [], pairings = [] } = {}) {
+export function upcomingItems(kennel, { litters = [], pairings = [], dogs = [], sales = [] } = {}) {
   const own = (x) => !x.is_archived && x.kennel_id === kennel.id;
   const pairingsById = new Map(pairings.map((p) => [p.id, p]));
   const hasLitter = new Set(litters.filter((l) => !l.is_archived && l.pairing_id).map((l) => l.pairing_id));
   const out = [];
-  for (const l of litters.filter((x) => own(x) && isWaitlistLitter(x) && !x.picks_opened_date)) {
+  for (const l of litters.filter((x) => own(x) && isWaitlistLitter(x) && !x.picks_opened_date && !isLitterSpokenFor(x, dogs, sales))) {
     const pairing = (l.pairing_id && pairingsById.get(l.pairing_id)) || null;
     const early = l.status !== 'expected';
     out.push({
@@ -1306,7 +1335,7 @@ const SPENT_OUTCOMES = ['open', 'accepted', 'passed', 'no_response'];
 const spentOffer = (o) => SPENT_OUTCOMES.includes(o.outcome) || Boolean(o.backed_out_date);
 
 export function hasOpenOffer(offers, litterId) {
-  return offers.some((o) => !o.is_archived && o.litter_id === litterId && o.outcome === 'open');
+  return offers.some((o) => !o.is_archived && o.litter_id === litterId && o.outcome === 'open' && !isHeldPick(o));
 }
 
 // An open offer whose family has picked a pup but hasn't sent the deposit yet
@@ -1333,7 +1362,7 @@ export function turnIsEmpty(rows, pups, sales = []) {
 
 // The kennel's open turns with no pup left in them (turnIsEmpty), in openTurns' shape.
 export function emptiedTurns(offers, pups, sales, kennelId) {
-  return openTurns(offers, kennelId).filter((t) => turnIsEmpty(t.offers, pups, sales));
+  return openTurns(offers, kennelId, { includeHeld: true }).filter((t) => turnIsEmpty(t.offers, pups, sales));
 }
 
 // The pups a family could switch their pick to: this litter's available pups that
@@ -1466,13 +1495,18 @@ export function turnOffers(offers, turnId) {
   return offers.filter((o) => !o.is_archived && turnIdOf(o) === turnId);
 }
 
+// A pick held past its turn for its deposit (waitlistActions.holdPick; guide §29).
+export const isHeldPick = (o) => Boolean(o) && !o.is_archived && o.outcome === 'open' && Boolean(o.held_date) && Boolean(o.chosen_dog_id);
+export const heldPickOf = (offers, entryId) => (offers || []).find((o) => o.entry_id === entryId && isHeldPick(o)) || null;
+
 // The open turns in a kennel, oldest first: [{ id, entry_id, offers, respond_by_date }].
 // After 5c there is at most one; offers made before it (one per litter) can leave
-// several, which still close the usual way.
-export function openTurns(offers, kennelId) {
+// several, which still close the usual way. A held pick only with `includeHeld`.
+export function openTurns(offers, kennelId, { includeHeld = false } = {}) {
   const groups = new Map();
   for (const o of offers) {
     if (o.is_archived || o.outcome !== 'open' || (kennelId && o.kennel_id !== kennelId)) continue;
+    if (!includeHeld && isHeldPick(o)) continue;
     const id = turnIdOf(o);
     if (!groups.has(id)) groups.set(id, []);
     groups.get(id).push(o);
@@ -1507,7 +1541,7 @@ export const isTurnOverdue = (turn, now) => Boolean(turn) && isPastDeadline(turn
 
 // Does this family hold an open turn? `offers` may be the kennel's or the family's.
 export function holdsTurn(offers, entryId) {
-  return openTurns(offers || [], null).some((t) => t.entry_id === entryId);
+  return openTurns(offers || [], null, { includeHeld: true }).some((t) => t.entry_id === entryId);
 }
 
 // The deadline when a litter joins an open turn (§16.1 rule 5): it restarts from
@@ -1524,6 +1558,7 @@ export function joinRespondBy(turn, now, config, program) {
 // archived) where they're eligible for an available pup and haven't spent their
 // turn. → [{ litter, eligibleDogs }] in litter-id order.
 export function turnLittersFor(entry, offers, litters, pups, sales, { today, config = WAITLIST_CONFIG_DEFAULTS } = {}) {
+  if (heldPickOf(offers, entry.id)) return [];
   return litters
     .filter((l) => isPicksOpen(l) && l.kennel_id === entry.kennel_id)
     .filter((l) => !turnSpent(offers, l.id, entry.id))
@@ -1575,6 +1610,7 @@ export function offerBlocker(entry, litter, { offers = [], pups = [], sales = []
   if (!isOnList(entry) || isFamilyPageOnly(entry)) return 'Only families on the list can be offered a turn.';
   if (!litter || litter.is_archived) return 'That litter is archived.';
   if (litter.waitlist_off) return `${litter.nickname || 'This litter'} is kept off the waitlist (Non-Waitlist Sales). Put it back on the waitlist from its page first.`;
+  if (heldPickOf(offers, entry.id)) return 'They have a pup held for them until their deposit is in. Settle that first.';
   const [held] = openTurns(offers, litter.kennel_id);
   if (held) return held.entry_id === entry.id ? 'They hold the turn now.' : `${nameOf(held.entry_id)} holds the turn now; one family at a time.`;
   if (turnSpent(offers, litter.id, entry.id)) return 'They\'ve already had their turn on this litter.';
@@ -1608,7 +1644,7 @@ export function joinsOpenTurn(turn, litter, entries, offers, pups, sales, { toda
 // (kennelId) => that kennel's date (each kennel's deadlines on its own clock, D11).
 const dayFor = (today, kennelId) => (typeof today === 'function' ? today(kennelId) : today);
 export function overdueTurns(offers, today) {
-  return openTurns(offers, null).filter((t) => isTurnOverdue(t, dayFor(today, t.offers[0]?.kennel_id)));
+  return openTurns(offers, null, { includeHeld: true }).filter((t) => isTurnOverdue(t, dayFor(today, t.offers[0]?.kennel_id)));
 }
 
 // --- "Pups available soon" (Spec §15.5) -----------------------------------------
@@ -1680,11 +1716,11 @@ export function soonFamiliesForLitter(entries, offers, litter, pups, sales, opts
   const here = offers.filter((o) => !o.is_archived && o.litter_id === litter.id);
   const closedHere = new Set(here.filter((o) => o.outcome !== 'open' && SPENT_OUTCOMES.includes(o.outcome)).map((o) => o.entry_id));
   const inFlight = openOfferEntryIds(offers);
-  const queue = litterQueue(entries, litter, pups, sales, opts).filter((q) => !closedHere.has(q.entry.id));
+  const queue = litterQueue(entries, litter, pups, sales, opts).filter((q) => !closedHere.has(q.entry.id) && !heldPickOf(offers, q.entry.id));
   // An open offer here whose family has since dropped out of the queue (paused,
   // say) still holds this litter's turn, so it still takes a pup's worth of room.
   const queued = new Set(queue.map((q) => q.entry.id));
-  slots -= here.filter((o) => o.outcome === 'open' && !queued.has(o.entry_id)).length;
+  slots -= here.filter((o) => o.outcome === 'open' && !isHeldPick(o) && !queued.has(o.entry_id)).length;
   if (slots <= 0) return [];
   return queue.slice(0, slots).map((q, i) => ({ ...q, soonPosition: i + 1, inFlight: inFlight.has(q.entry.id) }));
 }
@@ -2031,19 +2067,25 @@ export const listedName = (entry, fullName) => (entry && entry.private_listing ?
 // Numbers come from numberedList (`sales` and `dogs` are required): a family with a
 // pup selected keeps its number and isn't a row here (its number is a gap, as a
 // paused family's is); publicSelected gives those rows. One placed by a side sale is
-// a plain row here instead, with its answers as they were (boughtOutOfOrder).
+// a plain row here instead, with its answers as they were (boughtOutOfOrder), unless
+// the side sale is marked in order: then, as a turn pick, Pup selected from the time
+// it's recorded (sideSaleInOrder).
 export const DECIDING_LABEL = 'Currently deciding';
-export function publicList(entries, kennelId, programsById = new Map(), { today, nameOf = (e) => entryName(e, null), deciding = () => false, config = null, wantsMore = () => [], sales, dogs } = {}) {
+// The labels for where a family stands on the picks open now (waitlistStanding.js).
+export const PICKS_STANDING_LABEL = Object.freeze({ passed: 'Passed', no_response: 'No response', no_deposit: 'No deposit - expired', no_match: 'No matches' });
+
+// `standing(entry)`: where they stand on the picks open now (waitlistStanding.picksStanding).
+export function publicList(entries, kennelId, programsById = new Map(), { today, nameOf = (e) => entryName(e, null), deciding = () => false, config = null, wantsMore = () => [], sales, dogs, offers = [], standing = () => null } = {}) {
   return numberedList(entries, kennelId, programsById, { sales, dogs })
     .map((e, i) => ({ entry: e, position: i + 1 }))
     // A family that bought out of order keeps a plain row (boughtOutOfOrder).
-    .filter(({ entry }) => isOnList(entry) || boughtOutOfOrder(entry, sales))
+    .filter(({ entry }) => (isOnList(entry) && !heldPickOf(offers, entry.id) && !sideSaleInOrder(sideSaleOf(entry, sales))) || boughtOutOfOrder(entry, sales))
     .map(({ entry, position }) => ({ entry, position, paused: isOnList(entry) && isPaused(entry, today, config) }))
     .filter(({ paused }) => !paused || Boolean(config && config.public_show_paused))
     .map(({ entry, position, paused }) => ({
       position,
       name: deciding(entry) ? DECIDING_LABEL : listedName(entry, nameOf(entry)),
-      ...(paused ? { skipped: true, skipped_until: pausedUntil(entry, today, config) } : { pref_sex: entry.pref_sex || 'any', ...wantsMoreOf(wantsMore(entry)) }),
+      ...(paused ? { skipped: true, skipped_until: pausedUntil(entry, today, config) } : { pref_sex: entry.pref_sex || 'any', ...wantsMoreOf(wantsMore(entry)), ...(standing(entry) ? { closed: standing(entry) } : {}) }),
       added: anchorDate(entry),
       ...publicProgramOf(publicProgram(entry, programsById, config)),
       ...(deciding(entry) ? { deciding: true } : {})
@@ -2054,10 +2096,10 @@ export function publicList(entries, kennelId, programsById = new Map(), { today,
 // program? }]. The name as listed (private names stay masked); never the pup, a date
 // of sale or a price. Published beside public_list as `public_selected`.
 export const PUP_SELECTED_LABEL = 'Pup selected';
-export function publicSelected(entries, kennelId, programsById = new Map(), { nameOf = (e) => entryName(e, null), config = null, sales, dogs } = {}) {
+export function publicSelected(entries, kennelId, programsById = new Map(), { nameOf = (e) => entryName(e, null), config = null, sales, dogs, offers = [] } = {}) {
   return numberedList(entries, kennelId, programsById, { sales, dogs })
     .map((e, i) => ({ entry: e, position: i + 1 }))
-    .filter(({ entry }) => !isOnList(entry) && !boughtOutOfOrder(entry, sales))
+    .filter(({ entry }) => (!isOnList(entry) && !boughtOutOfOrder(entry, sales)) || (isOnList(entry) && (heldPickOf(offers, entry.id) || sideSaleInOrder(sideSaleOf(entry, sales)))))
     .map(({ entry, position }) => ({
       position,
       name: listedName(entry, nameOf(entry)),
@@ -2113,6 +2155,7 @@ export function publicWantsMore(entry, { config = WAITLIST_CONFIG_DEFAULTS, bree
 // public_show_paused) "Skipped until …" / "Skipped for now".
 export function publicWants(row, fmtDate = (d) => d) {
   if (row.skipped) return row.skipped_until ? `Skipped until ${fmtDate(row.skipped_until)}` : 'Skipped for now';
+  if (PICKS_STANDING_LABEL[row.closed] && !row.deciding) return PICKS_STANDING_LABEL[row.closed];
   return [PUBLIC_SEX[row.pref_sex] || 'Either', ...(Array.isArray(row.wants_more) ? row.wants_more : [])].join(' · ');
 }
 
