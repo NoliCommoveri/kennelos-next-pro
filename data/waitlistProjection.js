@@ -24,7 +24,7 @@ import {
   waitlistConfig, openDays, closedDates, liveClosedDates, entryName, publicList, publicWantsMore, overallPositions, litterQueue, isPupAvailable, passesUsed,
   isManuallyPaused, readyFromDate, isReadyHeld, feeForEntry, kennelBreeds, listenParentChoices,
   rankedList, turnLittersFor, turnIdOf, isSideSalePending, passReasons, splitPrepassed, upcomingItems, plannedHeats, showUpcoming, isListeningFor, placeHidden, prefPlaces, whelpNotes, readyCheck, publicIntroText,
-  messengerLink, embedOrigins, publicSelected, publicSourceName, isPupReserved, isWaitlistLitter, isPicksOpen, isFamilyPageOnly, LISTEN_LIVE_LITTER,
+  messengerLink, embedOrigins, publicSelected, publicSourceName, isPupReserved, pupRegistrationOf, maxPassesFor, isWaitlistLitter, isPicksOpen, isFamilyPageOnly, LISTEN_LIVE_LITTER,
   isTimeOfDay, turnHours, awakeHours, fromMinutes, plannedOpening, statusPopupTexts, changePhase, freeChanges, isHeldPick, countsAsPass
 } from './waitlistRules.js';
 import { addDaysToYMD } from './dateUtils.js';
@@ -144,11 +144,12 @@ function litterLink(litter, kennel) {
   return isWebsiteAddress(url, [kennel]) ? { photos_url: url, page: true } : { photos_url: url };
 }
 
-// A pup as a family may see it: call name, sex, color, the registration it's
-// planned for (null: undecided, either), its registry ("AKC"; null when none),
-// and its link. Nothing else.
+// A pup as a family may see it: call name, sex, color, its registration (its live
+// sale's once sold, else the one it's planned for; null: undecided, either:
+// pupRegistrationOf), its registry ("AKC"; null when none), and its link. Nothing
+// else.
 const registryOf = (d) => orNull(String(d.registry ?? '').trim().slice(0, 30));
-const publicPup = (d, kennel) => ({ id: d.id, call_name: d.call_name || '', sex: orNull(d.sex), color: orNull(d.color_markings), registration: orNull(d.intended_registration), registry: registryOf(d), ...pupLink(d, kennel) });
+const publicPup = (d, kennel, sales = []) => ({ id: d.id, call_name: d.call_name || '', sex: orNull(d.sex), color: orNull(d.color_markings), registration: orNull(pupRegistrationOf(d, sales)), registry: registryOf(d), ...pupLink(d, kennel) });
 
 // A litter's expected prices as a family on their turn may see them (her setting
 // turn_prices): per registration the pups of it are planned for (an undecided pup
@@ -215,6 +216,12 @@ function entryView(entry, ctx) {
   const backOut = requestView(entry.back_out_request, ctx.today, (r) => ({ reason: r.reason?.label || '', outcome: r.outcome || null }));
   if (companion) view.back_out = { available: true, request: backOut };
   else if (backOut && backOut.decided === 'approved') view.back_out = { available: false, request: backOut };
+  // A new name for their pup (End-State guide §29): a placed family with a pup may
+  // ask for one; she approves it on her device, which renames the dog. Their request
+  // as their page shows it (the name they asked for, and the one she gave).
+  if (pup && entry.status === 'placed') {
+    view.pup_name = { available: true, name: pup, request: requestView(entry.name_request, ctx.today, (r) => ({ name: r.name || '', approved_name: orNull(r.approved_name) })) };
+  }
   // Her policies banner (it compares her last change with the day they applied) for a
   // placed family with an open sale too: a back-out policy matters most to them.
   if (companion && entry.applied_date && !WAITLIST_OPEN_STATUSES.includes(entry.status)) view.applied_date = entry.applied_date;
@@ -258,7 +265,7 @@ function entryView(entry, ctx) {
     },
     // `no_response`: whether a turn closed with no response or no deposit counts as a
     // pass for them (her rule and their program's), for the server's "turn ended" email.
-    passes: { used: passesUsed(entry, ctx.offers), max: Number(ctx.config.max_passes), no_response: countsAsPass('no_response', { config: ctx.config, program }) },
+    passes: { used: passesUsed(entry, ctx.offers), max: maxPassesFor(ctx.config, program), no_response: countsAsPass('no_response', { config: ctx.config, program }) },
     requests: requestsView(entry, ctx.today),
     // Which of their changes apply without her OK right now (Free Changes plan §4),
     // and the phase that decides it ('before' / 'after' pups are born). Her device
@@ -439,12 +446,15 @@ export function parentTestsShown(dog, config) {
 // name: a test's name and result, nothing else (never its flag). 'normal' keeps
 // only results flagged Normal, judged on each test's LATEST result: a retest
 // flagged Abnormal hides that test rather than falling back to an older Normal.
+// A test's own say (its latest result's `family_pages`) wins: Show shows it
+// whatever the rule (a single Abnormal result she wants seen), Hide keeps it off.
 function parentTestsOf(dogsById, config, events) {
   const done = completedTestsByDog(events);
   return (id) => {
-    const shown = id ? parentTestsShown(dogsById.get(id), config) : 'off';
-    if (shown === 'off') return [];
-    return (done.get(id) || []).filter((t) => shown === 'all' || t.outcome === 'Normal').map((t) => ({ name: t.name, result: t.result }));
+    if (!id) return [];
+    const shown = parentTestsShown(dogsById.get(id), config);
+    const byRule = (t) => shown === 'all' || (shown === 'normal' && t.outcome === 'Normal');
+    return (done.get(id) || []).filter((t) => (t.family_pages ? t.family_pages === 'show' : byRule(t))).map((t) => ({ name: t.name, result: t.result }));
   };
 }
 const breedOf = (dogsById, damId, sireId) => orNull(dogsById.get(damId)?.breed || dogsById.get(sireId)?.breed);
@@ -566,9 +576,9 @@ export function buildProjection({ kennel, entries = [], offers = [], programsByI
       pairing_id: orNull(litter.pairing_id),
       // Only available pups: what a turn is picked from (the turn card, the server's
       // automatic offers and the prices read this, never `reserved`).
-      pups: pups.filter((d) => isPupAvailable(d, sales)).sort(byId).map((d) => publicPup(d, kennel)),
+      pups: pups.filter((d) => isPupAvailable(d, sales)).sort(byId).map((d) => publicPup(d, kennel, sales)),
       // Already Reserved (E2): pups whose disposition is Placed, the website's rule.
-      reserved: pups.filter(isPupReserved).sort(byId).map((d) => publicPup(d, kennel)),
+      reserved: pups.filter(isPupReserved).sort(byId).map((d) => publicPup(d, kennel, sales)),
       open_offer_entry_id: open ? open.entry_id : null
     };
   }
@@ -647,7 +657,7 @@ export function buildProjection({ kennel, entries = [], offers = [], programsByI
     // Each record's own pup's sale (familySale): a family back on the list for a
     // second pup gets its first pup's cards only on that pup's record.
     saleFor: (entry) => familySale(entry, sales, familyOffers, live),
-    pickedPup: (id) => (dogsById.get(id) ? publicPup(dogsById.get(id), kennel) : null),
+    pickedPup: (id) => (dogsById.get(id) ? publicPup(dogsById.get(id), kennel, sales) : null),
     // The deposit for a family's pick: on its sale, else her listed one for the pup.
     depositFor: (o) => {
       const sale = o.sale_id ? sales.find((x) => x.id === o.sale_id) : null;

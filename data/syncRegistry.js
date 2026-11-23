@@ -472,6 +472,9 @@ export const SYNC_REGISTRY = Object.freeze({
       // Their request to back out (Family Requests plan §7), with their reason and
       // note: private like a pass reason.
       'back_out_request',
+      // A new name they asked for their pup (End-State guide §29), with their note:
+      // private like pause_request. What she approved renames the dog itself.
+      'name_request',
       // Duplicate applications merged into this one (applicationDuplicates.js): the
       // deleted one's name, dates and any fee moved over as a credit. Private like
       // the answers it came from.
@@ -514,7 +517,7 @@ export const SYNC_REGISTRY = Object.freeze({
     rows: ALL,
     cloud: [
       'kennel_id', 'name', 'applicable_on_form', 'priority', 'pause_allowed',
-      'passes_count', 'respond_days_override', 'public_description', 'public_icon'
+      'passes_count', 'max_passes_override', 'respond_days_override', 'public_description', 'public_icon'
     ],
     private: ['fee_override', 'notes'],
     pending: []
