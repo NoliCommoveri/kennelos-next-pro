@@ -57,7 +57,10 @@ export const DOG_REFERENCES = [
   { table: 'waitlist_offers', field: 'lost_dog_id', label: 'pup a family lost, on a waitlist offer\'s history', scan: true },
   // The pups an offer put in front of a family (a list; cloud, so the family's page
   // has it too). Not indexed, so a scan like lost_dog_id.
-  { table: 'waitlist_offers', field: 'eligible_dog_ids', label: 'a pup offered to a waitlist family', scan: true }
+  { table: 'waitlist_offers', field: 'eligible_dog_ids', label: 'a pup offered to a waitlist family', scan: true },
+  // The pup's birth record (Line Management plan §3.4): it stays when the dog is deleted
+  // only by archiving the dog instead.
+  { table: 'birth_records', field: 'dog_id', label: 'pup on a litter\'s birth record' }
 ];
 
 // --- Litter: what can point at a Litter (Data Model v3 §10) -----------------
@@ -71,7 +74,8 @@ export const LITTER_REFERENCES = [
   },
   { table: 'waitlist_offers',  field: 'litter_id',        label: 'litter on a waitlist offer' },
   // Not indexed (only a delete asks), so it's a scan.
-  { table: 'contracts', field: 'reservation_litter_id', label: 'litter on a reservation agreement', scan: true }
+  { table: 'contracts', field: 'reservation_litter_id', label: 'litter on a reservation agreement', scan: true },
+  { table: 'birth_records', field: 'litter_id', label: 'birth record of a pup' }
 ];
 
 // --- Pairing: what can point at a Pairing -----------------------------------
@@ -187,6 +191,21 @@ export const WAITLIST_OFFER_REFERENCES = [];
 // FKs (contact_id, source_entry_id) are guarded on contacts and waitlist entries.
 export const DO_NOT_SELL_REFERENCES = [];
 
+// --- Color: what can point at a color or marking on her list (Line Management plan §3.3)
+// None of these is indexed (only a delete asks), so each is a scan; a field holding a
+// list of ids matches when the id is in it.
+export const COLOR_REFERENCES = [
+  { table: 'dogs', field: 'color_id', label: 'color of a dog', scan: true },
+  { table: 'dogs', field: 'marking_ids', label: 'marking on a dog', scan: true },
+  { table: 'birth_records', field: 'color_id', label: 'color on a birth record', scan: true },
+  { table: 'birth_records', field: 'marking_ids', label: 'marking on a birth record', scan: true },
+  { table: 'waitlist_entries', field: 'pref_color_ids', label: 'color a waitlist family would like', scan: true }
+];
+
+// --- Birth record: nothing points at one (a pup's Dog points the other way is
+// birth_records.dog_id). Present so the table has a registry like every other.
+export const BIRTH_RECORD_REFERENCES = [];
+
 // --- Expense: a leaf entity — nothing points at an Expense. Its own FKs
 // (event_id, subject_id) point OUTWARD and are guarded on those targets above.
 export const EXPENSE_REFERENCES = [];
@@ -260,7 +279,8 @@ export const REFERENCES_BY_TABLE = {
   stud_services: STUD_SERVICE_REFERENCES, contracts: CONTRACT_REFERENCES, events: EVENT_REFERENCES,
   waitlist_entries: WAITLIST_ENTRY_REFERENCES, waitlist_programs: WAITLIST_PROGRAM_REFERENCES,
   waitlist_offers: WAITLIST_OFFER_REFERENCES, do_not_sell: DO_NOT_SELL_REFERENCES,
-  expenses: EXPENSE_REFERENCES, accounts: ACCOUNT_REFERENCES, documents: DOCUMENT_REFERENCES
+  expenses: EXPENSE_REFERENCES, accounts: ACCOUNT_REFERENCES, documents: DOCUMENT_REFERENCES,
+  colors: COLOR_REFERENCES, birth_records: BIRTH_RECORD_REFERENCES
 };
 
 // The value at a registry entry's field: a dotted path, `list[].key` (every

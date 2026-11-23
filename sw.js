@@ -6,7 +6,7 @@
 // never re-fetches a stale precached file on its own; only a CACHE_NAME change
 // (which changes these bytes, so the browser detects a new service worker,
 // installs it, and purges the old cache in `activate`) rolls it over.
-const CACHE_NAME = 'kennelos-pro-shell-v177-next-5a8b5b9';
+const CACHE_NAME = 'kennelos-pro-shell-v177-next-365eaff';
 
 const PRECACHE_URLS = [
   './',
@@ -18,6 +18,8 @@ const PRECACHE_URLS = [
   'nav.js',
   'manifest.json',
   'assets/app.css',
+  'assets/forest.css',
+  'assets/icon.js',
   'assets/appShell.js',
   'assets/breedTestPicker.js',
   'assets/cloudBackupUI.js',
@@ -239,6 +241,11 @@ const PRECACHE_URLS = [
   'data/ocr.js',
   'data/pairingRepo.js',
   'data/pairingWarnings.js',
+  'data/coatLoci.js',
+  'data/colors.js',
+  'data/colorRepo.js',
+  'data/birthRecords.js',
+  'data/birthRecordRepo.js',
   'data/paymentLinks.js',
   'data/pedigreeEdit.js',
   'data/pedigreeWalk.js',
@@ -482,6 +489,21 @@ const PRECACHE_URLS = [
   'pages/waitlist.html',
   'pages/waitlist.js',
   'vendor/dexie.min.mjs',
+  'vendor/fonts/figtree-latin-500-normal.woff2',
+  'vendor/fonts/figtree-latin-ext-500-normal.woff2',
+  'vendor/fonts/figtree-latin-600-normal.woff2',
+  'vendor/fonts/figtree-latin-ext-600-normal.woff2',
+  'vendor/fonts/figtree-latin-700-normal.woff2',
+  'vendor/fonts/figtree-latin-ext-700-normal.woff2',
+  'vendor/fonts/figtree-latin-800-normal.woff2',
+  'vendor/fonts/figtree-latin-ext-800-normal.woff2',
+  'vendor/fonts/inter-latin-400-normal.woff2',
+  'vendor/fonts/inter-latin-ext-400-normal.woff2',
+  'vendor/fonts/inter-latin-500-normal.woff2',
+  'vendor/fonts/inter-latin-ext-500-normal.woff2',
+  'vendor/fonts/inter-latin-600-normal.woff2',
+  'vendor/fonts/inter-latin-ext-600-normal.woff2',
+  'vendor/lucide/iconNodes.js',
   'vendor/gsi/client.js',
   'vendor/jspdf.umd.min.js',
   'vendor/lz-string.min.mjs',

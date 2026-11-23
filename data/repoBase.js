@@ -25,7 +25,8 @@ export const ENTITY_LABELS = Object.freeze({
   documents: 'this document', dogs: 'this dog', events: 'this entry', expenses: 'this expense',
   files: 'this file', kennels: 'this kennel', litters: 'this litter', pairings: 'this pairing',
   sales: 'this sale', stud_services: 'this stud service', waitlist_entries: 'this application',
-  waitlist_offers: 'this offer', waitlist_programs: 'this waitlist'
+  waitlist_offers: 'this offer', waitlist_programs: 'this waitlist',
+  colors: 'this color', birth_records: 'this birth record'
 });
 
 // The blockers as one line: "sire of another dog × 2, dam of a litter × 1".

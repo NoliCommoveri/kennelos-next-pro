@@ -35,7 +35,7 @@ export const SYNC_TABLES = REGISTRY_TABLES;
 
 // Pulled pages are applied with the tables other rows point at first (§5.3).
 export const APPLY_ORDER = Object.freeze([
-  'kennels', 'contacts', 'accounts', 'files', 'dogs', 'pairings', 'litters', 'sales',
+  'kennels', 'contacts', 'accounts', 'files', 'colors', 'dogs', 'pairings', 'litters', 'birth_records', 'sales',
   'stud_services', 'contracts', 'documents', 'events', 'expenses',
   'breed_feeding_schedules', 'waitlist_programs', 'waitlist_entries', 'waitlist_offers',
   'do_not_sell'

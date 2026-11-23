@@ -52,6 +52,9 @@ export const SYNC_REGISTRY = Object.freeze({
       'owner_contact_id', 'co_owner_contact_ids', 'date_of_birth', 'date_of_death',
       'color_markings', 'registry', 'registration_number', 'microchip_id', 'url',
       'planned_tests', 'disposition', 'dob_is_estimated', 'recorded_coi',
+      // Her color and markings from her own list (Line Management plan §3.3; D6: her
+      // program's facts about her dogs, cloud like color_markings).
+      'color_id', 'marking_ids',
       'intended_registration', // Waitlist Spec §9
       'waitlist_tests', // its say over its health tests on waitlist family pages; a display choice, read by whichever device publishes
       'photos_online', // its say over showing its url as a photos link on waitlist pages; a display choice like waitlist_tests
@@ -185,6 +188,7 @@ export const SYNC_REGISTRY = Object.freeze({
       'picks_open_time', // the time on accept_deposits_date picks are planned to open (Waitlist Timers plan); families see a countdown
       'litter_registration_number', 'puppies_born_total', 'puppies_born_alive',
       'puppies_born_deceased', 'puppies_born_abnormalities', 'delivery_type', 'foster_direction',
+      'csection_reason', 'dam_complications', // how the birth went (Line Management plan §3.4, D6), like delivery_type
       'foster_partner_contact_id',
       'picks_opened_date', // a waitlist date: the auto-offer flow needs it after a restore
       'photos_url', // the litter's photos link: like a dog's url, and the publishing device shows it on waitlist pages
@@ -406,6 +410,7 @@ export const SYNC_REGISTRY = Object.freeze({
       // The Payment service account the application fee was paid via (plan §4): an id.
       'fee_paid_via_account_id',
       'pref_sex', 'pref_breed', 'pref_purposes', 'pref_colors',
+      'pref_color_ids', // the same wishes, from her color list (Line Management plan §3.3), cloud like pref_colors
       'listen_mode', 'listen_sire_ids', 'listen_dam_ids',
       'removed_reason', 'placed_sale_id',
       // The status a family left when she entered their withdrawal: drives the
@@ -525,6 +530,26 @@ export const SYNC_REGISTRY = Object.freeze({
       'passes_count', 'max_passes_override', 'respond_days_override', 'public_description', 'public_icon'
     ],
     private: ['fee_override', 'notes'],
+    pending: []
+  },
+
+  // Her color list and the litters' birth records (Line Management plan §3.3–§3.4): her
+  // program's own facts about her dogs, not anyone's personal details, so cloud and her
+  // devices agree (D6, owner decision 2026-11-23). A birth record's notes stay private,
+  // like every table's notes.
+  colors: {
+    rows: ALL,
+    cloud: ['name', 'kind', 'genotype', 'sort_order'],
+    private: [],
+    pending: []
+  },
+  birth_records: {
+    rows: ALL,
+    cloud: [
+      'litter_id', 'birth_order', 'birth_time', 'sex', 'color_id', 'marking_ids', 'birth_weight',
+      'born_alive', 'dog_id', 'died_on', 'death_cause', 'abnormalities'
+    ],
+    private: ['notes'],
     pending: []
   },
 

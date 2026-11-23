@@ -231,6 +231,16 @@ db.version(8).stores({
   sync_lost: 'id, at'
 });
 
+// version(9), 2026-11-23 (Line Management plan §3.3–§3.4, Phase 2; `next` only until
+// it's brought in, so it may still change there): `colors`, her own color list (a coat
+// color or a marking, with optional links to the shipped coat genes), indexed on kind
+// for the two dropdowns; `birth_records`, one per pup born (stillborn included), indexed
+// on litter_id (a litter's Births) and dog_id (the pup's record, and the delete guard).
+db.version(9).stores({
+  colors: 'id, kind, is_archived',
+  birth_records: 'id, litter_id, dog_id, is_archived'
+});
+
 // --- Schema upgrade hand-off between open copies ---------------------------
 // A new version(N) can only install once every other open copy of the app on
 // this device lets go of the older database. A live copy does that by itself

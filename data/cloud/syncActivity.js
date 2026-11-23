@@ -9,7 +9,8 @@ const NOUNS = {
   sales: 'a sale', stud_services: 'a stud service', contracts: 'a contract', events: 'an event',
   waitlist_entries: 'a waitlist entry', waitlist_programs: 'a waitlist program', waitlist_offers: 'a waitlist offer',
   expenses: 'an expense', documents: 'a document', files: 'a file', accounts: 'an account',
-  breed_feeding_schedules: 'a feeding schedule', do_not_sell: 'a do-not-sell listing'
+  breed_feeding_schedules: 'a feeding schedule', do_not_sell: 'a do-not-sell listing',
+  colors: 'a color', birth_records: 'a birth record'
 };
 
 // What kind of record a table holds, without the article: "Dog", "Waitlist entry".

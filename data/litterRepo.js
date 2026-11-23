@@ -6,7 +6,7 @@ import { db } from './db.js';
 import { makeRepo } from './repoBase.js';
 import { LITTER_REFERENCES } from './referenceRegistry.js';
 import { assertOwnKennel } from './kennelScope.js';
-import { FOSTER_DIRECTION, FOSTER_COMP_MODEL, LITTER_DELIVERY_TYPE } from './vocab.js';
+import { FOSTER_DIRECTION, FOSTER_COMP_MODEL, LITTER_DELIVERY_TYPE, LITTER_CSECTION_REASON, DAM_COMPLICATION } from './vocab.js';
 import { enforceLitterCap } from './editionConfig.js';
 
 const base = makeRepo('litters', LITTER_REFERENCES);
@@ -19,6 +19,8 @@ const REQUIRED_FIELDS = ['dam_id', 'sire_id', 'status'];
 const FOSTER_DIRECTIONS = FOSTER_DIRECTION.map((d) => d.value);
 const FOSTER_COMP_MODELS = FOSTER_COMP_MODEL.map((m) => m.value);
 const DELIVERY_TYPES = LITTER_DELIVERY_TYPE.map((d) => d.value);
+const CSECTION_REASONS = LITTER_CSECTION_REASON.map((r) => r.value);
+const DAM_COMPLICATIONS = DAM_COMPLICATION.map((c) => c.value);
 
 function validateLitter(candidate) {
   for (const f of REQUIRED_FIELDS) {
@@ -41,6 +43,17 @@ function validateLitter(candidate) {
   }
   if (candidate.delivery_type != null && candidate.delivery_type !== '' && !DELIVERY_TYPES.includes(candidate.delivery_type)) {
     throw new Error(`Litter: delivery_type must be one of ${DELIVERY_TYPES.join(', ')}.`);
+  }
+  // How the birth went (Line Management plan §3.4): a C-section's reason, and the dam's
+  // complications, each from its list. The reason is kept if the delivery type changes
+  // (she may correct the type back); screens ask it only for a C-section.
+  if (candidate.csection_reason != null && candidate.csection_reason !== '' && !CSECTION_REASONS.includes(candidate.csection_reason)) {
+    throw new Error(`Litter: csection_reason must be one of ${CSECTION_REASONS.join(', ')}.`);
+  }
+  if (candidate.dam_complications != null) {
+    if (!Array.isArray(candidate.dam_complications)) throw new Error('Litter: dam_complications must be a list.');
+    const bad = candidate.dam_complications.find((c) => !DAM_COMPLICATIONS.includes(c));
+    if (bad != null) throw new Error(`Litter: dam_complications must be from ${DAM_COMPLICATIONS.join(', ')}.`);
   }
   if (candidate.foster_our_share_pct != null && candidate.foster_our_share_pct !== '') {
     const p = Number(candidate.foster_our_share_pct);

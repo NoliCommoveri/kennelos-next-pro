@@ -579,6 +579,44 @@ export function boardingStayAt(ev) {
 // the app owns. No new event types come with it.
 export const COI_METHOD_SUGGESTIONS = ['genomic', 'pedigree', 'registry', 'trial mating', 'other'];
 
+// --- Colors and birth records (Line Management plan §3.3–§3.4, Phase 2) ---------------
+// Her own color list (the `colors` table) holds two kinds of entry: a coat color (a dog
+// has one, Dog.color_id) and a marking (any number, Dog.marking_ids).
+export const COLOR_KIND = [
+  { value: 'color',   label: 'Color' },
+  { value: 'marking', label: 'Marking' }
+];
+
+// Why a C-section was done (Litter.csection_reason), asked when the delivery type is a
+// C-section (plan §3.4).
+export const LITTER_CSECTION_REASON = [
+  { value: 'uterine_inertia', label: 'Uterine inertia' },
+  { value: 'malpresentation', label: 'Malpresentation' },
+  { value: 'oversized_pup',   label: 'Oversized pup' },
+  { value: 'obstruction',     label: 'Obstruction' },
+  { value: 'dam_distress',    label: 'Dam in distress' },
+  { value: 'other',           label: 'Other' }
+];
+
+// What the dam had around the birth (Litter.dam_complications[], any number).
+export const DAM_COMPLICATION = [
+  { value: 'eclampsia',          label: 'Eclampsia' },
+  { value: 'mastitis',           label: 'Mastitis' },
+  { value: 'metritis',           label: 'Metritis' },
+  { value: 'retained_placenta',  label: 'Retained placenta' },
+  { value: 'hemorrhage',         label: 'Hemorrhage' },
+  { value: 'other',              label: 'Other' }
+];
+
+// Why a pup died (birth_records.death_cause), for a stillborn pup or one lost after.
+export const PUP_DEATH_CAUSE = [
+  { value: 'fading',     label: 'Fading puppy' },
+  { value: 'crushed',    label: 'Crushed' },
+  { value: 'congenital', label: 'Congenital defect' },
+  { value: 'unknown',    label: 'Unknown' },
+  { value: 'other',      label: 'Other' }
+];
+
 // Enforced choice list for the `placement` event type's `Method` field —
 // how the puppy actually travelled to the buyer.
 export const PLACEMENT_METHODS = ['Flight nanny', 'Ground transport', 'Local pickup', 'Other'];

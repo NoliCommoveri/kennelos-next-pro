@@ -16,7 +16,7 @@ import { nameKey, sameRegistration, sameRegisteredName, registrationsConflict } 
 import { normName, normEmail, normPhone } from './contactSearch.js';
 import {
   EVENT_TYPES, RELEASED_SALE_STATUSES, WAITLIST_OPEN_STATUSES, SEX, SALE_STATUS, LITTER_STATUS, PAIRING_STATUS,
-  ACCOUNT_TYPE, CONTRACT_TYPE, EXPENSE_CATEGORIES, DOC_TYPES, WAITLIST_ENTRY_STATUS, descriptor
+  ACCOUNT_TYPE, CONTRACT_TYPE, EXPENSE_CATEGORIES, DOC_TYPES, WAITLIST_ENTRY_STATUS, COLOR_KIND, descriptor
 } from './vocab.js';
 
 const blank = (v) => v == null || (typeof v === 'string' && v.trim() === '') || (Array.isArray(v) && !v.length);
@@ -72,6 +72,8 @@ const RULES = {
   },
   waitlist_programs: (l, f, { fk }) => (l.kennel_id === fk(f.kennel_id) && eqSet(normName(l.name), normName(f.name)) ? 'same' : null),
   breed_feeding_schedules: (l, f) => (eqSet(normName(l.breed), normName(f.breed)) ? 'same' : null),
+  // Her color list: one name of one kind is one entry (colors.findColor's rule).
+  colors: (l, f) => (l.kind === f.kind && eqSet(normName(l.name), normName(f.name)) ? 'same' : null),
   // Dogs go twice: strong identifiers first (dogs), then, once litters are paired,
   // pups and the call-name question (dogs_late).
   dogs(l, f, ctx) {
@@ -145,6 +147,14 @@ const RULES = {
     if (open(l) && open(f)) return 'same';
     return !open(l) && !open(f) && eqSet(l.applied_date, f.applied_date) ? 'same' : null;
   },
+  // A pup's birth record: the same pup's Dog, else the same place in the same litter
+  // (asked when the two disagree on its sex).
+  birth_records(l, f, { fk }) {
+    if (!eqSet(l.litter_id, fk(f.litter_id))) return null;
+    if (set(l.dog_id) && set(f.dog_id)) return l.dog_id === fk(f.dog_id) ? 'same' : null;
+    if (!eqSet(l.birth_order, f.birth_order)) return null;
+    return knownSex(l) && knownSex(f) && l.sex !== f.sex ? 'ask' : 'same';
+  },
   waitlist_offers: (l, f, { fk }) => (eqSet(l.entry_id, fk(f.entry_id)) && eqSet(l.litter_id, fk(f.litter_id))
     && eqSet(l.offered_date, f.offered_date) ? 'same' : null),
   // Her do-not-sell list: the same contact, or the same person by name and an email
@@ -180,7 +190,9 @@ const DISTANCE = {
 export const MATCH_ORDER = [
   ['kennels', 'kennels'], ['accounts', 'accounts'], ['contacts', 'contacts'],
   ['waitlist_programs', 'waitlist_programs'], ['breed_feeding_schedules', 'breed_feeding_schedules'],
+  ['colors', 'colors'],
   ['dogs', 'dogs'], ['pairings', 'pairings'], ['litters', 'litters'], ['dogs_late', 'dogs'],
+  ['birth_records', 'birth_records'],
   ['sales', 'sales'], ['stud_services', 'stud_services'], ['contracts', 'contracts'],
   ['events', 'events'], ['expenses', 'expenses'], ['documents', 'documents'],
   ['waitlist_entries', 'waitlist_entries'], ['waitlist_offers', 'waitlist_offers'],
@@ -415,6 +427,9 @@ export function describeRecord(table, r, nameOf = () => '') {
     case 'accounts': return bits(r.name, r.account_type && descriptor(ACCOUNT_TYPE, r.account_type).label, r.website);
     case 'waitlist_programs': return bits(r.name, nameOf('kennels', r.kennel_id));
     case 'breed_feeding_schedules': return bits(r.breed, 'feeding schedule');
+    case 'colors': return bits(r.name, r.kind && descriptor(COLOR_KIND, r.kind).label.toLowerCase());
+    case 'birth_records': return bits(nameOf('litters', r.litter_id) && `litter ${nameOf('litters', r.litter_id)}`, r.birth_order && `pup ${r.birth_order}`,
+      r.sex && descriptor(SEX, r.sex).label, r.born_alive === false ? 'stillborn' : nameOf('dogs', r.dog_id));
     case 'contracts': return bits(r.contract_type && `${descriptor(CONTRACT_TYPE, r.contract_type).label} contract`, nameOf('dogs', r.related_dog_id),
       nameOf('contacts', r.related_contact_id) && `with ${nameOf('contacts', r.related_contact_id)}`, r.signed_date);
     case 'events': return bits(r.title || (r.event_type && descriptor(EVENT_TYPES, r.event_type).label), nameOf(r.subject_type === 'dog' ? 'dogs' : r.subject_type === 'litter' ? 'litters' : 'pairings', r.subject_id), r.event_date);
