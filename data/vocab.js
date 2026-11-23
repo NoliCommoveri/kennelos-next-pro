@@ -577,7 +577,7 @@ export function boardingStayAt(ev) {
 // these without forcing an enum. NOT a validated vocab and never a badge: the
 // value describes how the breeder's lab/registry derived the number, not a state
 // the app owns. No new event types come with it.
-export const COI_METHOD_SUGGESTIONS = ['genomic', 'pedigree', 'registry', 'other'];
+export const COI_METHOD_SUGGESTIONS = ['genomic', 'pedigree', 'registry', 'trial mating', 'other'];
 
 // Enforced choice list for the `placement` event type's `Method` field —
 // how the puppy actually travelled to the buyer.

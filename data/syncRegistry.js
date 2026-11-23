@@ -166,7 +166,12 @@ export const SYNC_REGISTRY = Object.freeze({
     cloud: [
       'kennel_id', 'sire_id', 'dam_id', 'pairing_type', 'status', 'method',
       'planned_date', 'last_observed_date', 'expected_due_date',
-      'show_on_website' // shows under Coming up on her KennelPort website (KennelPort plan 5.3); a display choice
+      'show_on_website', // shows under Coming up on her KennelPort website (KennelPort plan 5.3); a display choice
+      // A COI she knows for this pair, from a registry's or lab's trial-mating tool
+      // ({ value (a percent), method, source, as_of_date }, like Dog.recorded_coi).
+      // Her program's figure, not anyone's personal data: cloud (Line Management
+      // plan D6, owner decision 2026-11-23).
+      'recorded_coi'
     ],
     private: ['notes'],
     pending: []

@@ -6,7 +6,7 @@
 // never re-fetches a stale precached file on its own; only a CACHE_NAME change
 // (which changes these bytes, so the browser detects a new service worker,
 // installs it, and purges the old cache in `activate`) rolls it over.
-const CACHE_NAME = 'kennelos-pro-shell-v177-next-1805026';
+const CACHE_NAME = 'kennelos-pro-shell-v177-next-5a8b5b9';
 
 const PRECACHE_URLS = [
   './',
@@ -218,6 +218,7 @@ const PRECACHE_URLS = [
   'data/litterFinances.js',
   'data/kennelSetup.js',
   'data/kennelTree.js',
+  'data/kinship.js',
   'data/dogSearch.js',
   'data/findRecords.js',
   'data/guidedDogs.js',
@@ -237,6 +238,7 @@ const PRECACHE_URLS = [
   'data/nudgeState.js',
   'data/ocr.js',
   'data/pairingRepo.js',
+  'data/pairingWarnings.js',
   'data/paymentLinks.js',
   'data/pedigreeEdit.js',
   'data/pedigreeWalk.js',
