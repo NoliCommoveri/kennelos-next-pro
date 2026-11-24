@@ -51,6 +51,7 @@ export const SYNC_REGISTRY = Object.freeze({
       'kennel_id', 'breeder_kennel_id', 'sire_id', 'dam_id', 'litter_id',
       'owner_contact_id', 'co_owner_contact_ids', 'date_of_birth', 'date_of_death',
       'color_markings', 'registry', 'registration_number', 'microchip_id', 'url',
+      'collar_color', // the collar a puppy wears at home, shown by its name on family pages (owner decision 2026-11-24)
       'planned_tests', 'disposition', 'dob_is_estimated', 'recorded_coi',
       // Her color and markings from her own list (Line Management plan §3.3; D6: her
       // program's facts about her dogs, cloud like color_markings).
