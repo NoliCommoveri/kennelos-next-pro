@@ -45,3 +45,13 @@ export function updateRow(screen, key, { sub, end }) {
   }
   if (end != null) b.querySelector('.row-end').innerHTML = end + chev;
 }
+
+/** "Last backup today, 6:12 AM" (the prototype's subline), from this device's last backup
+ *  (an ISO string or null). More's Backup & Restore row and Home's backup line. */
+export function backupLine(iso, now = new Date()) {
+  const d = iso ? new Date(iso) : null;
+  if (!d || Number.isNaN(d.getTime())) return 'No backup yet';
+  const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  const sameDay = d.toDateString() === now.toDateString();
+  return `Last backup ${sameDay ? 'today' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}, ${time}`;
+}

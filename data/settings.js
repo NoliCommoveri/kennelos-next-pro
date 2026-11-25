@@ -46,7 +46,8 @@ const KEYS = {
   navKennels: 'kennelOS.navKennels',
   websiteStrip: 'kennelOS.websiteStrip',
   cloudCodeUnsaved: 'kennelOS.cloudCodeUnsaved',
-  tourCleanupNotice: 'kennelOS.tourCleanupNotice'
+  tourCleanupNotice: 'kennelOS.tourCleanupNotice',
+  recentSearches: 'kennelOS.recentSearches'
 };
 
 // A restore gave records new ids (importExport.restoreFileMerge): every value this
@@ -72,6 +73,17 @@ export function remapStoredIds(rekey) {
     }
     if (next !== raw) localStorage.setItem(k, next);
   }
+}
+
+// Search's recent searches (UI Redesign plan Phase 2): this device only, newest first.
+export function getRecentSearches() {
+  try {
+    const v = JSON.parse(localStorage.getItem(KEYS.recentSearches) || '[]');
+    return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
+  } catch { return []; }
+}
+export function setRecentSearches(list) {
+  try { localStorage.setItem(KEYS.recentSearches, JSON.stringify(Array.isArray(list) ? list : [])); } catch { /* private mode: none kept */ }
 }
 
 export function getLastBackupDate() {

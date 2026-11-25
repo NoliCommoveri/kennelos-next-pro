@@ -80,6 +80,7 @@ function kennelSwitch() {
 const brandName = () => `<div class="brand-name">KennelOS${edTag()}</div>`;
 const brandBlock = () => `<div class="brand">${brandName()}${kennelSwitch()}</div>`;
 const backBtn = () => (stack.length > 1 ? `<button type="button" class="icon-btn back-btn" aria-label="Back" data-back>${icon('arrow-left')}</button>` : '');
+export const SEARCH_PATH = 'pages/search.html';
 const searchBtn = `<button type="button" class="icon-btn search-btn" aria-label="Search everything (press /)" data-search>${icon('search')}<span class="lbl">Search</span><kbd>/</kbd></button>`;
 
 // The old-look page's own title (its .page-header's <h1>), shown in the band instead. app.css
@@ -110,7 +111,9 @@ function drawAppbar(bar, tabs) {
   // A tab's own screen shows the tab's icon beside its title when it's the first screen.
   const tab = tabs.find((x) => fileOf(x.path) === file);
   const ic = stack.length <= 1 ? (t.ic || tab?.icon || '') : '';
-  bar.innerHTML = `${backBtn()}<h1>${ic ? icon(ic) : ''}<span class="shell-title">${esc(t.text)}</span></h1>${searchBtn}`;
+  // Search's own screen has the box itself, not the button (the prototype's S.search).
+  const onSearch = file === fileOf(SEARCH_PATH);
+  bar.innerHTML = `${backBtn()}<h1>${ic ? icon(ic) : ''}<span class="shell-title">${esc(t.text)}</span></h1>${onSearch ? '' : searchBtn}`;
   if (t.from) mirrorTitle(t.from, bar.querySelector('.shell-title'));
 }
 
@@ -187,9 +190,30 @@ function wire(host) {
     if (!b || !host.contains(b)) return;
     if (b.hasAttribute('data-back')) back();
     else if (b.hasAttribute('data-go')) open(b.getAttribute('data-go'));
-    // Search itself comes with Home (Phase 2), which listens for this.
-    else document.dispatchEvent(new CustomEvent('kennelos:search'));
+    else openSearch();
   });
+}
+
+// Search (Phase 2): its own screen. On it, the keys put her back in the box (search.js
+// listens for the event).
+function openSearch() {
+  if (fileOf(location.pathname) === fileOf(SEARCH_PATH)) document.dispatchEvent(new CustomEvent('kennelos:search'));
+  else open(SEARCH_PATH);
+}
+
+// "/" anywhere she isn't typing, and Ctrl+K or Cmd+K anywhere, open search.
+function typing(el) {
+  return !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+}
+function onKey(e) {
+  if (e.defaultPrevented || e.altKey) return;
+  const k = (e.key || '').toLowerCase();
+  const cmdK = k === 'k' && (e.ctrlKey || e.metaKey) && !e.shiftKey;
+  const slash = e.key === '/' && !e.ctrlKey && !e.metaKey && !typing(document.activeElement);
+  if (!cmdK && !slash) return;
+  if (document.querySelector('dialog[open], .modal-overlay, .sheet-back')) return;
+  e.preventDefault();
+  openSearch();
 }
 
 let wired = false;
@@ -231,6 +255,7 @@ export function renderNav() {
   if (!wired) {
     wired = true;
     ['appbar', 'tabbar'].forEach((id) => { const el = document.getElementById(id); if (el) wire(el); });
+    if (document.getElementById('appbar')) document.addEventListener('keydown', onKey);
     addEventListener('pagehide', remember);
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') remember(); });
     // Back to a page the browser kept in memory: the page isn't loaded again, so the

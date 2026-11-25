@@ -46,6 +46,7 @@ import { EMAIL_TEMPLATE_KINDS, EMAIL_PLACEHOLDERS, DEFAULT_EMAIL_TEMPLATES, emai
 import { esc, badge, fmtDate, fmtMoney, param, todayYMD } from '../assets/ui.js';
 import { renderExpensePanel } from '../assets/expensePanel.js';
 import { renderKennelCardSection } from '../assets/kennelCardUI.js';
+import { KENNEL_SECTIONS } from '../data/kennelSections.js';
 import {
   fileToLogoDataUrl, logoPreview, LOGO_ACCEPT, nudgeFields, readNudgeFields,
   puppyRecordFieldsHtml, wirePuppyRecordFields, tickAllPuppyRecordFields, readPuppyRecordFields
@@ -106,25 +107,8 @@ function renderHeader(k) {
 }
 
 // --- Sections (one card at a time) --------------------------------------------
-// Every card the page can show, alphabetical by label. `when` says whether this
-// kennel has it (own-kennel cards, the waitlist's flag, a received kennel card).
-const SECTIONS = [
-  { key: 'litters', label: 'Active litters', when: (k) => k.is_own_kennel },
-  { key: 'feeding', label: 'Feeding schedules', when: (k) => k.is_own_kennel },
-  { key: 'finances', label: 'Finances', when: (k) => k.is_own_kennel },
-  { key: 'card', label: 'Kennel card', when: (k) => k.is_own_kennel || !!k.public_id },
-  { key: 'expenses', label: 'Kennel expenses', when: () => true },
-  { key: 'extra-charges', label: 'Extra charges price list', when: (k) => k.is_own_kennel && editionFlags.extraCharges },
-  { key: 'nudges', label: 'Lifecycle nudges', when: (k) => k.is_own_kennel },
-  { key: 'payment-schedules', label: 'Payment schedules', when: (k) => k.is_own_kennel },
-  { key: 'logo', label: 'Logo', when: () => true },
-  { key: 'tests', label: 'Preferred tests', when: (k) => k.is_own_kennel },
-  { key: 'puppy-record', label: 'Puppy Record fields', when: (k) => k.is_own_kennel && editionFlags.puppyRecord },
-  { key: 'placements', label: 'Recent placements', when: (k) => k.is_own_kennel },
-  { key: 'pickup', label: 'Pickup & transport', when: (k) => k.is_own_kennel && editionFlags.waitlist },
-  { key: 'roster', label: 'Roster', when: (k) => k.is_own_kennel },
-  { key: 'waitlist-settings', label: 'Waitlist settings', when: (k) => k.is_own_kennel && editionFlags.waitlist }
-].sort((a, b) => a.label.localeCompare(b.label));
+// Every card the page can show: data/kennelSections.js (search lists them too).
+const SECTIONS = KENNEL_SECTIONS;
 
 // Show only the chosen section. A stylesheet rule rather than toggling each card,
 // so a card re-rendered later (Save re-renders the config cards) stays hidden or

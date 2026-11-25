@@ -48,11 +48,11 @@ export const shortDate = (iso) => new Date(iso).toLocaleString(undefined, { week
 // What a change that couldn't happen says (review K4-8).
 export const FAILED_CHANGE_TEXT = 'That address was taken while the change was waiting, so nothing changed: your account still uses its current email.';
 
-const row = (title, text, actions) => `<div class="row-between">
-    <div><strong>${title}</strong>
-      <div class="muted" style="font-size:13px;">${text}</div></div>
-    <div class="pill-row">${actions}</div>
-  </div>`;
+// One notice in the forest look (UI Redesign plan Phase 2): a title, a line, its buttons
+// (the prototype's card with .sell-top, .hub-line and its buttons).
+const row = (title, text, actions) => `<div class="sell-top"><b>${title}</b></div>
+    <div class="hub-line">${text}</div>
+    <div class="actions-2">${actions}</div>`;
 
 // The card's inner HTML from settings, or '' for no card. Pure apart from what it
 // reads, so it can be tested.
@@ -64,25 +64,25 @@ export function todayCloudCardHtml({ codeUnsaved = getCloudCodeUnsavedCache(), n
   const expired = Boolean(session) && !session.token;
   const change = state.emailChange || null;
   if (state.emailChangeFailed && !change && !expired) {
-    return row('✉️ Your email change didn\'t happen.', esc(FAILED_CHANGE_TEXT), '<button class="btn btn-sm" data-act="email-dismiss">OK</button>');
+    return row('Your email change didn\'t happen.', esc(FAILED_CHANGE_TEXT), '<button type="button" class="btn-2" data-act="email-dismiss">OK</button>');
   }
   if (change && !expired) {
-    return row('✉️ Your account\'s email is changing.', `${changeRequestedBy(change)}; it takes effect ${esc(shortDate(change.effectiveAt))}. Not you? Cancel it.`,
-      '<button class="btn btn-sm" data-act="email-cancel">Cancel it</button>');
+    return row('Your account\'s email is changing.', `${changeRequestedBy(change)}; it takes effect ${esc(shortDate(change.effectiveAt))}. Not you? Cancel it.`,
+      '<button type="button" class="btn-2" data-act="email-cancel">Cancel it</button>');
   }
   if (codeUnsaved && isVaultOffered() && state.enabled && !paused && !expired) {
-    return row('🔑 Save your recovery code.', 'If you ever lose your passkey, it\'s the other way to unlock your sensitive records.',
-      '<button class="btn btn-sm btn-primary" data-act="code">Show code</button>');
+    return row('Save your recovery code.', 'If you ever lose your passkey, it\'s the other way to unlock your sensitive records.',
+      '<button type="button" class="primary-btn" data-act="code">Show code</button>');
   }
   if (paused || expired) {
-    return row('☁️ Cloud backup is paused.', esc(paused || 'Your sign-in has expired.'),
-      '<a class="btn btn-sm btn-primary" href="import-export.html#backup-restore">Resolve</a>');
+    return row('Cloud backup is paused.', esc(paused || 'Your sign-in has expired.'),
+      '<a class="primary-btn" href="import-export.html#backup-restore">Resolve</a>');
   }
   if (!state.enabled && state.movedToEdition !== 'pro') {
     const at = dismissedAt(NUDGE_KEY);
     if (at && now - Date.parse(at) < NUDGE_SNOOZE_MS) return '';
-    return row('☁️ Protect your records: turn on free cloud backup.', 'If this device is lost or replaced, sign in on the new one and your records come back.',
-      '<button class="btn btn-sm btn-primary" data-act="on">Turn on</button><button class="btn btn-sm" data-act="later">Not now</button>');
+    return row('Turn on free cloud backup.', 'If this device is lost or replaced, sign in on the new one and your records come back.',
+      '<button type="button" class="primary-btn" data-act="on">Turn on</button><button type="button" class="btn-2" data-act="later">Not now</button>');
   }
   return '';
 }
@@ -91,16 +91,18 @@ const backupUI = () => import('./cloudBackupUI.js');
 
 // Draws the card into `el` and keeps it current: after a backup attempt or a
 // change made through the card, and once the recovery code has been looked up.
-export function renderTodayCloudCard(el) {
+export function renderTodayCloudCard(el, { onChange = null } = {}) {
   if (!el) return;
   const render = () => {
     const html = todayCloudCardHtml();
     // The "turn on" card coming back after its 30 days clears the old dismissal.
     if (html.includes('data-act="later"') && dismissedAt(NUDGE_KEY)) undismiss(NUDGE_KEY);
-    const next = html ? `<section class="card" style="margin-bottom:16px;">${html}</section>` : '';
+    const next = html ? `<section class="card app-card">${html}</section>` : '';
     if (el.dataset.drawn === next) return;
     el.dataset.drawn = next;
     el.innerHTML = next;
+    el.hidden = !html;
+    onChange?.(Boolean(html));
     if (!html) return;
     const on = (act, fn) => el.querySelector(`[data-act="${act}"]`)?.addEventListener('click', async () => {
       try { await fn(); } catch (e) { await alertModal({ title: "That didn't work", message: (await backupUI()).errorText(e) }); }

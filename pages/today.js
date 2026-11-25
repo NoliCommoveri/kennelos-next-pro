@@ -1,16 +1,14 @@
-// today.js — the consolidated "Today" home (Navigation Consolidation Plan v1 §4).
-// Action-first ordering, top → bottom: (1) reminders, (2) active litters,
-// (3) due-outs / upcoming, (4) who's away, (5) the slow-changing kennel
-// overview. This page is the single home for what used to be four separate
-// nav destinations (dashboard, reminders, upcoming, board), so it shows their
-// real content — not teaser counts.
+// today.js — Home in the forest look (UI Redesign plan Phase 2; the prototype's S.home):
+//   Today and the day's date, then a pill per open litter or pairing naming its stage (D28);
+//   six tiles, three that follow the stages and three that stay (data/homeStages.js);
+//   Needs you: live's nudges as rows, each opening a sheet with its buttons and Dismiss (the
+//   owner's departure, 2026-11-25: the prototype's Home has no nudges); This week (reminders
+//   overdue or due in seven days, and what's dated in them) and Coming up (dogs away from
+//   home, then what's dated after), with All reminders and Calendar; the cloud backup line.
 //
-// Every read here is DERIVED over the existing repos, exactly as the dashboard/
-// reminders/upcoming/board pages each do — no stored aggregates, no new schema.
-//
-// Every card is collapsible (cardShell in assets/ui.js): a chevron button in
-// the header toggles its body, and a card with no rows to show starts
-// collapsed (isEmpty) instead of an expanded empty-state message.
+// Everything is read from her records when Home opens (in the active kennel's scope) and
+// drawn in one paint. Nudges redraw by themselves when a family's message or action comes
+// in while Home is open.
 import { eventRepo } from '../data/eventRepo.js';
 import { getAwayBoardRows } from '../data/awayBoard.js';
 import { computeNudges } from '../data/nudges.js';
@@ -21,246 +19,129 @@ import { pairingRepo } from '../data/pairingRepo.js';
 import { saleRepo } from '../data/saleRepo.js';
 import { contactRepo } from '../data/contactRepo.js';
 import { dogsInScope, inScopeOnly, subjectInScope } from '../data/kennelScope.js';
-import { EVENT_TYPES, DOG_STATUS, DISPOSITION, SHOW_ENTRY_STATUS } from '../data/vocab.js';
+import { descriptor, EVENT_TYPES } from '../data/vocab.js';
 import { editionFlags } from '../data/editionConfig.js';
 import { isReadOnly } from '../data/demoMode.js';
-import { esc, badge, fmtDate, cardShell, alertModal, confirmModal } from '../assets/ui.js';
+import { shellTabs, isOffered } from '../data/shellNav.js';
+import { kennelStages, stagePills, homeTiles, agendaRows, nudgeLook, pairName } from '../data/homeStages.js';
+import { esc, fmtMoney, alertModal, confirmModal } from '../assets/ui.js';
+import { icon } from '../assets/icon.js';
+import { backupLine } from '../assets/hubRows.js';
 import { renderUpgradeNudge } from '../assets/upgradeNudge.js';
-import { hasEditionLinks, editionLinksHtml, wireEditionLinks } from '../assets/editionLinks.js';
 import { CapExceededError } from '../data/repoBase.js';
-import { todayYMD, daysFromToday, addDaysToYMD } from '../data/dateUtils.js';
+import { todayYMD } from '../data/dateUtils.js';
 import { isCloudAvailable } from '../data/cloud/cloudConfig.js';
-import { CLOUD_DATA_CHANGED_EVENT, getWebsiteStripCache, getWebsiteLaterFor } from '../data/settings.js';
+import { CLOUD_DATA_CHANGED_EVENT, getWebsiteStripCache, getLastBackupDate, getCloudBackupState } from '../data/settings.js';
 import { renderTodayCloudCard } from '../assets/todayCloudCard.js';
 
-const DUE_SOON_DAYS = 30; // shared window with the reminder buckets (§3.3)
-
+const screen = document.getElementById('screen');
 const errorBox = document.getElementById('page-error');
-const remindersEl = document.getElementById('today-reminders');
-const upcomingEl = document.getElementById('today-upcoming');
-const showsEl = document.getElementById('today-shows');
-const boardEl = document.getElementById('today-board');
-const availableEl = document.getElementById('today-available');
-const nudgesEl = document.getElementById('today-nudges');
-const overviewEl = document.getElementById('today-overview');
-const editionsEl = document.getElementById('today-editions');
-const cloudEl = document.getElementById('today-cloud');
-const installEl = document.getElementById('today-install');
+const head = screen.querySelector('.today-h');
+const chev = `<span class="chev">${icon('chevron-right')}</span>`;
 
-// Subject-resolution context, loaded once. Shared by every section.
-//
-// These maps are built from the UNSCOPED loads on purpose (Multi-Kennel Scope
-// Spec §7). They exist to resolve labels, and scoping them would break the very
-// filter that uses them: `subjectInScope` treats an unresolvable subject as
-// in-scope (a row we can't place is better shown than silently dropped), so a map
-// pre-filtered to the active kennel would make every OTHER kennel's events look
-// unresolvable and let them through. Filter the display lists, never the maps.
-const ctx = { dogsById: new Map(), pairingsById: new Map(), littersById: new Map(), contactsById: new Map() };
-
-// The active-kennel predicate for a polymorphic Event, bound to those maps.
-const eventInScope = (ev) => subjectInScope(ev.subject_type, ev.subject_id, {
-  dog: ctx.dogsById, pairing: ctx.pairingsById, litter: ctx.littersById
-});
-
-function showError(msg) { errorBox.innerHTML = `<div class="inline-error">${esc(msg)}</div>`; }
-
-function subjectLabel(ev) {
-  if (ev.subject_type === 'dog') return ctx.dogsById.get(ev.subject_id)?.call_name || '—';
-  if (ev.subject_type === 'pairing') {
-    const p = ctx.pairingsById.get(ev.subject_id);
-    if (!p) return '—';
-    return `${ctx.dogsById.get(p.sire_id)?.call_name || '—'} × ${ctx.dogsById.get(p.dam_id)?.call_name || '—'}`;
-  }
-  const l = ctx.littersById.get(ev.subject_id);
-  if (!l) return '—';
-  return `Litter (${ctx.dogsById.get(l.dam_id)?.call_name || '—'} × ${ctx.dogsById.get(l.sire_id)?.call_name || '—'})`;
+function showError(msg) {
+  errorBox.hidden = false;
+  errorBox.innerHTML = `<div class="stub-note warn">${icon('circle-alert')}<span>${esc(msg)}</span></div>`;
 }
 
-// `extra` appends a raw query-string fragment (e.g. "&openEvent=<id>") so
-// callers can deep-link straight to an event on the subject's own page —
-// there is no standalone event page, since Event is polymorphic (CLAUDE.md).
-function subjectHref(ev, extra = '') {
-  if (ev.subject_type === 'dog') return `dog.html?id=${encodeURIComponent(ev.subject_id)}${extra}`;
-  if (ev.subject_type === 'pairing') return `pairing.html?id=${encodeURIComponent(ev.subject_id)}${extra}`;
-  return `litter.html?id=${encodeURIComponent(ev.subject_id)}${extra}`;
-}
+document.getElementById('today-date').textContent = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
 
-// --- 1. Reminders (interactive; re-renders in place on dismiss/snooze) ------
+// --- the prototype's pieces ----------------------------------------------------------------
+const pill = ({ label, tone }) => `<span class="pill ${esc(tone || '')}">${esc(label)}</span>`;
+const rowHtml = ({ icon: ic, tone = '', title, sub, end = '', href, attrs = '' }) =>
+  `<button type="button" class="row"${href ? ` data-href="${esc(href)}"` : ''}${attrs}><span class="row-ic ${esc(tone)}">${icon(ic)}</span><span class="row-main"><span class="row-t">${esc(title)}</span>${sub ? `<span class="row-s">${esc(sub)}</span>` : ''}</span><span class="row-end">${end}${chev}</span></button>`;
+const tileHtml = (t) => `<button type="button" class="tile" data-href="${esc(t.href)}" data-tile="${esc(t.key)}">${icon(t.icon)}<b>${esc(t.title)}</b><span>${esc(t.sub)}</span></button>`;
+const emptyLine = (text) => `<p class="lede" style="padding:4px 14px 12px">${esc(text)}</p>`;
 
-function reminderRow(ev, bucketBadge) {
-  const contact = ev.related_contact_id ? ctx.contactsById.get(ev.related_contact_id)?.name : '';
-  // A reminder is nudging toward logging the NEXT occurrence, not editing the
-  // one that fired it — so this deep-links to a fresh event of the same
-  // event_type on the subject's page, prefilled like the app's other
-  // soft-suggestion prompts (eventForm.js `prefill`). `fromReminder` makes
-  // saving that next one dismiss this reminder: it's been handled.
-  const logHref = subjectHref(ev, `&logEvent=${encodeURIComponent(ev.event_type)}&fromReminder=${encodeURIComponent(ev.id)}`);
-  return `<li style="padding:10px 0; border-top:1px solid var(--border);">
-      <div>${bucketBadge}<a href="${subjectHref(ev)}"><strong>${esc(subjectLabel(ev))}</strong></a> — ${badge(EVENT_TYPES, ev.event_type)} ${esc(ev.title)}</div>
-      <div class="muted" style="font-size:13px;">⏰ ${esc(fmtDate(ev.reminder_date))}${contact ? ` · ${esc(contact)}` : ''}</div>
-      <div class="pill-row" data-row="${esc(ev.id)}" style="margin-top:8px;">
-        <a class="btn btn-sm" href="${esc(logHref)}">Log new →</a>
-        <button class="btn btn-sm" data-act="snooze" data-id="${esc(ev.id)}">Snooze</button>
-        <button class="btn btn-sm" data-act="dismiss" data-id="${esc(ev.id)}">Dismiss</button>
-      </div>
-    </li>`;
-}
+// --- Needs you: live's nudges ------------------------------------------------------------
+let nudges = [];
+// Five, then "Show all", so This week stays in view (search's per-group rule).
+const NEEDS_LIMIT = 5;
+let needsAll = false;
 
-function reminderBucket(title, rows, bucketBadge) {
+function needsYouHtml() {
+  const rows = nudges.filter((n) => !isDismissed(n.key));
   if (!rows.length) return '';
-  return `<h3 style="margin:14px 0 0;">${esc(title)} <span class="muted" style="font-size:13px;">(${rows.length})</span></h3>
-    <ul class="linked-list" style="margin:2px 0 0; padding:0; list-style:none;">
-      ${rows.map((ev) => reminderRow(ev, bucketBadge)).join('')}
-    </ul>`;
+  const shown = needsAll ? rows : rows.slice(0, NEEDS_LIMIT);
+  return `<section class="card" id="home-needs"><div class="section-h"><h2>${icon('bell-ring')}Needs you</h2><span class="fcount">${rows.length}</span></div>
+    <div class="rows">${shown.map((n) => { const look = nudgeLook(n.key); return rowHtml({ icon: look.icon, tone: look.tone, title: n.title, sub: n.detail, attrs: ` data-nudge="${esc(n.key)}"` }); }).join('')}
+    ${rows.length > shown.length ? `<button type="button" class="row" data-needs-all><span class="row-main"><span class="row-t" style="color:var(--primary)">Show all ${rows.length}</span></span></button>` : ''}</div></section>`;
 }
 
-async function renderReminders() {
-  (await prepareReminders())();
+function redrawNeedsYou() {
+  const html = needsYouHtml();
+  const old = document.getElementById('home-needs');
+  if (old && html) old.outerHTML = html;
+  else if (old) old.remove();
+  else if (html) screen.querySelector('.home-cols')?.insertAdjacentHTML('beforebegin', html);
 }
 
-async function prepareReminders() {
-  const reminders = (await eventRepo.getReminders()).filter(eventInScope);
-  return () => paintReminders(reminders);
+async function refreshNudges() {
+  nudges = await computeNudges();
+  redrawNeedsYou();
 }
 
-function paintReminders(reminders) {
-  const isEmpty = !reminders.length;
-  const title = `Reminders${reminders.length ? ` <span class="muted" style="font-size:14px;">(${reminders.length})</span>` : ''}`;
-  let body;
-  if (isEmpty) {
-    body = `<div class="empty-state">Nothing pending. Add a reminder date to any event to see it here.</div>`;
-  } else {
-    const today = todayYMD();
-    const horizon = daysFromToday(DUE_SOON_DAYS);
-    const overdue = reminders.filter((e) => e.reminder_date < today);
-    const dueSoon = reminders.filter((e) => e.reminder_date >= today && e.reminder_date <= horizon);
-    const upcoming = reminders.filter((e) => e.reminder_date > horizon);
-    body = reminderBucket('Overdue', overdue, '<span class="badge badge-red">Overdue</span> ')
-      + reminderBucket('Due soon', dueSoon, '<span class="badge badge-amber">Due soon</span> ')
-      + reminderBucket('Upcoming', upcoming, '<span class="badge badge-blue">Upcoming</span> ');
-  }
-  remindersEl.innerHTML = cardShell(title, body, { key: 'reminders', isEmpty });
-  wireReminderActions();
-}
-
-function wireReminderActions() {
-  remindersEl.querySelectorAll('[data-act]').forEach((btn) => {
-    btn.addEventListener('click', () => onReminderAction(btn.dataset.act, btn.dataset.id));
+// The sheet a nudge opens: what it says, its buttons, Open and Dismiss.
+function openNudge(key) {
+  const n = nudges.find((x) => x.key === key);
+  if (!n) return;
+  const host = document.createElement('div');
+  host.className = 'sheet-back';
+  host.innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="${esc(n.title)}">
+      <div class="sheet-h"><h2>${esc(n.title)}</h2><button type="button" class="ghost" data-close>${icon('x')}Close</button></div>
+      ${n.detail ? `<p class="lede">${esc(n.detail)}</p>` : ''}
+      ${n.actions.map((a, i) => `<button type="button" class="${i ? 'btn-2' : 'primary-btn'}" data-act="${i}">${esc(a.label)}</button>`).join('')}
+      <div class="actions-2">${n.subjectHref ? `<button type="button" class="btn-2" data-open>Open</button>` : ''}<button type="button" class="btn-2" data-dismiss>Dismiss</button></div>
+    </div>`;
+  const close = () => host.remove();
+  host.addEventListener('click', async (e) => {
+    if (e.target === host || e.target.closest('[data-close]')) return close();
+    if (e.target.closest('[data-open]')) { location.href = n.subjectHref; return; }
+    if (e.target.closest('[data-dismiss]')) { dismiss(key); close(); redrawNeedsYou(); return; }
+    const b = e.target.closest('[data-act]');
+    if (!b) return;
+    close();
+    await runNudgeAction(key, n.actions[Number(b.dataset.act)]);
   });
+  document.getElementById('app').appendChild(host);
+  host.querySelector('.primary-btn, .btn-2')?.focus();
 }
 
-async function onReminderAction(act, id) {
+async function runNudgeAction(key, action) {
   try {
-    if (act === 'dismiss') { await eventRepo.dismissReminder(id); renderReminders(); }
-    else if (act === 'snooze') openSnooze(id);
-  } catch (e) { showError(e.message || String(e)); }
+    // An action that can't be undone asks first (Lite's permanent departure).
+    if (action.confirm && !(await confirmModal(action.ask))) return;
+    // An action may return { title, message } to report what it did (the waitlist's
+    // turn moving on to another family, say)…
+    let report = await action.run();
+    // …or `openPicks`: a litter to open picks on through the picks preview (Pro only).
+    if (report && report.openPicks) {
+      const { openPicksFromCheckin } = await import('../assets/waitlistPicksPanel.js');
+      const litter = await litterRepo.getById(report.openPicks);
+      report = litter ? await openPicksFromCheckin(litter) : null;
+    }
+    await refreshNudges();
+    if (report && report.message) await alertModal(report);
+    // …or `compose`: a note for her to send herself (the follow-up a week after a pup
+    // goes home). Sent or copied, the nudge retires.
+    if (report && report.compose) {
+      const { openComposer } = await import('../assets/messageComposer.js');
+      const sent = await openComposer(report.compose);
+      if (sent && report.doneDismisses) { dismiss(key); redrawNeedsYou(); }
+    }
+    // …and `emails`: families to offer an email about it (the waitlist online, Pro only).
+    if (report && report.emails?.length) {
+      const { offerEmails } = await import('../assets/waitlistEmailUI.js');
+      await offerEmails(report.emails);
+    }
+  } catch (e) {
+    // Maturing a pup can hit Lite's cap: the upgrade nudge, not a raw error (cap spec §6).
+    if (e instanceof CapExceededError) { errorBox.hidden = false; renderUpgradeNudge(errorBox, e, 'mature'); } else showError(e.message || String(e));
+  }
 }
 
-// Inline snooze: swap the row's actions for a date picker (a week out, never before
-// today). Snoozing IS a reminder_date edit — there is no separate snooze field.
-function openSnooze(id) {
-  const holder = remindersEl.querySelector(`[data-row="${CSS.escape(id)}"]`);
-  if (!holder) return;
-  holder.innerHTML = `
-    <input type="date" class="snooze-date" min="${todayYMD()}" value="${daysFromToday(7)}" style="max-width:160px;">
-    <button class="btn btn-primary btn-sm" data-set>Set</button>
-    <button class="btn btn-sm" data-cancel>Cancel</button>`;
-  holder.querySelector('[data-cancel]').addEventListener('click', renderReminders);
-  holder.querySelector('[data-set]').addEventListener('click', async () => {
-    const val = holder.querySelector('.snooze-date').value;
-    if (!val) return;
-    try { await eventRepo.snoozeReminder(id, val); renderReminders(); }
-    catch (e) { showError(e.message || String(e)); }
-  });
-}
-
-// --- 0. Nudges (derived, dismissible — Data Integrity Brief §2) -------------
-
-// Computes, then returns the function that paints: main() paints Today's cards
-// together, in one frame (Load Performance plan Phase 1), and a redraw paints at once.
-async function renderNudges() {
-  (await prepareNudges())();
-}
-
-async function prepareNudges() {
-  const all = await computeNudges();
-  return () => paintNudges(all);
-}
-
-function paintNudges(all) {
-  const rows = all.filter((n) => !isDismissed(n.key));
-  if (!rows.length) { nudgesEl.innerHTML = ''; return; }
-  const title = `Nudges <span class="muted" style="font-size:14px;">(${rows.length})</span>`;
-  const body = `<p class="field-hint">Suggestions computed from your data — nothing here changes a record until you act on it.</p>
-      <ul class="linked-list" style="margin:6px 0 0; padding:0; list-style:none;">
-        ${rows.map((n) => `
-          <li class="row-between" style="padding:10px 0; border-top:1px solid var(--border); align-items:flex-start;">
-            <div>
-              <div><a href="${esc(n.subjectHref)}"><strong>${esc(n.title)}</strong></a></div>
-              ${n.detail ? `<div class="muted" style="font-size:13px;">${esc(n.detail)}</div>` : ''}
-            </div>
-            <div class="pill-row" data-nudge="${esc(n.key)}">
-              ${n.actions.map((a, i) => `<button class="btn btn-sm" data-nudge-action="${i}">${esc(a.label)}</button>`).join('')}
-              <button class="btn btn-sm" data-nudge-dismiss>Dismiss</button>
-            </div>
-          </li>`).join('')}
-      </ul>`;
-  nudgesEl.innerHTML = cardShell(title, body, { key: 'nudges', isEmpty: false });
-
-  nudgesEl.querySelectorAll('[data-nudge]').forEach((holder) => {
-    const key = holder.dataset.nudge;
-    const nudge = rows.find((n) => n.key === key);
-    holder.querySelectorAll('[data-nudge-action]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        try {
-          // An action may return { title, message } to report what it did (the
-          // waitlist's turn moving on to another family, say).
-          const action = nudge.actions[Number(btn.dataset.nudgeAction)];
-          // An action that can't be undone asks first (Lite's permanent departure).
-          if (action.confirm && !(await confirmModal(action.ask))) return;
-          let report = await action.run();
-          // ...or `openPicks`: a litter id to open picks on through the picks preview
-          // (waitlist, Pro only); null when she closes it without opening.
-          if (report && report.openPicks) {
-            const [{ openPicksFromCheckin }, { litterRepo }] = await Promise.all([import('../assets/waitlistPicksPanel.js'), import('../data/litterRepo.js')]);
-            const litter = await litterRepo.getById(report.openPicks);
-            report = litter ? await openPicksFromCheckin(litter) : null;
-          }
-          renderNudges();
-          if (report && report.message) await alertModal(report);
-          // ...or `compose`: a note for her to send herself (the follow-up a week after
-          // a pup goes home, Integrations plan §3). Sent or copied → the nudge retires.
-          if (report && report.compose) {
-            const { openComposer } = await import('../assets/messageComposer.js');
-            const sent = await openComposer(report.compose);
-            if (sent && report.doneDismisses) { dismiss(key); renderNudges(); }
-          }
-          // ...and `emails`: families to offer an email about it (the waitlist online,
-          // Pro only; nothing shows where they can't be emailed).
-          if (report && report.emails?.length) {
-            const { offerEmails } = await import('../assets/waitlistEmailUI.js');
-            await offerEmails(report.emails);
-          }
-        }
-        catch (e) {
-          // The promote-lifecycle nudge matures a pup (a ✗→✓ dog transition); in
-          // Lite that can hit the cap and throw CapExceededError — show the
-          // upgrade nudge rather than a raw error (cap spec §6).
-          if (e instanceof CapExceededError) renderUpgradeNudge(errorBox, e, 'mature');
-          else showError(e.message || String(e));
-        }
-      });
-    });
-    const dismissBtn = holder.querySelector('[data-nudge-dismiss]');
-    dismissBtn.addEventListener('click', () => { dismiss(key); renderNudges(); });
-  });
-}
-
-// Nudges redraw by themselves when data changes while Today is open: above all a
-// family's message or status-page action, which the waitlist inbox takes in a
-// moment after the app opens and every few minutes after (cloudWaitlist.js), so
-// it shows without her leaving the page. Debounced, and one redraw at a time.
-const NUDGE_REFRESH_MS = 1500;
+// A family's message or status-page action comes in while Home is open: Needs you redraws
+// (debounced, one at a time).
 function watchForNudgeChanges() {
   let timer = null;
   let running = false;
@@ -269,357 +150,176 @@ function watchForNudgeChanges() {
     timer = null;
     if (running) { again = true; return; }
     running = true;
-    try { await renderNudges(); } catch { /* the next change tries again */ }
+    try { await refreshNudges(); } catch { /* the next change tries again */ }
     running = false;
     if (again) { again = false; redraw(); }
   };
   window.addEventListener(CLOUD_DATA_CHANGED_EVENT, () => {
     if (timer) clearTimeout(timer);
-    timer = setTimeout(redraw, NUDGE_REFRESH_MS);
+    timer = setTimeout(redraw, 1500);
   });
 }
 
-// --- 2. Due outs / Upcoming -------------------------------------------------
+// --- the backup line and the install tip ----------------------------------------------------
+const backupOffered = () => isOffered({ path: 'pages/import-export.html' });
 
-function renderUpcoming(rows) {
-  const isEmpty = !rows.length;
-  const inner = rows.length
-    ? `<ul class="linked-list" style="margin:6px 0 0; padding:0; list-style:none;">
-        ${rows.map((ev) => {
-          const contact = ev.related_contact_id ? ctx.contactsById.get(ev.related_contact_id)?.name : '';
-          // A due-out is THIS event, not a next one — deep-links to open it
-          // directly (edit mode) on the subject's page.
-          const openHref = subjectHref(ev, `&openEvent=${encodeURIComponent(ev.id)}`);
-          return `<li class="row-between" style="padding:9px 0; border-top:1px solid var(--border);">
-            <div style="min-width:0;"><a href="${subjectHref(ev)}"><strong>${esc(subjectLabel(ev))}</strong></a> — ${badge(EVENT_TYPES, ev.event_type)} ${esc(ev.title || '')}${contact ? ` <span class="muted">· ${esc(contact)}</span>` : ''}</div>
-            <div class="pill-row" style="align-items:center; justify-content:flex-end; flex:0 0 auto;">
-              <span class="muted" style="font-size:13px; white-space:nowrap;">${esc(fmtDate(ev.event_date))}</span>
-              <a class="btn btn-sm" href="${esc(openHref)}">Open →</a>
-            </div>
-          </li>`;
-        }).join('')}
-      </ul>`
-    : `<div class="empty-state">Nothing scheduled from today onward.</div>`;
-  const title = `Due outs &amp; upcoming${rows.length ? ` <span class="muted" style="font-size:14px;">(${rows.length})</span>` : ''}`;
-  const body = `<p class="field-hint">Everything scheduled from today onward — drop-offs, vet visits, surgeries.</p>${inner}`;
-  upcomingEl.innerHTML = cardShell(title, body, { key: 'upcoming', isEmpty, marginTop: true });
+function backupRowHtml() {
+  if (!backupOffered()) return '';
+  const cloudOn = isCloudAvailable() && getCloudBackupState().enabled;
+  return `<section class="card" id="home-backup"><div class="rows">${rowHtml({ icon: 'cloud', title: cloudOn ? 'Cloud backup is on' : 'Backup', sub: backupLine(getLastBackupDate()), href: 'import-export.html#backup-restore' })}</div></section>`;
 }
 
-// --- 2b. Upcoming shows (Show Tracking Spec §5.3, Pro-only) -------------------
-// Show events in the next 14 days (not scratched), grouped by show day: dog ·
-// show · location · handler · ring time. Silent when empty. Entries-close alerts
-// need nothing here — they're ordinary reminders via reminder_date. While this
-// card is on, main() keeps show events OUT of the Due outs card, so a show is
-// listed exactly once on Today (decision 8).
-const SHOWS_WINDOW_DAYS = 14;
-
-function renderShows(rows) {
-  if (!showsEl) return;
-  if (!rows.length) { showsEl.innerHTML = ''; return; }
-  const byDate = new Map();
-  for (const ev of rows) {
-    const arr = byDate.get(ev.event_date);
-    if (arr) arr.push(ev); else byDate.set(ev.event_date, [ev]);
-  }
-  const inner = [...byDate.entries()].map(([date, evs]) => `
-    <h3 style="margin:14px 0 0; font-size:14px;">${esc(fmtDate(date))}</h3>
-    <ul class="linked-list" style="margin:2px 0 0; padding:0; list-style:none;">
-      ${evs.map((ev) => {
-        const det = ev.details || {};
-        const handler = ev.related_contact_id ? ctx.contactsById.get(ev.related_contact_id)?.name : '';
-        const meta = [det.location, handler ? `Handler: ${handler}` : '', [det.ring && `Ring ${det.ring}`, det.ring_time].filter(Boolean).join(' · ')]
-          .filter(Boolean).map(esc).join(' · ');
-        const openHref = subjectHref(ev, `&openEvent=${encodeURIComponent(ev.id)}`);
-        return `<li class="row-between" style="padding:9px 0; border-top:1px solid var(--border);">
-          <div style="min-width:0;">
-            <div><a href="${subjectHref(ev)}"><strong>${esc(subjectLabel(ev))}</strong></a> — ${esc(det.show_name || ev.title || '')} ${det.entry_status ? badge(SHOW_ENTRY_STATUS, det.entry_status) : ''}</div>
-            ${meta ? `<div class="muted" style="font-size:13px;">${meta}</div>` : ''}
-          </div>
-          <a class="btn btn-sm" href="${esc(openHref)}">Open →</a>
-        </li>`;
-      }).join('')}
-    </ul>`).join('');
-  const title = `Upcoming shows <span class="muted" style="font-size:14px;">(${rows.length})</span>`;
-  const body = `<p class="field-hint">Show entries in the next ${SHOWS_WINDOW_DAYS} days. <a href="shows.html">All shows →</a></p>${inner}`;
-  showsEl.innerHTML = cardShell(title, body, { key: 'shows', isEmpty: false, marginTop: true });
-}
-
-// --- 3. Who's away (Location / Status Board) --------------------------------
-
-// Expandable-row table (phone-first): Dog · Reason · Location stay in the row;
-// Contact / Drop-off / Return collapse into a panel a tap opens. Each away-dog is
-// a summary <tr> plus a hidden panel <tr>; clicking the summary toggles both.
-function renderBoard(rows) {
-  if (!rows.length) {
-    boardEl.innerHTML = cardShell('Away from home', `<div class="empty-state">No dogs are currently away.</div>`, { key: 'board', isEmpty: true, marginTop: true });
-    return;
-  }
-  const today = todayYMD();
-  const body = rows.map((row, i) => {
-    const dog = ctx.dogsById.get(row.dogId);
-    const contact = row.contactId ? ctx.contactsById.get(row.contactId) : null;
-    const ret = row.returnDate
-      ? `${esc(fmtDate(row.returnDate))}${row.returnDate < today ? ' <span class="badge badge-amber">Overdue?</span>' : ''}`
-      : '<span class="badge badge-blue">Ongoing</span>';
-    const drop = `${esc(fmtDate(row.outDate))}${row.dropoffTime ? ` <span class="faint">${esc(row.dropoffTime)}</span>` : ''}`;
-    return `<tbody class="expand-group">
-      <tr class="expand-summary" data-panel="board-${i}">
-        <td><strong>${esc(dog ? dog.call_name : '—')}</strong></td>
-        <td>${esc(row.reason || '—')}</td>
-        <td>${esc(row.location || '—')}</td>
-        <td style="text-align:right; width:1em;"><span class="expand-chevron">▸</span></td>
-      </tr>
-      <tr class="expand-panel" id="board-${i}" hidden>
-        <td colspan="4">
-          <div class="expand-detail">
-            <div class="k">Contact</div><div class="v">${contact ? esc(contact.name) : '—'}</div>
-            <div class="k">Drop-off</div><div class="v">${drop}</div>
-            <div class="k">Return</div><div class="v">${ret}</div>
-            <div class="expand-actions"><a class="btn btn-sm" href="${esc(row.href)}">Open →</a></div>
-          </div>
-        </td>
-      </tr>
-    </tbody>`;
-  }).join('');
-  const title = `Away from home <span class="muted" style="font-size:14px;">(${rows.length})</span>`;
-  const cardBody = `<p class="field-hint">Boarding stays and in-person stud services — medications and heat cycles don't appear here. Tap a row for contact, drop-off, and return.</p>
-      <table class="data expand-table">
-        <thead><tr><th>Dog</th><th>Reason</th><th>Location</th><th></th></tr></thead>
-        ${body}
-      </table>`;
-  boardEl.innerHTML = cardShell(title, cardBody, { key: 'board', isEmpty: false, marginTop: true });
-  boardEl.querySelectorAll('.expand-summary').forEach((tr) => {
-    tr.addEventListener('click', () => {
-      const panel = document.getElementById(tr.dataset.panel);
-      if (!panel) return;
-      const open = panel.hidden;
-      panel.hidden = !open;
-      tr.classList.toggle('open', open); // CSS rotates the ▸ chevron to point down
-    });
-  });
-}
-
-// --- Active litters (per-litter availability) -------------------------------
-// Replaces the flat available-puppies feed: one block per NON-archived litter
-// that still has at least one 'available' puppy, each showing that litter's
-// selling roster grouped available → undecided → sold. The "selling roster" is
-// the litter's non-archived pups whose disposition is one of available/
-// undecided/placed ('keeping' pups and pups that have moved past the puppy
-// life-stage — disposition nulled — are excluded). "Sold" = disposition
-// 'placed' (the value sale.js sets when a sale is recorded); the per-litter
-// tally reads "<placed>/<roster> sold". Add-sale buttons appear on the still-
-// sellable pups (available/undecided), exactly as the old feed's did. Disposition
-// is the breeder's placement intent, distinct from DOG_STATUS 'for_sale' (the
-// life-stage badge).
-const SELLING_DISPOSITIONS = new Set(['available', 'undecided', 'placed']);
-// Display order within a litter: available first, undecided next, sold last.
-const DISPOSITION_ORDER = { available: 0, undecided: 1, placed: 2 };
-
-function litterLabel(l) {
-  const dam = ctx.dogsById.get(l.dam_id)?.call_name || '—';
-  const sire = ctx.dogsById.get(l.sire_id)?.call_name || '—';
-  return `${dam} × ${sire}`;
-}
-
-// One puppy row: name + its disposition badge on the left, an "Add sale →"
-// action pinned right for sellable pups (available/undecided). Sold pups carry
-// no action — their "Placed" badge already says so.
-function pupRow(d) {
-  const sellable = d.disposition !== 'placed';
-  const action = sellable
-    ? `<div class="pill-row"><a class="btn btn-sm" href="sale.html?new=1&dog=${encodeURIComponent(d.id)}">Add sale →</a></div>`
-    : '';
-  return `<li class="row-between" style="padding:8px 0 0;">
-      <span style="min-width:0;"><a href="dog.html?id=${encodeURIComponent(d.id)}"><strong>${esc(d.call_name)}</strong></a> ${badge(DISPOSITION, d.disposition)}</span>
-      ${action}
-    </li>`;
-}
-
-function renderAvailable(dogs, litters) {
-  // Group each litter's non-archived selling pups by litter_id.
-  const pupsByLitter = new Map();
-  for (const d of dogs) {
-    if (d.is_archived || !d.litter_id || !SELLING_DISPOSITIONS.has(d.disposition)) continue;
-    if (!pupsByLitter.has(d.litter_id)) pupsByLitter.set(d.litter_id, []);
-    pupsByLitter.get(d.litter_id).push(d);
-  }
-  // Active litter = non-archived litter with ≥1 'available' pup. Newest first.
-  const active = litters
-    .filter((l) => !l.is_archived)
-    .map((l) => ({ litter: l, pups: pupsByLitter.get(l.id) || [] }))
-    .filter((x) => x.pups.some((p) => p.disposition === 'available'))
-    .sort((a, b) => String(b.litter.whelp_date || '').localeCompare(String(a.litter.whelp_date || '')));
-
-  const isEmpty = !active.length;
-  const inner = active.length
-    ? active.map(({ litter, pups }, i) => {
-        const sold = pups.filter((p) => p.disposition === 'placed').length;
-        const ordered = [...pups].sort((a, b) =>
-          (DISPOSITION_ORDER[a.disposition] - DISPOSITION_ORDER[b.disposition])
-          || a.call_name.localeCompare(b.call_name));
-        // A rule between litters (skipped before the first) is the visual break.
-        const sep = i ? ' style="margin-top:16px; padding-top:16px; border-top:1px solid var(--border);"' : '';
-        return `<div${sep}>
-          <div class="row-between">
-            <a href="litter.html?id=${encodeURIComponent(litter.id)}"><strong>${esc(litterLabel(litter))}</strong></a>
-            <span class="muted" style="white-space:nowrap;">${sold}/${pups.length} sold</span>
-          </div>
-          <ul class="linked-list" style="margin:2px 0 0; padding:0; list-style:none;">
-            ${ordered.map(pupRow).join('')}
-          </ul>
-        </div>`;
-      }).join('')
-    : `<div class="empty-state">No litters with available puppies.</div>`;
-  const title = `Active litters${active.length ? ` <span class="muted" style="font-size:14px;">(${active.length})</span>` : ''}`;
-  availableEl.innerHTML = cardShell(title, inner, { key: 'active-litters', isEmpty, marginTop: true });
-}
-
-// --- 4. Kennel overview (slow-changing; sits last) --------------------------
-
-function stat(num, label, href) {
-  const cls = ['stat', num === 0 ? 'stat-zero' : ''].filter(Boolean).join(' ');
-  const inner = `<div class="stat-num">${esc(num)}</div><div class="stat-label">${esc(label)}</div>`;
-  return href ? `<a class="${cls}" href="${href}">${inner}</a>` : `<div class="${cls}">${inner}</div>`;
-}
-
-function renderOverview({ allDogs, litters, pairings, sales }) {
-  const activeDogs = allDogs.filter((d) => !d.is_archived);
-  const archivedCount = allDogs.length - activeDogs.length;
-  const byStatus = new Map();
-  for (const d of activeDogs) byStatus.set(d.status, (byStatus.get(d.status) || 0) + 1);
-  const statusTiles = DOG_STATUS
-    .filter((s) => (byStatus.get(s.value) || 0) > 0 || ['active_breeding', 'retired_breeding', 'puppy', 'pet_home', 'deceased'].includes(s.value))
-    .map((s) => stat(byStatus.get(s.value) || 0, s.label, 'dogs.html'))
-    .join('') + stat(archivedCount, 'Archived (any status)', 'dogs.html');
-
-  const year = String(new Date().getFullYear());
-  const inYear = (ymd) => (ymd || '').startsWith(year);
-  const yearLitters = litters.filter((l) => inYear(l.whelp_date)).length;
-  const yearPairings = pairings.filter((p) => inYear(p.planned_date)).length;
-  const yearSales = sales.filter((s) => inYear(s.sale_date)).length;
-
-  overviewEl.innerHTML =
-    cardShell('Kennel overview',
-      `<p class="field-hint">Active dogs by status. Rarely changes, so it sits at the bottom.</p><div class="stat-grid">${statusTiles}</div>`,
-      { key: 'overview', isEmpty: allDogs.length === 0, marginTop: true })
-    + cardShell(`This year (${year})`,
-      `<div class="stat-grid">
-        ${stat(yearLitters, 'Litters whelped', 'breeding.html')}
-        ${stat(yearPairings, 'Pairings', 'breeding.html')}
-        ${stat(yearSales, 'Sales', 'sales.html')}
-      </div>`,
-      { key: 'this-year', isEmpty: yearLitters === 0 && yearPairings === 0 && yearSales === 0, marginTop: true });
-}
-
-// --- Edition footer (Lite only) --------------------------------------------
-// The "See the full app ↗" / "Upgrade to Pro →" links (editions plan §"In-Lite
-// links to Demo and Pro"). Edition-static, so it's rendered once up front and
-// never touches the loaded data. No-op in Pro/Demo (hasEditionLinks() false).
-function renderEditionFooter() {
-  if (!editionsEl || !hasEditionLinks()) return;
-  editionsEl.innerHTML = editionLinksHtml();
-  wireEditionLinks(editionsEl);
-}
-
-// --- Install as an app (moved here from the first-run cards, 2026-10-10) ------
-// A dismissible card until it's dismissed or the app is already running
-// installed (standalone), when there's nothing to say.
 const INSTALL_TIP_KEY = 'install-tip';
-function renderInstallTip() {
-  if (!installEl) return;
+function installRowHtml() {
   const standalone = window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone === true;
-  if (standalone || isDismissed(INSTALL_TIP_KEY)) { installEl.innerHTML = ''; return; }
-  installEl.innerHTML = `<section class="card" style="margin-bottom:16px;">
-      <div class="row-between">
-        <div><strong>📲 Install KennelOS as an app</strong>
-          <div class="muted" style="font-size:13px;">It opens from your home screen like any app, and works offline.</div></div>
-        <div class="pill-row"><button class="btn btn-sm" data-act="install-ok">Got it</button></div>
-      </div>
-      <details style="margin-top:8px;"><summary class="muted" style="font-size:13px;cursor:pointer;">How?</summary>
-        <ul class="muted" style="font-size:13px;margin:6px 0 0;padding-left:20px;">
-          <li><strong>Android (Chrome):</strong> tap the <strong>⋮</strong> menu → <strong>Add to Home screen</strong> (or <strong>Install app</strong>).</li>
-          <li><strong>iPhone / iPad (Safari):</strong> tap <strong>Share</strong> (□ with an ↑) → <strong>Add to Home Screen</strong>.</li>
-        </ul>
-      </details>
-    </section>`;
-  installEl.querySelector('[data-act="install-ok"]').addEventListener('click', () => { dismiss(INSTALL_TIP_KEY); renderInstallTip(); });
+  if (standalone || isDismissed(INSTALL_TIP_KEY)) return '';
+  return `<section class="card" id="home-install"><div class="rows">${rowHtml({ icon: 'house', title: 'Put KennelOS on your home screen', sub: 'Opens like any app, and works offline', attrs: ' data-install' })}</div></section>`;
 }
 
-// Her website's changes not sent yet, drawn from the last compare so the card is
-// in the first paint (assets/websiteBanner.js adopts it, Load Performance plan D7).
-function drawCachedWebsiteCard(el) {
-  const cache = getWebsiteStripCache();
-  if (!el || !cache?.html || !cache.waiting?.length || getWebsiteLaterFor() === cache.signature) return;
-  // Built by websiteBanner.waitingHtml, which escapes every value.
-  el.innerHTML = `<div class="card inline-notice" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">${cache.html}</div>`;
-  el.hidden = false;
+function openInstallTip() {
+  const host = document.createElement('div');
+  host.className = 'sheet-back';
+  host.innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="Put KennelOS on your home screen">
+      <div class="sheet-h"><h2>Put KennelOS on your home screen</h2><button type="button" class="ghost" data-close>${icon('x')}Close</button></div>
+      <div class="stub-note">${icon('info')}<span><b>Android (Chrome):</b> tap the ⋮ menu, then <b>Add to Home screen</b> (or <b>Install app</b>).</span></div>
+      <div class="stub-note">${icon('info')}<span><b>iPhone or iPad (Safari):</b> tap <b>Share</b>, then <b>Add to Home Screen</b>.</span></div>
+      <button type="button" class="primary-btn" data-done>${icon('check')}Got it</button>
+    </div>`;
+  host.addEventListener('click', (e) => {
+    if (e.target === host || e.target.closest('[data-close]')) host.remove();
+    else if (e.target.closest('[data-done]')) { dismiss(INSTALL_TIP_KEY); host.remove(); document.getElementById('home-install')?.remove(); }
+  });
+  document.getElementById('app').appendChild(host);
 }
+
+// --- loading and drawing -------------------------------------------------------------------
+async function load() {
+  const today = todayYMD();
+  const [allDogs, litters, pairings, sales, contacts, upcoming, reminders, away, nudgeList] = await Promise.all([
+    dogRepo.getAll({ includeArchived: true }),
+    litterRepo.getAll(),
+    pairingRepo.getAll(),
+    saleRepo.getAll(),
+    contactRepo.getAll(),
+    eventRepo.getUpcoming(),
+    eventRepo.getReminders(),
+    getAwayBoardRows(),
+    computeNudges(),
+  ]);
+  const contracts = editionFlags.contracts
+    ? await (await import('../data/contractRepo.js')).contractRepo.getAll().catch(() => []) : [];
+  const dogsById = new Map(allDogs.map((d) => [d.id, d]));
+  // Labels resolve from every record; lists are scoped (Multi-Kennel Scope Spec §7).
+  const maps = { dog: dogsById, litter: new Map(litters.map((l) => [l.id, l])), pairing: new Map(pairings.map((p) => [p.id, p])) };
+  const inScope = (ev) => subjectInScope(ev.subject_type, ev.subject_id, maps);
+  const dogs = dogsInScope(allDogs.filter((d) => !d.is_archived));
+  const scoped = { litters: inScopeOnly(litters), pairings: inScopeOnly(pairings), sales: inScopeOnly(sales), contracts: inScopeOnly(contracts) };
+  const pickups = upcoming.filter((e) => e.event_type === 'placement').filter(inScope);
+  const stages = kennelStages({ litters: scoped.litters, pairings: scoped.pairings, dogs, pickups, today, waitlist: !!editionFlags.waitlist });
+
+  // Weights for the newborn litters' pups (their own histories), for "Last weighed".
+  const newborn = stages.filter((s) => s.k === 'newborns' && s.litter).map((s) => s.litter.id);
+  const weighPups = dogs.filter((d) => newborn.includes(d.litter_id));
+  const weights = (await Promise.all(weighPups.map((p) => eventRepo.getForSubject('dog', p.id)))).flat();
+  // Balances owed matter only while pups are going home; the money code loads only then.
+  const priceTable = stages.some((s) => s.k === 'gohome') ? (await import('../data/incomeView.js')).priceTable : null;
+  nudges = nudgeList;
+  return { priceTable, today, dogs, dogsById, contacts, stages, pickups, weights, upcoming: upcoming.filter(inScope), reminders: reminders.filter(inScope), away, ...scoped, maps };
+}
+
+function steadyTiles(d) {
+  const year = d.today.slice(0, 4);
+  const tiles = [];
+  if (editionFlags.websiteLink && !isReadOnly() && d.website) {
+    const waiting = getWebsiteStripCache()?.waiting?.length || 0;
+    tiles.push({ key: 'website', icon: 'globe', title: 'Website', sub: waiting ? `${waiting} change${waiting > 1 ? 's' : ''} not on your site` : 'Up to date', href: 'kels.html?task=website-update' });
+  }
+  tiles.push({ key: 'sales', icon: 'tag', title: 'Sales', sub: `${d.sales.filter((s) => String(s.sale_date || '').startsWith(year)).length} this year`, href: 'sales.html' });
+  tiles.push({ key: 'financials', icon: 'coins', title: 'Financials', sub: 'Income, expenses and net', href: 'financials.html' });
+  if (isOffered({ path: 'pages/contacts.html', flag: 'contactsSection' })) tiles.push({ key: 'people', icon: 'users', title: 'People', sub: `${d.contacts.length} ${d.contacts.length === 1 ? 'person' : 'people'}`, href: 'contacts.html' });
+  return tiles;
+}
+
+function draw(d) {
+  const tabs = shellTabs().map((t) => t.key);
+  const tiles = homeTiles({
+    stages: d.stages, tabs, steady: steadyTiles(d),
+    ctx: {
+      today: d.today, dogs: d.dogs, sales: d.sales, events: [...d.weights, ...d.pickups], flags: editionFlags,
+      contractsToSign: d.contracts.filter((c) => c.status === 'sent').length,
+      balanceDue: (s) => { try { return d.priceTable ? d.priceTable(s).balanceDue : 0; } catch { return 0; } },
+      money: (n) => fmtMoney(n).replace(/\.00$/, ''),
+    },
+  });
+  const typeLabel = (t) => descriptor(EVENT_TYPES, t).label;
+  const subject = (ev) => (ev.subject_type === 'dog' ? d.dogsById.get(ev.subject_id)?.call_name || '—'
+    : pairName(d.maps[ev.subject_type]?.get(ev.subject_id), d.dogsById));
+  const { week, later } = agendaRows({
+    reminders: d.reminders, upcoming: d.upcoming, away: d.away, today: d.today,
+    label: subject, typeLabel, dogName: (id) => d.dogsById.get(id)?.call_name || '—',
+  });
+  const weekRows = week.map((r) => rowHtml({ ...r, end: r.pill ? pill(r.pill) : '' })).join('');
+  const laterRows = later.slice(0, 6).map((r) => rowHtml(r)).join('');
+  const html = `
+    <div class="pups-strip">${stagePills(d.stages).map(pill).join('')}</div>
+    <div class="tiles">${tiles.map(tileHtml).join('')}</div>
+    ${needsYouHtml()}
+    <div class="home-cols">
+      <section class="card"><div class="section-h"><h2>${icon('calendar-check')}This week</h2><button type="button" class="link" data-href="reminders.html">All reminders</button></div><div class="rows">${weekRows || emptyLine('Nothing due this week.')}</div></section>
+      <div class="stack">
+        <section class="card"><div class="section-h"><h2>${icon('calendar-days')}Coming up</h2><button type="button" class="link" data-href="calendar.html">Calendar</button></div><div class="rows">${laterRows || emptyLine('Nothing coming up yet.')}</div></section>
+        <div id="today-cloud" hidden></div>
+        ${backupRowHtml()}
+        ${installRowHtml()}
+      </div>
+    </div>`;
+  head.insertAdjacentHTML('afterend', html);
+}
+
+// Net on the Financials tile, as Financials' overview counts it, once Home is drawn.
+async function fillNet() {
+  const tile = screen.querySelector('[data-tile="financials"] span');
+  if (!tile) return;
+  const [{ getIncomeRows, summarize }, { expenseRepo }, { expenseInScope }, studs] = await Promise.all([
+    import('../data/incomeView.js'), import('../data/expenseRepo.js'), import('../data/kennelScope.js'),
+    editionFlags.studServices ? import('../data/studServiceRepo.js').then((m) => m.studServiceRepo.getAll()).catch(() => []) : [],
+  ]);
+  const [rows, expenses, dogs, litters, pairings] = await Promise.all([
+    getIncomeRows(), expenseRepo.getAll(), dogRepo.getAll({ includeArchived: true }), litterRepo.getAll({ includeArchived: true }), pairingRepo.getAll({ includeArchived: true }),
+  ]);
+  const maps = { dog: new Map(dogs.map((x) => [x.id, x])), litter: new Map(litters.map((x) => [x.id, x])), pairing: new Map(pairings.map((x) => [x.id, x])), stud_service: new Map(studs.map((x) => [x.id, x])) };
+  const net = summarize(rows).totals.earned - expenseRepo.total(expenses.filter((x) => expenseInScope(x, maps)));
+  const text = fmtMoney(Math.abs(net)).replace(/\.\d\d$/, '');
+  tile.textContent = `Net ${net > 0 ? '+' : net < 0 ? '−' : ''}${text}`;
+}
+
+// Her website tile shows while a site is linked; its line is corrected after a fresh compare.
+async function websiteLinked() {
+  if (!editionFlags.websiteLink || isReadOnly()) return false;
+  try { return await (await import('../data/kennelportLinkStore.js')).anyWebsiteLink(); } catch { return false; }
+}
+
+screen.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-href], [data-nudge], [data-install], [data-needs-all]');
+  if (!b || !screen.contains(b)) return;
+  if (b.hasAttribute('data-needs-all')) { needsAll = true; redrawNeedsYou(); } else if (b.hasAttribute('data-nudge')) openNudge(b.dataset.nudge);
+  else if (b.hasAttribute('data-install')) openInstallTip();
+  else location.href = b.dataset.href;
+});
 
 async function main() {
-  renderEditionFooter();
-  renderInstallTip();
-  // "Turn on free cloud backup" / "backup is paused" — only with a server. Decided
-  // from settings, so it's in the first paint; the cloud UI loads on a button press.
-  if (isCloudAvailable()) renderTodayCloudCard(cloudEl);
-  // Her website's changes not sent yet, with Send now (assets/websiteBanner.js).
-  if (editionFlags.websiteLink && !isReadOnly()) {
-    const websiteEl = document.getElementById('today-website');
-    drawCachedWebsiteCard(websiteEl);
-    import('../assets/websiteBanner.js').then((m) => m.startWebsiteBanner({ el: websiteEl }))
-      .catch((e) => import('../assets/appShell.js').then((m) => m.moduleFailed(e)).catch(() => {}));
+  const [d, website] = await Promise.all([load(), websiteLinked()]);
+  d.website = website;
+  draw(d);
+  // "Turn on free cloud backup", "backup is paused" and the like, only with a server; the
+  // backup line steps aside while one shows.
+  if (isCloudAvailable()) {
+    renderTodayCloudCard(document.getElementById('today-cloud'), {
+      onChange: (shown) => { const r = document.getElementById('home-backup'); if (r) r.hidden = shown; },
+    });
   }
-  // Under the top cards just drawn, so they don't push it down (Load Performance plan Phase 1).
-  const loading = document.getElementById('today-loading');
-  if (loading) loading.hidden = false;
-
-  const [allDogs, litters, pairings, sales, contacts, upcoming, boardRows] = await Promise.all([
-    dogRepo.getAll({ includeArchived: true }),
-    litterRepo.getAll({ includeArchived: false }),
-    pairingRepo.getAll({ includeArchived: false }),
-    saleRepo.getAll({ includeArchived: false }),
-    contactRepo.getAll({ includeArchived: true }),
-    eventRepo.getUpcoming(),
-    getAwayBoardRows()
-  ]);
-  ctx.dogsById = new Map(allDogs.map((d) => [d.id, d]));
-  ctx.pairingsById = new Map(pairings.map((p) => [p.id, p]));
-  ctx.littersById = new Map(litters.map((l) => [l.id, l]));
-  ctx.contactsById = new Map(contacts.map((c) => [c.id, c]));
-
-  // Active-kennel scope (Multi-Kennel Scope Spec §7). Applied AFTER the maps are
-  // built, for the reason spelled out at ctx. Dogs go through the dog flavor so
-  // external/leased dogs stay visible; the rest carry their own stamped kennel.
-  // Every one of these is a pass-through under "All kennels" and in Lite.
-  const scopedDogs = dogsInScope(allDogs);
-  const scopedLitters = inScopeOnly(litters);
-  const scopedPairings = inScopeOnly(pairings);
-  const scopedSales = inScopeOnly(sales);
-
-  // Nudges and reminders each do their own async read, run concurrently. Every
-  // card then paints in the same frame, in page order (Load Performance plan
-  // Phase 1): painting the lower cards first and the two top ones when ready
-  // pushed the page down under her finger.
-  const [paintNudgesCard, paintRemindersCard] = await Promise.all([prepareNudges(), prepareReminders()]);
-  document.getElementById('today-loading')?.remove();
-  paintNudgesCard();
-  paintRemindersCard();
   watchForNudgeChanges();
-  renderAvailable(scopedDogs, scopedLitters);
-  const scopedUpcoming = upcoming.filter(eventInScope);
-  if (editionFlags.shows) {
-    // Shows get their own card and leave the Due outs card (decision 8). The
-    // filter is here, not in getUpcoming(), so the Upcoming page still lists them.
-    const horizon = addDaysToYMD(todayYMD(), SHOWS_WINDOW_DAYS);
-    renderShows(scopedUpcoming.filter((e) => e.event_type === 'show'
-      && e.event_date <= horizon && e.details?.entry_status !== 'scratched'));
-    renderUpcoming(scopedUpcoming.filter((e) => e.event_type !== 'show'));
-  } else {
-    renderUpcoming(scopedUpcoming);
-  }
-  // boardRows arrive already scoped — getAwayBoardRows() owns that, so board.js,
-  // today.js, and dashboard.js can't disagree about who is away.
-  renderBoard(boardRows);
-  renderOverview({ allDogs: scopedDogs, litters: scopedLitters, pairings: scopedPairings, sales: scopedSales });
+  fillNet().catch((e) => console.warn('KennelOS: Home net', e));
 }
 
 main().catch((e) => showError(e.message || String(e)));

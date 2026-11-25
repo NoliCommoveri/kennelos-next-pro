@@ -4,7 +4,7 @@
 // when there's a tour to take (wizardUI.renderWizardMenuEntry fills #shell-tour), and in
 // Lite the links out to the Demo and to Pro.
 import { MORE_ROWS, hubRows } from '../data/shellNav.js';
-import { mountHub, updateRow, rowHtml } from '../assets/hubRows.js';
+import { mountHub, updateRow, rowHtml, backupLine } from '../assets/hubRows.js';
 import { getLastBackupDate } from '../data/settings.js';
 import { hasEditionLinks, wireEditionLinks } from '../assets/editionLinks.js';
 import { demoUrl, upgradeUrl } from '../data/editionConfig.js';
@@ -22,14 +22,6 @@ tour.innerHTML = '<div class="rows"></div>';
 const kelsCard = sections.find((s) => s.querySelector('[data-row="kels"]'));
 if (kelsCard) kelsCard.after(tour); else screen.appendChild(tour);
 
-// "Last backup today, 6:12 AM" (the prototype's subline), from this device's last backup.
-function backupLine(iso, now = new Date()) {
-  const d = iso ? new Date(iso) : null;
-  if (!d || Number.isNaN(d.getTime())) return 'No backup yet';
-  const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
-  const sameDay = d.toDateString() === now.toDateString();
-  return `Last backup ${sameDay ? 'today' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}, ${time}`;
-}
 if (cards.flat().some((r) => r.key === 'backup')) updateRow(screen, 'backup', { sub: backupLine(getLastBackupDate()) });
 
 // Lite: see the full app (the Demo, in a new tab) and upgrade to Pro.
