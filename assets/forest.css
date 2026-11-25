@@ -195,6 +195,32 @@ i[data-lucide], svg.lucide { width: 18px; height: 18px; flex: none; }
 .tile span { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .when { font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
 .home-cols { display: grid; gap: 14px; }
+/* Dogs hub: count cards, then rows; dog lists as rows or fact tiles */
+.dcards { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+.dcard { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); padding: 12px; display: flex; flex-direction: column; gap: 2px; text-align: left; cursor: pointer; font: inherit; color: var(--ink); min-width: 0; }
+.dcard:hover { border-color: var(--line-strong); background: var(--surface-2); }
+.dcard-t { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
+.dcard-t i[data-lucide], .dcard-t svg.lucide { width: 16px; height: 16px; color: var(--primary); flex: none; }
+.dcard b { font-family: var(--font-display); font-size: 26px; font-weight: 800; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.dcard-s { font-size: 12px; color: var(--muted); }
+.dav { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; flex: none; font-family: var(--font-display); font-weight: 800; font-size: 15px; }
+.dav.m { background: var(--p-blue-bg); color: var(--p-blue-fg); }
+.dav.f { background: var(--p-rose-bg); color: var(--p-rose-fg); }
+.vswitch { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 10px; overflow: hidden; flex: none; }
+.vswitch button { border: 0; background: var(--surface); color: var(--muted); width: 38px; display: grid; place-items: center; cursor: pointer; }
+.vswitch button[aria-pressed="true"] { background: var(--primary-soft); color: var(--primary); }
+.vswitch svg.lucide, .vswitch i[data-lucide] { width: 18px; height: 18px; }
+.dtiles { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+.dtile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); padding: 10px; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; text-align: left; cursor: pointer; font: inherit; color: var(--ink); min-width: 0; overflow: hidden; }
+.dtile:hover { border-color: var(--line-strong); background: var(--surface-2); }
+.dtile-h { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dtile-h .dav { width: 30px; height: 30px; font-size: 13px; }
+.dtile-h b { font-family: var(--font-display); font-size: 15.5px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dtile dl { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; width: 100%; }
+.dtile dl div { display: flex; justify-content: space-between; gap: 6px; font-size: 12px; }
+.dtile dt { color: var(--muted); flex: none; }
+.dtile dl div { min-width: 0; }
+.dtile dd { margin: 0; font-weight: 600; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 0; }
 /* dogs table */
 .search { display: flex; gap: 8px; }
 .search label { flex: 1; display: flex; align-items: center; gap: 8px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 10px; padding: 0 10px; color: var(--muted); }
@@ -313,6 +339,8 @@ svg.chart .hit:hover, svg.chart .hit.on { fill: var(--surface-2); }
   .screen { padding: 20px 24px 28px; gap: 16px; }
   .screen > * { width: 100%; max-width: 1000px; }
   .tiles { grid-template-columns: repeat(6, 1fr); }
+  .dcards { grid-template-columns: repeat(3, minmax(0,1fr)); }
+  .dtiles { grid-template-columns: repeat(4, minmax(0,1fr)); }
   .home-cols { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); align-items: start; }
   .wide-only { display: table-cell; }
   .kpis { grid-template-columns: repeat(4, minmax(0,1fr)); }
