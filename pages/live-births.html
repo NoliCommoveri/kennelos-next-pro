@@ -5,16 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Live-Birth Summary — KennelOS</title>
   <link rel="stylesheet" href="../assets/app.css">
+  <link rel="stylesheet" href="../assets/forest-shell.css">
   <link rel="manifest" href="../manifest.json">
   <link rel="icon" href="../assets/icons/favicon-32.png" sizes="32x32">
   <link rel="apple-touch-icon" href="../assets/icons/apple-touch-icon.png">
-  <meta name="theme-color" content="#122138">
+  <meta name="theme-color" content="#1d4a33" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#173a28" media="(prefers-color-scheme: dark)">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="KennelOS">
 </head>
-<body>
-  <div id="app-nav"></div>
+<body class="has-shell">
+  <div class="app" id="app"><div class="shell">
+    <nav class="tabbar" id="tabbar" aria-label="Main"></nav>
+    <div class="main">
+      <header class="appbar" id="appbar"></header>
+      <div class="screen legacy" id="screen" tabindex="-1">
+    <div id="app-nav" hidden></div>
   <main>
     <div class="page-header">
       <div>
@@ -27,6 +34,9 @@
       <div id="report-mount"></div>
     </section>
   </main>
+      </div>
+    </div>
+  </div></div>
 
   <script type="module" src="../app.js"></script>
   <script type="module" src="./live-births.js"></script>

@@ -19,6 +19,7 @@ import { alertModal, esc } from './ui.js';
 import { isCloudAvailable } from '../data/cloud/cloudConfig.js';
 import { isDemo } from '../data/demoMode.js';
 import { tourUrl, edition } from '../data/editionConfig.js';
+import { icon } from './icon.js';
 
 function rootPrefix() {
   return location.pathname.includes('/pages/') ? '../' : '';
@@ -71,44 +72,38 @@ function goToStep(step) {
   location.href = resolveStepUrl(step);
 }
 
-// --- Nav menu entry ------------------------------------------------------
+// --- The tour's row on More ---------------------------------------------
 // While the seed is loaded: take, resume or retake the tour here. Once this
 // device has a program of its own the tour is never seeded again beside it
 // (Load Performance plan D3): "Take the tour" opens the Demo in a new tab.
+// Drawn into More's #shell-tour card (pages/more.html), as one of its rows.
 export function renderWizardMenuEntry() {
-  const menu = document.querySelector('.nav-more-menu');
-  if (!menu) return;
+  const host = document.getElementById('shell-tour');
+  if (!host) return;
+  const rowHtml = (label, sub) => `<button type="button" class="row"><span class="row-ic">${icon('compass')}</span><span class="row-main"><span class="row-t">${esc(label)}</span><span class="row-s">${esc(sub)}</span></span><span class="row-end">${icon('chevron-right')}</span></button>`;
+  const show = (label, sub, onClick) => {
+    host.querySelector('.rows').innerHTML = rowHtml(label, sub);
+    host.querySelector('.row').addEventListener('click', onClick);
+    host.hidden = false;
+  };
   if (!isTourAvailable()) {
     if (isDemo() || !tourUrl) return;
-    const link = document.createElement('a');
-    link.href = tourUrl;
-    link.target = '_blank';
-    link.rel = 'noopener';
-    link.className = 'nav-link';
-    link.textContent = '🧭 Take the tour ↗';
-    link.title = edition === 'lite' ? 'Opens the KennelOS demo in a new tab. The demo shows Pro.' : 'Opens the KennelOS demo in a new tab';
-    menu.appendChild(link);
+    show('Take the tour', edition === 'lite' ? 'Opens the KennelOS demo in a new tab. The demo shows Pro.' : 'Opens the KennelOS demo in a new tab',
+      () => globalThis.open(tourUrl, '_blank', 'noopener'));
     return;
   }
 
   const status = getWizardStatus();
-  const label = status === 'completed' ? '🧭 Retake the tour'
-    : (status === 'active' && getWizardStepIndex() > 0) ? '🧭 Resume tour'
-    : '🧭 Take the tour';
-
-  const a = document.createElement('a');
-  a.href = '#';
-  a.className = 'nav-link';
-  a.textContent = label;
-  a.addEventListener('click', (e) => {
-    e.preventDefault();
+  const label = status === 'completed' ? 'Retake the tour'
+    : (status === 'active' && getWizardStepIndex() > 0) ? 'Resume tour'
+    : 'Take the tour';
+  show(label, 'A walk through the sample kennel', () => {
     if (status !== 'active') startWizard();
     const step = currentStep();
     if (!step) return;
     if (isOnStepPage(step)) runWizardStep();
     else goToStep(step);
   });
-  menu.appendChild(a);
 }
 
 // --- Overlay / spotlight / cards -----------------------------------------

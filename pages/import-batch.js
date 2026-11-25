@@ -11,6 +11,7 @@ import { createImportView } from '../assets/importView.js';
 import { esc } from '../assets/ui.js';
 import { edition } from '../data/editionConfig.js';
 import { isProOnlyPage } from '../data/proPages.js';
+import { scroller } from '../nav.js';
 
 const root = document.getElementById('import-root');
 
@@ -113,14 +114,14 @@ function runSteps(order) {
           </div>
         </section>`;
       mount.querySelector('#batch-handoff-next').addEventListener('click', () => next({ handoff: true }));
-      window.scrollTo(0, 0);
+      scroller().scrollTop = 0;
       return;
     }
     createImportView({
       mount, entity: f.entity, listHref: ENTITY_LIST[f.entity], listLabel: label(f.entity),
       rows: f.rows, fileName: f.name, encoding: f.encoding, onNext: next
     });
-    window.scrollTo(0, 0);
+    scroller().scrollTop = 0;
   };
   next();
 }
@@ -153,7 +154,7 @@ function renderDone(results) {
       </table></div>
       <div class="form-actions">${lists} <a class="btn btn-primary" href="import-export.html">Back to Import / Export</a></div>
     </section>`;
-  window.scrollTo(0, 0);
+  scroller().scrollTop = 0;
 }
 
 renderPick();

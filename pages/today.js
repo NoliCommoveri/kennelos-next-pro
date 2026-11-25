@@ -517,7 +517,7 @@ function renderOverview({ allDogs, litters, pairings, sales }) {
 // never touches the loaded data. No-op in Pro/Demo (hasEditionLinks() false).
 function renderEditionFooter() {
   if (!editionsEl || !hasEditionLinks()) return;
-  editionsEl.innerHTML = editionLinksHtml({ variant: 'footer' });
+  editionsEl.innerHTML = editionLinksHtml();
   wireEditionLinks(editionsEl);
 }
 

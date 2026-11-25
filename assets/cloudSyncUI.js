@@ -26,6 +26,7 @@ import { getMyKennelName } from '../data/kennelSetup.js';
 import {
   openModal, typedConfirm, progressModal, notify, relativeTime, snapshotLabel, errorText, signInModal, withFreshSignIn
 } from './cloudBackupUI.js';
+import { scroller } from '../nav.js';
 
 const vaultUI = () => import('./cloudVaultUI.js');
 
@@ -492,7 +493,7 @@ function react(tables) {
   const what = pageReaction(page, id, tables, { busy });
   if (what === 'notice') showNotice();
   if (what === 'reload') {
-    try { sessionStorage.setItem(SCROLL_KEY, JSON.stringify({ path: location.pathname + location.search, y: window.scrollY })); } catch { /* top it is */ }
+    try { sessionStorage.setItem(SCROLL_KEY, JSON.stringify({ path: location.pathname + location.search, y: scroller().scrollTop })); } catch { /* top it is */ }
     location.reload();
   }
   notify();
@@ -504,7 +505,7 @@ function restoreScroll() {
     const saved = JSON.parse(sessionStorage.getItem(SCROLL_KEY) || 'null');
     sessionStorage.removeItem(SCROLL_KEY);
     if (saved && saved.path === location.pathname + location.search) {
-      requestAnimationFrame(() => window.scrollTo(0, saved.y || 0));
+      requestAnimationFrame(() => { scroller().scrollTop = saved.y || 0; });
     }
   } catch { /* nothing saved */ }
 }

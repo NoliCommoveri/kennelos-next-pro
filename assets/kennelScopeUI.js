@@ -2,7 +2,7 @@
 // (Multi-Kennel Scope Spec §7/§8). Three widgets, all reading the one scope
 // service (data/kennelScope.js) and none of them reading the setting directly:
 //
-//   • renderKennelSwitcher(host) — the nav's active-kennel indicator + switcher.
+//   • refreshKennelScope()       — keeps the kennel line under the brand (nav.js) current.
 //   • mountScopeChip(el)         — the "🏠 <kennel> only" chip a scoped list or
 //                                  report shows in its toolbar, so a short list
 //                                  always says WHY it is short.
@@ -18,10 +18,11 @@
 // chip and the notice never fire, and the switcher returns before rendering.
 import { editionFlags } from '../data/editionConfig.js';
 import {
-  getActiveKennel, getActiveKennelId, setActiveKennel, ownKennels, isScoped, inScope, isOwnedByUser
+  getActiveKennel, setActiveKennel, ownKennels, isScoped, inScope, isOwnedByUser
 } from '../data/kennelScope.js';
 import { getNavKennels, setNavKennels } from '../data/settings.js';
 import { esc } from './ui.js';
+import { refreshKennelLine } from '../nav.js';
 
 // True in the editions that have a scope at all. Callers that build markup up
 // front (rather than awaiting a render) branch on this to skip the host element.
@@ -37,49 +38,21 @@ function applyScope(id) {
   location.reload();
 }
 
-// --- The nav switcher (§8) -------------------------------------------------
+// --- The kennel line under the brand (§8) ---------------------------------
 
-// Rendered into the nav's scope slot on every page. Silent until an own kennel
-// exists (pre-setup, and all of Lite), so a first-run user never sees a switcher
-// over an empty app.
-//
-// Drawn first from the stored copy of her own kennels (settings.getNavKennels),
-// so it is there in the nav's first paint instead of widening the nav a moment
-// later (Load Performance plan Phase 1); then corrected, and the copy refreshed,
-// from the database. Redrawn only when the two differ.
-export async function renderKennelSwitcher(host) {
-  if (!host || !hasKennelScopeUI()) return;
-  const cached = getNavKennels();
-  if (cached?.own?.length) drawSwitcher(host, cached.own, getActiveKennelId() || '');
-  // getActiveKennel() doubles as the stale-scope guard (§5): an archived or
-  // deleted active kennel is cleared here, on every page load, rather than
-  // rendering an empty app with no explanation.
-  const [kennels, active] = await Promise.all([ownKennels(), getActiveKennel()]);
+// Every page: her own kennels are read and the stored copy (settings.getNavKennels)
+// refreshed, which nav.js draws the kennel line from, so a kennel she's narrowed to shows
+// under the brand. getActiveKennel() doubles as the stale-scope guard (§5): an archived or
+// deleted active kennel is cleared here, on every page load, rather than rendering an empty
+// app with no explanation. The switch itself is on Kennels (pages/kennels.html), which the
+// kennel line opens.
+export async function refreshKennelScope() {
+  if (!hasKennelScopeUI()) return;
+  const [kennels] = await Promise.all([ownKennels(), getActiveKennel()]);
   const now = getNavKennels() || { name: null, own: [] };
   const own = kennels.map((k) => ({ id: k.id, kennel_name: k.kennel_name || '' }));
   if (JSON.stringify(now.own) !== JSON.stringify(own)) setNavKennels({ ...now, own });
-  if (!kennels.length) { host.innerHTML = ''; return; }
-  drawSwitcher(host, own, active?.id || '');
-}
-
-function switcherHtml(kennels, activeId) {
-  const options = [`<option value=""${activeId ? '' : ' selected'}>All kennels</option>`]
-    .concat(kennels
-      .slice()
-      .sort((a, b) => (a.kennel_name || '').localeCompare(b.kennel_name || ''))
-      .map((k) => `<option value="${esc(k.id)}"${k.id === activeId ? ' selected' : ''}>${esc(k.kennel_name)}</option>`))
-    .join('');
-  return `<select class="kennel-switcher${activeId ? ' scoped' : ''}"
-      aria-label="Active kennel"
-      title="Which kennel the lists, hubs, and reports are showing">${options}</select>`;
-}
-
-function drawSwitcher(host, kennels, activeId) {
-  const html = switcherHtml(kennels, activeId);
-  if (host.dataset.drawn === html) return;
-  host.dataset.drawn = html;
-  host.innerHTML = html;
-  host.querySelector('select').addEventListener('change', (e) => applyScope(e.target.value || null));
+  refreshKennelLine();
 }
 
 // --- The "scoped to one kennel" chip (§7) ----------------------------------

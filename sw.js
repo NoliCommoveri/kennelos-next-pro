@@ -6,7 +6,7 @@
 // never re-fetches a stale precached file on its own; only a CACHE_NAME change
 // (which changes these bytes, so the browser detects a new service worker,
 // installs it, and purges the old cache in `activate`) rolls it over.
-const CACHE_NAME = 'kennelos-pro-shell-v179-next-f42ad2e';
+const CACHE_NAME = 'kennelos-pro-shell-v179-next-476895b';
 
 const PRECACHE_URLS = [
   './',
@@ -19,7 +19,9 @@ const PRECACHE_URLS = [
   'manifest.json',
   'assets/app.css',
   'assets/forest.css',
+  'assets/forest-shell.css',
   'assets/icon.js',
+  'assets/hubRows.js',
   'assets/appShell.js',
   'assets/breedTestPicker.js',
   'assets/cloudBackupUI.js',
@@ -177,6 +179,8 @@ const PRECACHE_URLS = [
   'data/registryCountries.js',
   'data/dropbox.js',
   'data/editionConfig.js',
+  'data/shellNav.js',
+  'data/navHistory.js',
   'data/editionTour.js',
   'data/eventRepo.js',
   'data/expenseRepo.js',
@@ -326,6 +330,8 @@ const PRECACHE_URLS = [
   'pages/breed-feeding-schedules.html',
   'pages/breed-feeding-schedules.js',
   'pages/breeding.html',
+  'pages/business.html',
+  'pages/business.js',
   'pages/breeding.js',
   'pages/calendar.html',
   'pages/calendar.js',
@@ -393,6 +399,8 @@ const PRECACHE_URLS = [
   'pages/litters-report.js',
   'pages/live-births.html',
   'pages/live-births.js',
+  'pages/more.html',
+  'pages/more.js',
   'pages/pairing-import.html',
   'pages/pairing-import.js',
   'pages/pairing.html',

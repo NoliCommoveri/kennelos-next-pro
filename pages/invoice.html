@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Invoice — KennelOS</title>
   <link rel="stylesheet" href="../assets/app.css">
+  <link rel="stylesheet" href="../assets/forest-shell.css">
   <link rel="manifest" href="../manifest.json">
   <link rel="icon" href="../assets/icons/favicon-32.png" sizes="32x32">
   <link rel="apple-touch-icon" href="../assets/icons/apple-touch-icon.png">
-  <meta name="theme-color" content="#122138">
+  <meta name="theme-color" content="#1d4a33" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#173a28" media="(prefers-color-scheme: dark)">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="KennelOS">
@@ -37,7 +39,7 @@
 
     .inv-parties { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
     .inv-party {
-      flex: 1 1 240px; background: var(--surface); border: 1px solid var(--border);
+      flex: 1 1 240px; background: var(--legacy-surface); border: 1px solid var(--border);
       border-radius: var(--radius); padding: 10px 12px;
     }
     .inv-party-role { text-transform: uppercase; letter-spacing: 0.05em; font-size: 11px; color: var(--text-muted); font-weight: 600; margin-bottom: 3px; }
@@ -61,7 +63,7 @@
     .inv-status-paid { color: var(--success); }
     .inv-status-due { color: var(--warning); }
 
-    .inv-pay { margin-top: 16px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+    .inv-pay { margin-top: 16px; background: var(--legacy-surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
     .inv-pay h3 { margin: 0 0 4px; font-size: 13px; }
     .inv-pay .inv-row { display: flex; gap: 8px; font-size: 14px; padding: 1px 0; }
     .inv-pay .inv-k { color: var(--text-muted); flex: 0 0 160px; }
@@ -84,8 +86,13 @@
     }
   </style>
 </head>
-<body>
-  <div id="app-nav" class="no-print"></div>
+<body class="has-shell">
+  <div class="app" id="app"><div class="shell">
+    <nav class="tabbar" id="tabbar" aria-label="Main"></nav>
+    <div class="main">
+      <header class="appbar" id="appbar"></header>
+      <div class="screen legacy" id="screen" tabindex="-1">
+    <div id="app-nav" class="no-print" hidden></div>
   <main class="inv-wrap">
     <div class="inv-actions no-print">
       <a class="btn btn-sm" id="inv-back" href="financials.html?view=income">← Back to Financials</a>
@@ -96,6 +103,9 @@
     <p id="inv-pdf-note" class="no-print muted" style="text-align:center;" hidden></p>
     <div id="inv-root"><p class="inv-empty">Loading…</p></div>
   </main>
+      </div>
+    </div>
+  </div></div>
   <script type="module" src="../app.js"></script>
   <script type="module" src="invoice.js"></script>
 </body>

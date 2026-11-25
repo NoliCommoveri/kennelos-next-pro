@@ -1,4 +1,4 @@
-// app.js — shared shell bootstrap imported by every page. Injects the nav and,
+// app.js — shared shell bootstrap imported by every page. Draws the shell (nav.js) and,
 // on first run, asks the browser to keep this origin's data durable.
 //
 // Imports here resolve relative to THIS module's URL (the app root), so they are
@@ -14,6 +14,7 @@ import { expenseRepo } from './data/expenseRepo.js';
 import { studServiceRepo } from './data/studServiceRepo.js';
 import { renderSampleBanner, autoClearTourSeed, showTourCleanupNotice } from './assets/sampleDataUI.js';
 import { maybeShowKennelSetupPrompt, renderKennelBanner } from './assets/kennelSetupUI.js';
+import { refreshKennelScope } from './assets/kennelScopeUI.js';
 import { renderWizardMenuEntry, runWizardStep } from './assets/wizardUI.js';
 import { runFirstRunOnboarding, maybeMeetKels } from './assets/onboardingUI.js';
 import { isDemo, isReadOnly, withSeedAllowed } from './data/demoMode.js';
@@ -198,12 +199,12 @@ async function helperSkipsGate() {
 }
 
 async function boot() {
-  // The nav first, in every edition and before any wait (Load Performance plan
-  // Phase 1): its space is reserved in app.css, so drawing it moves nothing, and
-  // a license wall is an overlay over it. The kennel name and switcher come from
-  // their stored copies (kennelSetupUI / kennelScopeUI) and are corrected after
-  // their reads.
+  // The shell first, in every edition and before any wait (Load Performance plan
+  // Phase 1): its frame is in every page's HTML, so drawing it moves nothing, and
+  // a license wall is an overlay over it. The kennel line comes from its stored
+  // copy and is corrected after its reads (kennelSetupUI / kennelScopeUI).
   renderNav();
+  refreshKennelScope().catch(() => {});
   if (!isDemo()) {
     renderKennelBanner();
     if (editionFlags.websiteLink && !isTodayPage()) drawCachedWebsiteStrip();

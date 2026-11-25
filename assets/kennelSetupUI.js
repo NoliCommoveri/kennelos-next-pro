@@ -12,6 +12,7 @@ import { renderBreedPicker } from './breedTestPicker.js';
 import { isCloudAvailable } from '../data/cloud/cloudConfig.js';
 import { setMeetKelsPending, getNavKennels, setNavKennels } from '../data/settings.js';
 import { withSeedAllowed } from '../data/demoMode.js';
+import { refreshKennelLine } from '../nav.js';
 
 // The mandatory first-run gate (Multi-Kennel Scope Spec §3.2), called from
 // app.js's boot on every page. Async because the gate's condition is a db read
@@ -185,34 +186,19 @@ async function signedInToCloud() {
   } catch { return false; }
 }
 
-// Adds the kennel name as a second line under "KennelOS" in the nav brand —
-// stacked rather than beside it, so a long name never crowds the phone menu
-// button. Drawn first from the stored copy (settings.getNavKennels), so the nav's
-// first paint already has it (Load Performance plan Phase 1), then corrected from
-// the database, which also refreshes the copy. No line when no kennel is set up.
+// Her kennel's name under the KennelOS brand, in the header band on Home and at the top of
+// the desktop rail (nav.js setShellKennelName). nav.js draws it from the stored copy
+// (settings.getNavKennels), so the first paint already has it (Load Performance plan
+// Phase 1); this corrects it from the database, which also refreshes the copy. No line
+// when no kennel is set up.
 export async function renderKennelBanner() {
   // Every page runs this, so it's also where a broken owner-contact setting gets
   // repaired before the sync readers (dog form owner prefill, stud partner list)
   // need it. A failure here must never cost the banner.
   resolveMyContactId().catch(() => {});
-  const text = () => document.querySelector('.nav-brand .nav-brand-text');
-  const cached = getNavKennels();
-  if (cached?.name) drawKennelName(text(), cached.name);
   let name;
   try { name = (await getMyKennelName()) || null; } catch { return; }
   const now = getNavKennels() || { name: null, own: [] };
   if (now.name !== name) setNavKennels({ ...now, name });
-  drawKennelName(text(), name);
-}
-
-function drawKennelName(text, name) {
-  if (!text) return;
-  let span = text.querySelector('.nav-kennel');
-  if (!name) { span?.remove(); return; }
-  if (!span) {
-    span = document.createElement('span');
-    span.className = 'nav-kennel';
-    text.appendChild(span);
-  }
-  if (span.textContent !== name) span.textContent = name;
+  refreshKennelLine();
 }

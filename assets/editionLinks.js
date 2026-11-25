@@ -12,7 +12,7 @@
 //     records on and unlocked) skips the file: they sign in on Pro and restore,
 //     with "Save a backup file too" as the secondary button.
 //
-// These render in two spots (decided): the nav "More" menu (every page) and a
+// These render in two spots (decided): rows on the More hub (pages/more.js) and a
 // footer on Today. Both are driven entirely by demoUrl / upgradeUrl from
 // editionConfig, which are null in Pro/Demo — so hasEditionLinks() is false there
 // and nothing renders. This keeps the module edition-agnostic like the rest of
@@ -175,37 +175,23 @@ async function fileUpgradeNote({ email }) {
   });
 }
 
-// HTML for the two links. `variant` only changes presentation:
-//   'nav'    — items styled as entries inside the nav "More" dropdown.
-//   'footer' — a labelled block (native .btn styling) for the foot of Today.
-// The Upgrade CTA is always a <button> (it must run JS before navigating); the
+// HTML for the two links, as a labelled block (native .btn styling) for the foot of
+// Today. (More draws them as rows of its own, pages/more.js.) The Upgrade CTA is always a <button> (it must run JS before navigating); the
 // Demo link is a plain external anchor (new tab, so Lite isn't lost). A hidden
 // note paragraph carries any error / "backup saved" fallback message.
-export function editionLinksHtml({ variant = 'nav' } = {}) {
+export function editionLinksHtml() {
   const note = `<p class="edition-links-note" role="status" hidden></p>`;
-
-  if (variant === 'footer') {
-    const demo = demoUrl
-      ? `<a class="btn edition-link edition-link-demo" href="${esc(demoUrl)}" target="_blank" rel="noopener">See the full app ↗</a>`
-      : '';
-    const upgrade = upgradeUrl
-      ? `<button type="button" class="btn btn-primary edition-link edition-link-upgrade">Upgrade to Pro →</button>`
-      : '';
-    return `<div class="edition-links edition-links-footer">
-        <p class="edition-links-lead">Want the full app — unlimited dogs and litters, plus every Pro feature?</p>
-        <div class="edition-links-row">${demo}${upgrade}</div>
-        ${note}
-      </div>`;
-  }
-
-  // nav: menu items inside the More dropdown (reuse .nav-link for the menu look).
   const demo = demoUrl
-    ? `<a class="nav-link edition-link edition-link-demo" href="${esc(demoUrl)}" target="_blank" rel="noopener">See the full app ↗</a>`
+    ? `<a class="btn edition-link edition-link-demo" href="${esc(demoUrl)}" target="_blank" rel="noopener">See the full app ↗</a>`
     : '';
   const upgrade = upgradeUrl
-    ? `<button type="button" class="nav-link edition-link edition-link-upgrade">Upgrade to Pro →</button>`
+    ? `<button type="button" class="btn btn-primary edition-link edition-link-upgrade">Upgrade to Pro →</button>`
     : '';
-  return `<div class="edition-links edition-links-nav">${demo}${upgrade}${note}</div>`;
+  return `<div class="edition-links edition-links-footer">
+      <p class="edition-links-lead">Want the full app — unlimited dogs and litters, plus every Pro feature?</p>
+      <div class="edition-links-row">${demo}${upgrade}</div>
+      ${note}
+    </div>`;
 }
 
 // Wire the Upgrade button(s) within `scope` to the bridge. Idempotent per element

@@ -144,20 +144,7 @@ export const editionFlags = {
   dogCards: true,
 };
 
-// Full nav bar (Pro has every hub).
-export const navItems = [
-  { label: 'Today',    path: 'pages/today.html' },
-  { label: 'Dogs',     path: 'pages/dogs.html' },
-  { label: 'Breeding', path: 'pages/breeding.html' },
-  { label: 'People',   path: 'pages/contacts.html' },
-  { label: 'Placements & Contracts', path: 'pages/sales.html' },
-  { label: 'Financials', path: 'pages/financials.html' },
-  { label: 'Storage',    path: 'pages/documents.html' }, // documents + shows + accounts, seg-tabbed
-  { label: 'Sharing',    path: 'pages/companion.html' }, // Companion + Furever + Assistant, seg-tabbed
-];
-
-export const moreItems = [
-  { label: 'Reports',       path: 'pages/reports.html' },
-  { label: 'Import/Export', path: 'pages/import-export.html' },
-  { label: 'Settings',      path: 'pages/settings.html' },
-];
+// --- The shell (nav.js, data/shellNav.js) ---------------------------------
+// Pages this edition's build leaves out, so no tab or hub row links to them. The tabs and
+// rows themselves are in data/shellNav.js, each gated by an editionFlags entry.
+export const shellHiddenPages = [];

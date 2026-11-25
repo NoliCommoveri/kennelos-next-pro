@@ -19,7 +19,8 @@ import { contactRepo } from '../data/contactRepo.js';
 import { kennelRepo } from '../data/kennelRepo.js';
 import { eventRepo } from '../data/eventRepo.js';
 import { resolveKennelIdForWrite } from '../data/kennelScope.js';
-import { edition, editionFlags, navItems, moreItems } from '../data/editionConfig.js';
+import { edition, editionFlags } from '../data/editionConfig.js';
+import { shellPlace } from '../data/shellNav.js';
 import { esc, fmtDate } from './ui.js';
 import { KELS_FIND_INTRO } from './kelsChat.js';
 
@@ -33,7 +34,7 @@ const COMMON = [
   ['place:companion', 'Sharing your pups']
 ];
 
-const nav = (path) => [...navItems, ...moreItems].find((i) => i.path === path)?.label || 'the menu';
+const nav = (path) => shellPlace(path) || 'the menu';
 
 // Everything she can find, loaded once per visit: { candidates, rows }.
 // `tasks`: her task candidates (pages/kels.js). Contacts are loaded in every
